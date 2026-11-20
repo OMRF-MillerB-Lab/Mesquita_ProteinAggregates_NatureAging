@@ -1,0 +1,1952 @@
+---
+title: "Insoluble proteome — Adult vs Old"
+subtitle: "Age × Sex analysis (2 × 2 limma model) of the insoluble fraction"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    self_contained: true
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r rmarkdown-options, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE, error = FALSE, cache = FALSE,
+  dev = "ragg_png", dpi = 600, fig.align = "center"
+)
+```
+
+# Overview {-}
+
+**Question.** How does the detergent-insoluble skeletal-muscle proteome (SDS-solubilised pellet after Triton X-100 extraction) differ between adult and old control mice, and does the age effect differ between females and males?
+
+**Design.** Gastrocnemius, control mice only; Age (Adult, Old) × Sex (Female, Male). Sample sizes are printed in the *Data preparation* section. "Insoluble" is an operational, extraction-dependent property: the fraction contains physiologically insoluble structures (myofilaments, cytoskeleton, ECM) as well as any aggregated protein.
+
+**Statistical approach (in brief).** Identical to the soluble-fraction analysis (script 1):
+
+| Step | What is done |
+|---|---|
+| Filter | Protein detected in ≥ 50% of samples **within each Age group** (sexes pooled); non-positive values treated as missing |
+| Transform | log2 intensity; **no imputation, no normalization** |
+| Model | limma cell-means model on the four Age × Sex groups; `eBayes(trend = TRUE)` |
+| Contrasts | **Age** (Old − Adult, averaged over sex), **Sex** (Male − Female, averaged over age), **Age × Sex interaction**; plus the **simple age effect within each sex** (Female: Old − Adult; Male: Old − Adult) for the final scatter |
+| Multiple testing | Benjamini–Hochberg across all retained proteins, separately for each contrast |
+| Significance | Raw *P* ≤ 0.05 and FDR ≤ 0.05 are reported separately; **no log2FC threshold** (the ±0.5 lines on the volcano plots are visual references only) |
+| PCA | NIPALS on the filtered log2 matrix, centred and scaled, missing values handled without imputation |
+
+**Outputs** (all written under `Ins_AO/`; figures as 600-dpi PNG + editable SVG with separate legends, exported once at the end of the report):
+
+| Folder | Content |
+|---|---|
+| `Ins_AO/` | limma tables for each contrast (`DE_Insoluble_*.csv`), significance counts, list of retained proteins |
+| `PCA/`, `Vol/`, `HM/`, `GO/`, `UPR/`, `Int/` | PCA and scree, volcano plots, heatmaps, GO enrichment, UPR/chaperone module, interaction plots with their tables |
+| `SexAge/` | Female vs Male age effects for every protein, with GO-CC bin and interaction class |
+
+> **To run:** keep the two input CSV files (see *Settings*) and the `R/` folder next to this file, then knit. Code is folded by default; use the **Code** buttons to expand it.
+
+# Setup
+
+## Packages
+
+All packages must be installed beforehand (the script stops and lists any that are missing). Package load order is kept identical to the original analysis because it determines which functions mask which.
+
+```{r packages}
+pkgs <- c("tidyverse", "limma", "ComplexHeatmap", "circlize", "grid", "ggrepel", "ggtext",
+          "patchwork", "viridisLite", "nipals", "clusterProfiler", "org.Mm.eg.db",
+          "svglite", "cowplot", "AnnotationDbi", "GO.db", "ragg")
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Install missing packages first: ", paste(missing_pkgs, collapse = ", "), call. = FALSE)
+}
+invisible(lapply(pkgs[1:14], library, character.only = TRUE))
+select <- dplyr::select   # AnnotationDbi masks dplyr::select
+```
+
+## Settings
+
+```{r user-settings}
+fraction_name  <- "Insoluble"
+data_dir       <- "."     # folder holding the two input files
+intensity_file <- file.path(data_dir, "Aggregates_Insoluble.csv")
+meta_file      <- file.path(data_dir, "Aggregates_SampleList_Mesquita.csv")
+helper_dir     <- "R"     # folder holding nm_export_engine_insoluble_AO.R
+
+out_dir <- "Ins_AO"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+exclude_samples <- character(0)   # optional, e.g. c("3630R")
+
+# Filtering and significance
+min_complete_by_age <- 0.50   # fraction of samples detected, required within BOTH age groups
+raw_p_cutoff <- 0.05
+fdr_cutoff   <- 0.05
+z_clip       <- 2.5           # heatmap Z-scores are clipped to ±z_clip (display only)
+
+# GO enrichment
+run_go_analysis            <- TRUE
+go_top_n                   <- 5   # terms plotted per direction
+go_min_genes_per_direction <- 3
+
+# Colours
+col_up      <- "#D62728"
+col_down    <- "#1F77B4"
+col_ns      <- "grey78"
+age_colours <- c("Adult" = "#3B3B8F", "Old" = "#6BCB4A")
+sex_colours <- c("Female" = "#CC66B4", "Male" = "#00A087")
+sex_shapes  <- c("Female" = 16, "Male" = 17)
+```
+
+## Figure export settings (presentation only)
+
+Panel sizes (mm), font sizes (pt) and line/point sizes used for the exported PNG/SVG files. Editing them changes only how figures are drawn and saved, never the statistics. The export functions live in `R/nm_export_engine_insoluble_AO.R`.
+
+```{r NATURE_FIGURE_HELPER_EDIT_HERE, echo=FALSE}
+# ============================================================================
+# NATURE FIGURE HELPER — EDIT HERE (INSOLUBLE ADULT vs OLD)
+# Matching Soluble Adult vs Old Nature Helper v2; no v3-v5 legend sizing modes.
+# ============================================================================
+mm_to_in <- function(mm) mm / 25.4
+
+safe_dir_create <- function(path) {
+  if (!dir.exists(path)) {
+    dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  }
+}
+
+# Use generic sans inside ggplot/grid so Windows devices do not need to resolve
+# Arial directly. During SVG export, map sans explicitly to Arial.
+
+nm_style <- list(
+  font_family = "sans",
+  axis_title = 7.0, axis_text = 6.5,
+  strip_text = 7.0, strip_stats = 6.0,
+  legend_title = 6.5, legend_text = 6.0,
+  stat_text = 6.0, small_text = 5.7, plot_title = 8.0,
+  axis_line = 0.18, data_line = 0.28,
+  point_small = 0.85, point_medium = 1.05, point_rank = 1.30,
+  go_dot_range = c(1.6, 3.2), go_segment = 0.25,
+  go_guide_line = 0.20, go_label_wrap = 39,
+  volcano_point = 0.85, volcano_stroke = 0.20,
+  volcano_reference_line = 0.20, volcano_label_mm = 2.05,
+  volcano_segment = 0.16,
+  interaction_line = 0.30, interaction_point = 1.55,
+  interaction_errorbar = 0.24,
+  interaction_one_line = 0.30, interaction_one_point = 1.55,
+  interaction_one_errorbar = 0.24,
+  heatmap_title = 8.0, heatmap_row_label = 6.0,
+  heatmap_row_split = 6.5, heatmap_column_header = 6.5,
+  heatmap_annotation = 6.0, heatmap_p = 6.0,
+  upr_title = 8.0, upr_row_label = 6.5,
+  upr_module = 6.5, upr_p = 6.0
+)
+
+nm_export <- list(
+  dpi = 600,
+  background = "white",
+  separate_legends = TRUE,
+  legend_suffix = "_legend"
+)
+
+# Final physical dimensions (mm) for DATA PANELS only. These are intentionally
+# compatible with the panel footprints already used in current Figures 2, 5-7.
+nm_svg_dims <- list(
+  pca_single = c(width = 60, height = 52),
+  scree_single = c(width = 60, height = 48),
+  volcano_single = c(width = 58, height = 54),
+  go_single = c(width = 120, height = 102),
+  heatmap_sig = c(width = 183, height = 110),
+  heatmap_upr = c(width = 155, height = 100),
+  interaction_single = c(width = 58, height = 53),
+  interaction_grid = c(width = 183, height = 118),
+  interaction_page = c(width = 183, height = 118),
+  sex_age_scatter = c(width = 58, height = 54),
+  generic_single = c(width = 58, height = 54)
+)
+
+# Standalone legend footprints. These can be adjusted independently of panels.
+nm_legend_dims <- list(
+  pca_single = c(width = 45, height = 35),
+  scree_single = c(width = 40, height = 28),
+  volcano_single = c(width = 58, height = 40),
+  go_single = c(width = 58, height = 52),
+  heatmap_sig = c(width = 44, height = 74),
+  heatmap_upr = c(width = 44, height = 74),
+  interaction_single = c(width = 45, height = 32),
+  interaction_grid = c(width = 45, height = 32),
+  interaction_page = c(width = 45, height = 32),
+  sex_age_scatter = c(width = 58, height = 48),
+  generic = c(width = 50, height = 36)
+)
+
+
+# -----------------------------------------------------------------------------
+# FIGURE DIMENSIONS — INSOLUBLE ADULT VS OLD (ALL VALUES IN MILLIMETERS)
+# -----------------------------------------------------------------------------
+# One editable size list, keyed by the actual exported panel filename.
+# Example: edit nm_dims$PCA, RUN THIS DIMENSION CHUNK, then reexport("PCA").
+# Rerunning this chunk does not erase registered plot objects in the same session.
+# If a dimension is NA, the plotting chunk's data-driven dimension is used.
+# To resize an individual interaction plot, set nm_dims$Int_Capza2 <- c(...).
+# The "interaction_single" entry controls all such plots unless individually set.
+nm_dims <- list(
+  PCA = c(width = 60, height = 52),
+  Scree = c(width = 60, height = 48),
+  Vol_Age = c(width = 58, height = 54),
+  Vol_Sex = c(width = 58, height = 54),
+  Vol_Int = c(width = 58, height = 54),
+  HM_Age = c(width = 183, height = NA_real_),
+  HM_Sex = c(width = 183, height = NA_real_),
+  HM_UPR = c(width = 155, height = NA_real_),
+  GO_FDR = c(width = 120, height = 102),
+  GO_RawP = c(width = 120, height = 102),
+  Int_all = c(width = 86, height = 75),
+  interaction_single = c(width = 58, height = 53),
+  interaction_page = c(width = 183, height = 118),
+  Female_vs_Male_AgeEffects_Insoluble = c(width = 58, height = 54)
+)
+
+# Auto height for row-dense panels, equivalent to soluble v2.
+# No small 135-mm ceiling: each protein receives appropriate vertical space.
+nm_layout <- list(
+  heatmap_mm_per_protein = 2.55, heatmap_base_height_mm = 32,
+  upr_mm_per_protein = 3.30, upr_base_height_mm = 32,
+  interaction_columns = 4L, interaction_mm_per_row = 34,
+  interaction_page_rows = 3L
+)
+
+# Metadata only. No duplicate dimensions or hidden panel-size overrides.
+# Each entry lists its export family, whether a legend is separate, and purpose.
+figure_specs <- list(
+  PCA = list(size_key = "pca_single", save_legend = TRUE,
+             description = "Insoluble proteome PCA"),
+  Scree = list(size_key = "scree_single", save_legend = FALSE,
+               description = "PCA explained variance"),
+  Vol_Age = list(size_key = "volcano_single", save_legend = TRUE,
+                 description = "Age differential abundance"),
+  Vol_Sex = list(size_key = "volcano_single", save_legend = TRUE,
+                 description = "Sex differential abundance"),
+  Vol_Int = list(size_key = "volcano_single", save_legend = TRUE,
+                 description = "Age by sex interaction"),
+  HM_Age = list(size_key = "heatmap_sig", save_legend = TRUE,
+                description = "Age-significant proteins; Raw/FDR are data columns"),
+  HM_Sex = list(size_key = "heatmap_sig", save_legend = TRUE,
+                description = "Sex-significant proteins; Raw/FDR are data columns"),
+  GO_FDR = list(size_key = "go_single", save_legend = TRUE,
+                description = "Age GO enrichment, FDR"),
+  GO_RawP = list(size_key = "go_single", save_legend = TRUE,
+                 description = "Age GO enrichment, raw p"),
+  HM_UPR = list(size_key = "heatmap_upr", save_legend = TRUE,
+                description = "UPR/chaperone heatmap"),
+  Int_all = list(size_key = "interaction_grid", save_legend = TRUE,
+                 description = "Age by sex interaction proteins, grid"),
+  interaction_single = list(size_key = "interaction_single", save_legend = TRUE,
+                             description = "Individual age by sex interaction protein"),
+  interaction_page = list(size_key = "interaction_page", save_legend = TRUE,
+                          description = "Readable twelve-protein interaction page"),
+  Female_vs_Male_AgeEffects_Insoluble = list(size_key = "sex_age_scatter", save_legend = TRUE,
+                                            description = "Female vs male age effects")
+)
+
+# Separate legend sizes; changes here do not resize the data panel.
+# Preserve interactive legend overrides if this helper chunk is run again.
+if (!exists("legend_size_overrides", inherits = FALSE)) legend_size_overrides <- list()
+
+
+```
+
+```{r nm-export-engine, echo=FALSE}
+engine_file <- file.path(helper_dir, "nm_export_engine_insoluble_AO.R")
+if (!file.exists(engine_file)) {
+  stop("Cannot find the figure-export file '", engine_file, "' (working directory: ", getwd(),
+       "). Copy the 'R' folder from the zip next to this Rmd and the input CSVs, or set helper_dir.",
+       call. = FALSE)
+}
+source(engine_file, local = knitr::knit_global())
+```
+
+## Helper functions
+
+```{r helpers}
+format_p <- function(p) {
+  out <- rep("NA", length(p))
+  ok <- !is.na(p)
+  out[ok] <- ifelse(p[ok] < 0.001, "<0.001", sprintf("%.3f", p[ok]))
+  out
+}
+
+row_zscore <- function(x) {
+  observed <- !is.na(x)
+  if (sum(observed) < 2) return(ifelse(observed, 0, NA_real_))
+  s <- sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(ifelse(observed, 0, NA_real_))
+  (x - mean(x, na.rm = TRUE)) / s
+}
+
+safe_filename <- function(x) {
+  x %>%
+    str_replace_all("[^A-Za-z0-9]+", "_") %>%
+    str_replace_all("^_|_$", "")
+}
+
+pval_columns_heatmap <- function(info_df,
+                                 raw_col = "P.Value",
+                                 fdr_col = "adj.P.Val",
+                                 row_names,
+                                 width_mm = 24,
+                                 font_size = nm_style$heatmap_p) {
+  raw_p <- info_df[[raw_col]]
+  fdr_p <- info_df[[fdr_col]]
+
+  pval_text <- cbind(
+    Raw = format_p(raw_p),
+    FDR = format_p(fdr_p)
+  )
+
+  pval_mat <- matrix(
+    0,
+    nrow = nrow(pval_text),
+    ncol = 2,
+    dimnames = list(row_names, c("Raw", "FDR"))
+  )
+
+  Heatmap(
+    pval_mat,
+    use_raster = FALSE,
+    name = "p-value",
+    col = circlize::colorRamp2(c(0, 1), c("white", "white")),
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    show_heatmap_legend = FALSE,
+    show_row_names = FALSE,
+    show_column_names = TRUE,
+    column_names_side = "top",
+    column_names_gp = gpar(fontsize = nm_style$heatmap_column_header, fontface = "bold"),
+    column_title = "p-value",
+    column_title_gp = gpar(fontsize = nm_style$heatmap_column_header, fontface = "bold"),
+    width = unit(width_mm, "mm"),
+    rect_gp = gpar(col = "white"),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      this_p <- if (j == 1) raw_p[i] else fdr_p[i]
+      this_cutoff <- if (j == 1) raw_p_cutoff else fdr_cutoff
+
+      grid.text(
+        pval_text[i, j],
+        x = x,
+        y = y,
+        gp = gpar(
+          fontsize = font_size,
+          fontface = ifelse(
+            !is.na(this_p) & this_p <= this_cutoff,
+            "bold",
+            "plain"
+          )
+        )
+      )
+    }
+  )
+}
+
+# Row-wise Z-scores clipped to ±clip. Missing values (and rows with no variance)
+# become 0 for DISPLAY ONLY in the heatmaps; no statistic is computed from these values.
+zscore_clip <- function(m, clip = z_clip) {
+  z <- t(apply(m, 1, row_zscore))
+  z[!is.finite(z)] <- 0
+  z[z >  clip] <-  clip
+  z[z < -clip] <- -clip
+  z
+}
+```
+
+# Data preparation
+
+Reads the insoluble-protein intensity matrix and the sample list, keeps **Control** animals aged **Adult** or **Old**, converts non-positive values to missing, applies the within-age-group detection filter, and log2-transforms. Proteins are labelled by their first gene symbol (made unique with `make.unique`); the UniProt protein group is retained as the primary identifier in the output tables.
+
+```{r load-prepare-data}
+df <- read.csv(intensity_file, check.names = FALSE, stringsAsFactors = FALSE)
+meta <- read.csv(meta_file, check.names = FALSE, stringsAsFactors = FALSE)
+
+required_meta <- c("ID", "Age", "Treatment", "Sex")
+missing_meta <- setdiff(required_meta, colnames(meta))
+if (length(missing_meta) > 0) stop("Missing metadata columns: ", paste(missing_meta, collapse = ", "))
+
+required_df <- c("Protein.Group", "Genes")
+missing_df <- setdiff(required_df, colnames(df))
+if (length(missing_df) > 0) stop("Missing protein-data columns: ", paste(missing_df, collapse = ", "))
+
+sample_meta <- meta %>%
+  mutate(
+    ID = as.character(ID),
+    Age = str_to_title(trimws(as.character(Age))),
+    Treatment = str_to_title(trimws(as.character(Treatment))),
+    Sex = str_to_title(trimws(as.character(Sex)))
+  ) %>%
+  filter(Treatment == "Control", Age %in% c("Adult", "Old"), !ID %in% exclude_samples) %>%
+  filter(ID %in% colnames(df)) %>%
+  mutate(
+    Age = factor(Age, levels = c("Adult", "Old")),
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Group = factor(paste(Age, Sex, sep = "_"), levels = c("Adult_Female", "Adult_Male", "Old_Female", "Old_Male"))
+  ) %>%
+  arrange(Age, Sex, ID)
+
+if (nrow(sample_meta) < 4) stop("Too few samples after filtering metadata.")
+
+
+all_cols <- sample_meta$ID
+adult_cols <- sample_meta %>% filter(Age == "Adult") %>% pull(ID)
+old_cols   <- sample_meta %>% filter(Age == "Old")   %>% pull(ID)
+
+# Build annotation table and matrix
+protein_tbl <- df %>%
+  mutate(
+    Protein.Group = as.character(Protein.Group),
+    Protein.Names = if ("Protein.Names" %in% colnames(.)) as.character(Protein.Names) else NA_character_,
+    Genes = as.character(Genes),
+    First.Protein.Description = if ("First.Protein.Description" %in% colnames(.)) as.character(First.Protein.Description) else NA_character_,
+    Gene_clean = str_replace(Genes, ";.*$", ""),
+    Gene_clean = ifelse(is.na(Gene_clean) | Gene_clean == "", Protein.Group, Gene_clean),
+    Protein = make.unique(Gene_clean)
+  ) %>%
+  select(Protein, Protein.Group, Protein.Names, Genes, Gene_clean, First.Protein.Description)
+
+mat <- df %>%
+  select(all_of(all_cols)) %>%
+  as.matrix()
+mode(mat) <- "numeric"
+mat[mat <= 0] <- NA
+rownames(mat) <- protein_tbl$Protein
+
+
+keep <- rowMeans(!is.na(mat[, adult_cols, drop = FALSE])) >= min_complete_by_age &
+  rowMeans(!is.na(mat[, old_cols, drop = FALSE])) >= min_complete_by_age
+
+mat_filt <- mat[keep, , drop = FALSE]
+protein_tbl_filt <- protein_tbl %>% filter(Protein %in% rownames(mat_filt))
+
+
+write.csv(
+  protein_tbl_filt,
+  file.path(out_dir, "Insoluble_proteins_retained_after_filter.csv"),
+  row.names = FALSE
+)
+
+mat_log <- log2(mat_filt)
+```
+
+```{r data-summary, echo=FALSE, results="asis"}
+print(knitr::kable(as.data.frame.matrix(table(sample_meta$Age, sample_meta$Sex)),
+                   caption = "Animals per group (columns of the input matrix that were analysed)."))
+print(knitr::kable(
+  tibble(Step = c("Protein groups in input file",
+                  sprintf("Retained: detected in ≥ %.0f%% of samples in each Age group", min_complete_by_age * 100)),
+         Proteins = c(nrow(mat), nrow(mat_filt))),
+  caption = "Protein filtering."))
+```
+
+# Principal component analysis
+
+PCA of the filtered, log2-transformed insoluble proteome (samples = observations, proteins = variables). NIPALS handles missing values directly, variables are centred and scaled, and up to 10 components are extracted. Colour = Age, shape = Sex; shaded polygons are 95% normal-theory ellipses per Age group (visual summary, not a test). The scree plot shows individual and cumulative variance explained.
+
+```{r pca-scree-analysis}
+pca_dir <- file.path(out_dir, "PCA")
+safe_dir_create(pca_dir)
+
+# Samples as rows; proteins as variables.
+# Missing values remain NA and are handled directly by NIPALS.
+X <- t(mat_log[, sample_meta$ID, drop = FALSE])
+
+n_pc <- min(nrow(X), ncol(X), 10)
+if (n_pc < 2) stop("At least two principal components are required for the PCA plot.")
+
+pca_res <- nipals::nipals(
+  X,
+  ncomp = n_pc,
+  center = TRUE,
+  scale = TRUE
+)
+
+# nipals reports marginal R2 for each extracted component.
+# Convert to percentage and calculate cumulative explained variance.
+var_ind <- as.numeric(pca_res$R2[seq_len(n_pc)]) * 100
+cum_var <- cumsum(var_ind)
+
+scores_df <- as.data.frame(pca_res$scores[, 1:2, drop = FALSE]) %>%
+  rownames_to_column("Sample") %>%
+  left_join(
+    sample_meta %>% select(ID, Age, Sex),
+    by = c("Sample" = "ID")
+  )
+
+colnames(scores_df)[2:3] <- c("PC1", "PC2")
+
+loadings_df <- as.data.frame(pca_res$loadings[, 1:2, drop = FALSE]) %>%
+  rownames_to_column("Protein")
+colnames(loadings_df)[2:3] <- c("PC1_loading", "PC2_loading")
+
+scree_df <- tibble(
+  PC_number = seq_len(n_pc),
+  PC = factor(paste0("PC", seq_len(n_pc)), levels = paste0("PC", seq_len(n_pc))),
+  Individual = var_ind,
+  Cumulative = cum_var
+)
+
+# Save PCA numerical outputs.
+write.csv(scores_df, file.path(pca_dir, "PCA_scores.csv"), row.names = FALSE)
+write.csv(loadings_df, file.path(pca_dir, "PCA_loadings.csv"), row.names = FALSE)
+write.csv(scree_df, file.path(pca_dir, "PCA_variance.csv"), row.names = FALSE)
+
+# Preserve the viridis-based PCA appearance from the original PCA script.
+pca_pal <- viridisLite::viridis(5, option = "D")
+pca_age_colours <- c("Adult" = pca_pal[2], "Old" = pca_pal[4])
+pca_sex_shapes <- c("Female" = 16, "Male" = 17)
+
+p_pca <- ggplot(
+  scores_df,
+  aes(x = PC1, y = PC2, colour = Age, fill = Age)
+) +
+  stat_ellipse(
+    aes(group = Age),
+    type = "norm",
+    level = 0.95,
+    geom = "polygon",
+    alpha = 0.15,
+    colour = NA,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    aes(shape = Sex),
+    size = nm_style$point_rank + 0.35,
+    alpha = 0.95,
+    stroke = 0.35,
+    na.rm = TRUE
+  ) +
+  scale_colour_manual(values = pca_age_colours) +
+  scale_fill_manual(values = pca_age_colours) +
+  scale_shape_manual(values = pca_sex_shapes) +
+  guides(fill = "none") +
+  labs(
+    title = "PCA — Insoluble Fraction",
+    subtitle = "Adult vs Old Control",
+    x = sprintf("PC1 (%.1f%%)", var_ind[1]),
+    y = sprintf("PC2 (%.1f%%)", var_ind[2]),
+    colour = "Age group",
+    shape = "Sex"
+  ) +
+  theme_nm(legend_position = "right")
+
+p_scree <- ggplot(scree_df, aes(x = PC)) +
+  geom_col(
+    aes(y = Individual, fill = Individual),
+    width = 0.65,
+    colour = "white",
+    linewidth = 0.3
+  ) +
+  geom_line(
+    aes(y = Cumulative, group = 1),
+    colour = pca_age_colours[["Old"]],
+    linewidth = nm_style$data_line
+  ) +
+  geom_point(
+    aes(y = Cumulative),
+    colour = pca_age_colours[["Old"]],
+    size = nm_style$point_medium + 0.25,
+    shape = 21,
+    fill = "white",
+    stroke = 0.35
+  ) +
+  geom_hline(
+    yintercept = 80,
+    linetype = "dashed",
+    colour = "grey50",
+    linewidth = nm_style$axis_line
+  ) +
+  scale_fill_gradientn(
+    colours = viridisLite::viridis(256, option = "D", direction = -1),
+    guide = "none"
+  ) +
+  scale_y_continuous(
+    limits = c(0, max(100, max(scree_df$Cumulative, na.rm = TRUE) * 1.06)),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "Scree Plot — Insoluble Fraction",
+    subtitle = "Bars = individual variance | Line = cumulative variance",
+    x = "Principal Component",
+    y = "Variance Explained (%)"
+  ) +
+  theme_nm(legend_position = "none") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.y = element_line(colour = "grey93", linewidth = nm_style$axis_line)
+  )
+
+p_pca_export <- p_pca +
+  ggplot2::labs(title = NULL, subtitle = NULL) +
+  ggplot2::theme(plot.title = ggplot2::element_blank(), plot.subtitle = ggplot2::element_blank())
+
+p_scree_export <- p_scree +
+  ggplot2::labs(title = NULL, subtitle = NULL) +
+  ggplot2::theme(plot.title = ggplot2::element_blank(), plot.subtitle = ggplot2::element_blank())
+
+register_plot(
+  "PCA",
+  p_pca_export,
+  file.path(pca_dir, "PCA")
+)
+
+register_plot(
+  "Scree",
+  p_scree_export,
+  file.path(pca_dir, "Scree")
+)
+```
+
+## Scores plot
+
+```{r show-pca, echo=FALSE}
+print(p_pca)
+```
+
+## Scree plot
+
+```{r show-scree, echo=FALSE}
+print(p_scree)
+```
+
+# Age × Sex limma model
+
+Each protein is fitted with a cell-means model on the four Age × Sex groups (`~ 0 + group`), using the observations available for that protein. Three contrasts are estimated and moderated with empirical Bayes (`eBayes(trend = TRUE)`):
+
+- **Age:** mean of Old (F, M) − mean of Adult (F, M)
+- **Sex:** mean of Male (Adult, Old) − mean of Female (Adult, Old)
+- **Interaction:** (Old M − Old F) − (Adult M − Adult F)
+
+Both averages are unweighted means of the two sex (or age) cell means. `adj.P.Val` is the BH-adjusted *P* across all retained proteins within a contrast. Proteins are classified as **FDR ≤ 0.05**, **Raw *P* ≤ 0.05 only**, or **NS**.
+
+```{r limma-age-sex-model}
+group_vec <- sample_meta$Group
+design <- model.matrix(~ 0 + group_vec)
+colnames(design) <- levels(group_vec)
+
+fit <- lmFit(mat_log[, sample_meta$ID, drop = FALSE], design)
+
+cont_mat <- makeContrasts(
+  Age         = (Old_Female + Old_Male) / 2 - (Adult_Female + Adult_Male) / 2,
+  Sex         = (Adult_Male + Old_Male) / 2 - (Adult_Female + Old_Female) / 2,
+  Interaction = (Old_Male - Old_Female) - (Adult_Male - Adult_Female),
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, cont_mat)
+fit2 <- eBayes(fit2, trend = TRUE)
+
+get_res <- function(coef_name, contrast_label, x_label) {
+  topTable(fit2, coef = coef_name, number = Inf, sort.by = "none") %>%
+    rownames_to_column("Protein") %>%
+    left_join(protein_tbl_filt, by = "Protein") %>%
+    mutate(
+      Contrast = contrast_label,
+      X_label = x_label,
+      Direction = case_when(
+        logFC > 0 ~ "Up",
+        logFC < 0 ~ "Down",
+        TRUE ~ "No change"
+      ),
+      SigClass = case_when(
+        !is.na(adj.P.Val) & adj.P.Val <= fdr_cutoff ~ "FDR <= 0.05",
+        !is.na(P.Value) & P.Value <= raw_p_cutoff ~ "Raw p <= 0.05",
+        TRUE ~ "NS"
+      ),
+      SigAny = SigClass != "NS",
+      SigFDR = SigClass == "FDR <= 0.05",
+      SigRawOnly = SigClass == "Raw p <= 0.05"
+    )
+}
+
+res_age <- get_res("Age", "Age: Old vs Adult", "log2FC (Old / Adult)")
+res_sex <- get_res("Sex", "Sex: Male vs Female", "log2FC (Male / Female)")
+res_int <- get_res("Interaction", "Age × Sex interaction", "Interaction log2FC")
+
+res_all <- bind_rows(res_age, res_sex, res_int)
+
+write.csv(res_age, file.path(out_dir, "DE_Insoluble_Age_Old_vs_Adult_limma_2x2.csv"), row.names = FALSE)
+write.csv(res_sex, file.path(out_dir, "DE_Insoluble_Sex_Male_vs_Female_limma_2x2.csv"), row.names = FALSE)
+write.csv(res_int, file.path(out_dir, "DE_Insoluble_AgeXSex_Interaction_limma_2x2.csv"), row.names = FALSE)
+write.csv(res_all, file.path(out_dir, "DE_Insoluble_AllContrasts_limma_2x2.csv"), row.names = FALSE)
+
+summary_counts <- res_all %>%
+  group_by(Contrast, SigClass, Direction) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  arrange(Contrast, SigClass, Direction)
+write.csv(summary_counts, file.path(out_dir, "DE_Insoluble_summary_counts_rawP_FDR.csv"), row.names = FALSE)
+```
+
+```{r limma-summary, echo=FALSE, results="asis"}
+print(knitr::kable(summary_counts, caption = "Number of proteins per contrast, significance class and direction."))
+
+cell_n <- sapply(levels(sample_meta$Group), function(g)
+  rowSums(!is.na(mat_log[, sample_meta$ID[sample_meta$Group == g], drop = FALSE])))
+print(knitr::kable(
+  tibble(Contrast = c("Age", "Sex", "Interaction"),
+         `Proteins tested` = nrow(mat_log),
+         `With NA statistics` = c(sum(is.na(res_age$P.Value)), sum(is.na(res_sex$P.Value)), sum(is.na(res_int$P.Value))),
+         `Proteins with an empty Age × Sex cell` = sum(apply(cell_n, 1, min) == 0),
+         `Proteins with < 2 values in a cell` = sum(apply(cell_n, 1, min) < 2)),
+  caption = "Model diagnostics: the detection filter is applied per Age group (sexes pooled), so some proteins can have sparsely populated Age × Sex cells."))
+```
+
+# Volcano plots
+
+One volcano plot per contrast (x = log2 fold change, y = −log10 raw *P*). **Colour** shows direction among significant proteins (red up, blue down; grey = NS), and **shape** shows class (filled = FDR ≤ 0.05, open = raw *P* ≤ 0.05 only). The five most significant up- and down-regulated proteins are labelled. Dashed lines: raw *P* = 0.05 (horizontal) and log2FC = ±0.5 (vertical, visual reference only).
+
+```{r volcano-plots}
+volcano_dir <- file.path(out_dir, "Vol")
+safe_dir_create(volcano_dir)
+
+make_volcano <- function(res, file_tag) {
+  
+  volcano_lfc_ref <- 0.5
+  
+  res_plot <- res %>%
+    mutate(
+      neg_log10_p = -log10(P.Value),
+      neg_log10_p = ifelse(is.finite(neg_log10_p), neg_log10_p, NA_real_),
+      
+      # Color legend:
+      # Red  = all significant up proteins, raw p or FDR
+      # Blue = all significant down proteins, raw p or FDR
+      # Gray = nonsignificant
+      DirectionLegend = case_when(
+        SigAny & logFC > 0 ~ "Up",
+        SigAny & logFC < 0 ~ "Down",
+        TRUE ~ "NS"
+      ),
+      DirectionLegend = factor(DirectionLegend, levels = c("Up", "Down", "NS")),
+      
+      # Shape logic:
+      # Solid = FDR significant
+      # Open  = raw p significant only
+      # NS    = solid gray, but excluded from shape legend
+      SigShape = case_when(
+        SigFDR ~ "FDR",
+        SigRawOnly ~ "Raw p-value",
+        TRUE ~ "NS"
+      ),
+      SigShape = factor(SigShape, levels = c("FDR", "Raw p-value", "NS"))
+    )
+  
+  # Label top 5 up and top 5 down among significant proteins
+  label_tbl <- bind_rows(
+    res_plot %>%
+      filter(SigAny, logFC > 0) %>%
+      slice_min(P.Value, n = 5, with_ties = FALSE),
+    res_plot %>%
+      filter(SigAny, logFC < 0) %>%
+      slice_min(P.Value, n = 5, with_ties = FALSE)
+  ) %>%
+    distinct(Protein, .keep_all = TRUE)
+  
+  # Counts for direction legend
+  n_up   <- sum(res_plot$SigAny & res_plot$logFC > 0, na.rm = TRUE)
+  n_down <- sum(res_plot$SigAny & res_plot$logFC < 0, na.rm = TRUE)
+  n_ns   <- sum(!res_plot$SigAny, na.rm = TRUE)
+  
+  direction_colors <- c(
+    "Up"   = col_up,
+    "Down" = col_down,
+    "NS"   = col_ns
+  )
+  
+  direction_labels <- c(
+    "Up"   = paste0("Up (", n_up, ")"),
+    "Down" = paste0("Down (", n_down, ")"),
+    "NS"   = paste0("NS (", n_ns, ")")
+  )
+  
+  shape_values <- c(
+    "FDR" = 16,
+    "Raw p-value" = 1,
+    "NS" = 16
+  )
+  
+  p <- ggplot(res_plot, aes(x = logFC, y = neg_log10_p)) +
+    geom_point(
+      aes(
+        color = DirectionLegend,
+        shape = SigShape
+      ),
+      size = nm_style$volcano_point,
+      stroke = nm_style$volcano_stroke,
+      alpha = 0.90,
+      na.rm = TRUE
+    ) +
+    geom_hline(
+      yintercept = -log10(raw_p_cutoff),
+      linetype = "dashed",
+      colour = "grey55",
+      linewidth = nm_style$axis_line
+    ) +
+    geom_vline(
+      xintercept = c(-volcano_lfc_ref, volcano_lfc_ref),
+      linetype = "dashed",
+      colour = "grey65",
+      linewidth = nm_style$axis_line
+    ) +
+    geom_text_repel(
+      data = label_tbl,
+      aes(label = Protein),
+      size = nm_style$volcano_label_mm,
+      family = nm_style$font_family,
+      max.overlaps = 20,
+      box.padding = 0.35,
+      point.padding = 0.25,
+      segment.size = nm_style$volcano_segment,
+      segment.alpha = 0.55,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(
+      values = direction_colors,
+      labels = direction_labels,
+      drop = FALSE,
+      name = NULL
+    ) +
+    scale_shape_manual(
+      values = shape_values,
+      breaks = c("FDR", "Raw p-value"),
+      labels = c(
+        paste0("FDR ≤ ", fdr_cutoff),
+        paste0("Raw p-value ≤ ", raw_p_cutoff)
+      ),
+      drop = FALSE,
+      name = NULL
+    ) +
+    guides(
+      color = guide_legend(
+        order = 2,
+        override.aes = list(
+          shape = 16,
+          size = 2.2,
+          alpha = 1
+        )
+      ),
+      shape = guide_legend(
+        order = 2,
+        override.aes = list(
+          color = "black",
+          size = 2.2,
+          alpha = 1
+        )
+      )
+    ) +
+    labs(
+      title = paste0(fraction_name, " — ", unique(res$Contrast)),
+      #),
+      x = unique(res$X_label),
+      y = "-log10(raw p-value)",
+    ) +
+    theme_nm(legend_position = "right")
+  
+  p_export <- p +
+    ggplot2::labs(title = NULL, subtitle = NULL, caption = NULL) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_blank(),
+      plot.subtitle = ggplot2::element_blank(),
+      plot.caption = ggplot2::element_blank()
+    )
+
+  register_plot(
+    paste0("Vol_", file_tag),
+    p_export,
+    file.path(volcano_dir, paste0("Vol_", file_tag))
+  )
+  
+  p
+}
+
+p_vol_age <- make_volcano(res_age, "Age")
+p_vol_sex <- make_volcano(res_sex, "Sex")
+p_vol_int <- make_volcano(res_int, "Int")
+```
+
+## Age effect
+
+```{r show-volcano-age, echo=FALSE}
+print(p_vol_age)
+```
+
+## Sex effect
+
+```{r show-volcano-sex, echo=FALSE}
+print(p_vol_sex)
+```
+
+## Age × Sex interaction
+
+```{r show-volcano-interaction, echo=FALSE}
+print(p_vol_int)
+```
+
+# Heatmaps of significant proteins
+
+Row-wise Z-scores of log2 abundance for all proteins with raw *P* ≤ 0.05 or FDR ≤ 0.05 in the Age or Sex contrast. Rows are grouped by direction and significance class and ordered by *P*; columns are ordered Adult → Old, then Female → Male. Raw and FDR values are printed to the right (bold = below the cutoff). Z-scores are clipped to ±2.5, and **missing values are drawn as 0 (the row mean)** — this affects display only. The Age × Sex interaction is shown as line plots below rather than as a heatmap. Z-score / Age / Sex keys are exported as separate legend files.
+
+```{r significant-protein-heatmaps}
+heatmap_dir <- file.path(out_dir, "HM")
+safe_dir_create(heatmap_dir)
+
+sample_meta_ord <- sample_meta %>% arrange(Age, Sex, ID)
+col_order <- sample_meta_ord$ID
+
+heatmap_col_fun <- colorRamp2(c(-z_clip, 0, z_clip), c(col_down, "white", col_up))
+
+top_ann <- HeatmapAnnotation(
+  Age = sample_meta_ord$Age,
+  Sex = sample_meta_ord$Sex,
+  col = list(Age = age_colours, Sex = sex_colours),
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = nm_style$heatmap_annotation, fontface = "bold", fontfamily = nm_style$font_family),
+  annotation_legend_param = list(Age = list(title = "Age"), Sex = list(title = "Sex"))
+)
+
+heatmap_legend_grob <- ComplexHeatmap::packLegend(
+  ComplexHeatmap::Legend(
+    col_fun = heatmap_col_fun,
+    title = "Z-score",
+    at = c(-z_clip, 0, z_clip),
+    labels = c(paste0("-", z_clip), "0", as.character(z_clip)),
+    title_gp = grid::gpar(fontsize = nm_style$legend_title, fontface = "bold", fontfamily = nm_style$font_family),
+    labels_gp = grid::gpar(fontsize = nm_style$legend_text, fontfamily = nm_style$font_family)
+  ),
+  ComplexHeatmap::Legend(
+    labels = names(age_colours),
+    title = "Age",
+    legend_gp = grid::gpar(fill = unname(age_colours), col = unname(age_colours)),
+    title_gp = grid::gpar(fontsize = nm_style$legend_title, fontface = "bold", fontfamily = nm_style$font_family),
+    labels_gp = grid::gpar(fontsize = nm_style$legend_text, fontfamily = nm_style$font_family)
+  ),
+  ComplexHeatmap::Legend(
+    labels = names(sex_colours),
+    title = "Sex",
+    legend_gp = grid::gpar(fill = unname(sex_colours), col = unname(sex_colours)),
+    title_gp = grid::gpar(fontsize = nm_style$legend_title, fontface = "bold", fontfamily = nm_style$font_family),
+    labels_gp = grid::gpar(fontsize = nm_style$legend_text, fontfamily = nm_style$font_family)
+  ),
+  direction = "vertical",
+  gap = grid::unit(2.5, "mm")
+)
+
+make_sig_heatmap <- function(res, file_tag, title_text) {
+  sig_tbl <- res %>%
+    filter(SigAny, Protein %in% rownames(mat_log)) %>%
+    mutate(
+      Direction = factor(Direction, levels = c("Up", "Down", "No change")),
+      SigClass = factor(SigClass, levels = c("FDR <= 0.05", "Raw p <= 0.05", "NS"))
+    ) %>%
+    arrange(Direction, SigClass, P.Value)
+
+  if (nrow(sig_tbl) < 2) {
+    message("Skipping heatmap for ", file_tag, ": fewer than 2 significant proteins.")
+    return(NULL)
+  }
+
+  hm_mat <- mat_log[sig_tbl$Protein, col_order, drop = FALSE]
+  hm_z <- zscore_clip(hm_mat)
+
+  row_split <- factor(
+    paste(as.character(sig_tbl$Direction), as.character(sig_tbl$SigClass), sep = " | "),
+    levels = c(
+      "Up | FDR <= 0.05", "Up | Raw p <= 0.05",
+      "Down | FDR <= 0.05", "Down | Raw p <= 0.05",
+      "No change | FDR <= 0.05", "No change | Raw p <= 0.05"
+    )
+  )
+
+  ht_main <- Heatmap(
+    hm_z,
+    use_raster = FALSE,
+    name = "Z-score",
+    col = heatmap_col_fun,
+    na_col = "grey85",
+    top_annotation = top_ann,
+    column_split = sample_meta_ord$Age,
+    column_gap = unit(4, "mm"),
+    row_split = row_split,
+    row_gap = unit(3, "mm"),
+    row_title_side = "left",
+    row_title_gp = gpar(fontsize = nm_style$heatmap_row_split, fontface = "bold", fontfamily = nm_style$font_family),
+    cluster_rows = FALSE,
+    cluster_row_slices = FALSE,
+    cluster_columns = FALSE,
+    cluster_column_slices = FALSE,
+    show_column_names = FALSE,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    row_labels = sig_tbl$Protein,
+    row_names_gp = gpar(fontsize = nm_style$heatmap_row_label, fontface = "bold", fontfamily = nm_style$font_family),
+    column_title = title_text,
+    column_title_gp = gpar(fontsize = nm_style$heatmap_title, fontface = "bold"),
+    border = FALSE,
+    heatmap_legend_param = list(
+      title = "Z-score",
+      title_position = "topcenter",
+      at = c(-z_clip, 0, z_clip),
+      labels = c(paste0("-", z_clip), "0", as.character(z_clip))
+    )
+  )
+
+  ht_pvals <- pval_columns_heatmap(
+    sig_tbl,
+    raw_col = "P.Value",
+    fdr_col = "adj.P.Val",
+    row_names = rownames(hm_z),
+    width_mm = 24,
+    font_size = nm_style$heatmap_p
+  )
+
+  ht <- ht_main + ht_pvals
+
+  hm_height_mm <- nm_heatmap_height(nrow(sig_tbl), family = "heatmap")
+
+  register_heatmap(
+    paste0("HM_", file_tag),
+    ht,
+    file.path(heatmap_dir, paste0("HM_", file_tag)),
+    height_mm = hm_height_mm,
+    legend_grob = heatmap_legend_grob
+  )
+
+  write.csv(
+    sig_tbl,
+    file.path(heatmap_dir, paste0("HM_", file_tag, "_data.csv")),
+    row.names = FALSE
+  )
+
+  invisible(ht)
+}
+
+ht_age_registered <- make_sig_heatmap(res_age, "Age", "Insoluble — Age")
+ht_sex_registered <- make_sig_heatmap(res_sex, "Sex", "Insoluble — Sex")
+```
+
+## Age effect
+
+```{r show-heatmap-age, echo=FALSE}
+if (!is.null(ht_age_registered)) {
+  ComplexHeatmap::draw(ht_age_registered, heatmap_legend_side = "right",
+                       annotation_legend_side = "right", merge_legend = FALSE)
+} else {
+  cat("*Age heatmap was not generated (fewer than two significant proteins).*\n")
+}
+```
+
+## Sex effect
+
+```{r show-heatmap-sex, echo=FALSE}
+if (!is.null(ht_sex_registered)) {
+  ComplexHeatmap::draw(ht_sex_registered, heatmap_legend_side = "right",
+                       annotation_legend_side = "right", merge_legend = FALSE)
+} else {
+  cat("*Sex heatmap was not generated (fewer than two significant proteins).*\n")
+}
+```
+
+# GO biological-process enrichment (Age effect)
+
+Over-representation analysis with `clusterProfiler::enrichGO()` (Biological Process, `org.Mm.eg.db`). Age-significant proteins are split by sign of the log2 fold change into **Up in Old** and **Down in Old**, converted from gene symbols to Entrez IDs, and tested separately. The **background universe** is every protein retained after the detection filter that maps to an Entrez ID, so enrichment is relative to the measurable insoluble proteome. Settings: BH adjustment, `pvalueCutoff = 0.05`, `qvalueCutoff = 0.25`; directions with fewer than 3 mapped genes are skipped. The plot shows the five terms with the smallest adjusted *P* per direction (point size = number of input proteins; colour = −log10 adjusted *P*; x = fold enrichment = gene ratio / background ratio). Two input sets are analysed: **FDR ≤ 0.05** proteins, and **raw *P* ≤ 0.05** proteins (which include the FDR-significant ones). Full term tables are saved as `GO/GO_*_all.csv`.
+
+```{r go-bp-lollipop}
+go_dir <- file.path(out_dir, "GO")
+safe_dir_create(go_dir)
+
+map_symbols_to_entrez <- function(symbols) {
+  symbols <- symbols[!is.na(symbols) & symbols != ""] %>% unique()
+  if (length(symbols) == 0) return(character(0))
+
+  suppressMessages({
+    mapped <- tryCatch(
+      bitr(symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Mm.eg.db, drop = TRUE),
+      error = function(e) NULL
+    )
+  })
+
+  if (is.null(mapped) || nrow(mapped) == 0) return(character(0))
+  unique(mapped$ENTREZID)
+}
+
+parse_ratio <- function(x) {
+  num <- as.numeric(str_replace(x, "/.*$", ""))
+  den <- as.numeric(str_replace(x, "^.*/", ""))
+  num / den
+}
+
+run_go_bp_one_direction <- function(symbols, universe_symbols, direction_label) {
+  if (length(unique(symbols)) < go_min_genes_per_direction) {
+    message("Skipping GO for ", direction_label, ": fewer than ", go_min_genes_per_direction, " genes.")
+    return(NULL)
+  }
+
+  eg <- map_symbols_to_entrez(symbols)
+  universe_eg <- map_symbols_to_entrez(universe_symbols)
+
+  if (length(eg) < go_min_genes_per_direction) {
+    message("Skipping GO for ", direction_label, ": fewer than ", go_min_genes_per_direction, " mapped Entrez IDs.")
+    return(NULL)
+  }
+
+  ego <- tryCatch(
+    enrichGO(
+      gene = eg,
+      universe = universe_eg,
+      OrgDb = org.Mm.eg.db,
+      ont = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff = 0.05,
+      qvalueCutoff = 0.25,
+      readable = TRUE
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(ego) || nrow(as.data.frame(ego)) == 0) {
+    message("No enriched GO BP terms for ", direction_label)
+    return(NULL)
+  }
+
+  as.data.frame(ego) %>%
+    mutate(
+      Direction = direction_label,
+      GeneRatio_num = parse_ratio(GeneRatio),
+      BgRatio_num = parse_ratio(BgRatio),
+      FoldEnrich = GeneRatio_num / BgRatio_num,
+      neg_log10_fdr = -log10(p.adjust)
+    )
+}
+
+make_go_lollipop_age <- function(res_age_tbl, sig_filter, analysis_label, file_tag) {
+  if (!run_go_analysis) return(NULL)
+
+  go_input <- res_age_tbl %>%
+    filter({{ sig_filter }}) %>%
+    filter(!is.na(Gene_clean), Gene_clean != "", !is.na(logFC), logFC != 0) %>%
+    mutate(Direction = ifelse(logFC > 0, "Up in Old", "Down in Old"))
+
+  genes_up <- go_input %>% filter(Direction == "Up in Old") %>% pull(Gene_clean) %>% unique()
+  genes_down <- go_input %>% filter(Direction == "Down in Old") %>% pull(Gene_clean) %>% unique()
+  universe_genes <- protein_tbl_filt$Gene_clean %>% unique()
+
+  cat(sprintf("\nGO input [%s]: %d Up in Old, %d Down in Old\n", analysis_label, length(genes_up), length(genes_down)))
+
+  go_up <- run_go_bp_one_direction(genes_up, universe_genes, "Up in Old")
+  go_down <- run_go_bp_one_direction(genes_down, universe_genes, "Down in Old")
+  go_all <- bind_rows(go_up, go_down)
+
+  if (is.null(go_all) || nrow(go_all) == 0) {
+    message("No GO terms to plot for ", analysis_label)
+    return(NULL)
+  }
+
+  write.csv(
+    go_all,
+    file.path(go_dir, paste0("GO_", file_tag, "_all.csv")),
+    row.names = FALSE
+  )
+
+  go_plot <- go_all %>%
+    group_by(Direction) %>%
+    slice_min(p.adjust, n = go_top_n, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(
+      Direction = factor(Direction, levels = c("Up in Old", "Down in Old")),
+      Description_wrapped = str_wrap(Description, width = nm_style$go_label_wrap)
+    ) %>%
+    arrange(Direction, FoldEnrich) %>%
+    mutate(Description_wrapped = factor(Description_wrapped, levels = unique(Description_wrapped)))
+
+  p <- ggplot(go_plot, aes(y = Description_wrapped, x = FoldEnrich, size = Count, colour = neg_log10_fdr)) +
+    geom_segment(aes(x = 1, xend = FoldEnrich, y = Description_wrapped, yend = Description_wrapped),
+                 linewidth = nm_style$go_segment, colour = "grey60") +
+    geom_point(alpha = 0.95) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50", linewidth = nm_style$go_guide_line) +
+    facet_wrap(~ Direction, scales = "free_y", ncol = 1) +
+    scale_colour_gradient(low = "#FDAE61", high = "#D62728", name = expression(-log[10](GO~FDR))) +
+    scale_size_continuous(name = "Protein count", range = nm_style$go_dot_range) +
+    scale_x_continuous(expand = expansion(mult = c(0.04, 0.15))) +
+    labs(
+      title = paste0("GO Biological Processes — Insoluble Age effect, ", analysis_label),
+      subtitle = paste0("Top ", go_top_n, " terms per direction"),
+      x = "Fold enrichment",
+      y = NULL,
+    ) +
+    theme_nm(legend_position = "right") +
+    theme(
+      axis.text.y = element_text(size = nm_style$small_text),
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      panel.grid.major.x = element_line(colour = "grey93", linewidth = nm_style$axis_line)
+    )
+
+  h_mm <- max(55, min(110, nrow(go_plot) * 4.5 + 22))
+
+  p_export <- p +
+    ggplot2::labs(title = NULL, subtitle = NULL, caption = NULL) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_blank(),
+      plot.subtitle = ggplot2::element_blank(),
+      plot.caption = ggplot2::element_blank()
+    )
+
+  register_plot(
+    paste0("GO_", file_tag),
+    p_export,
+    file.path(go_dir, paste0("GO_", file_tag)),
+    height_mm = h_mm
+  )
+
+  p
+}
+
+p_go_age_fdr <- make_go_lollipop_age(
+  res_age,
+  sig_filter = adj.P.Val <= fdr_cutoff,
+  analysis_label = "FDR-significant proteins only",
+  file_tag = "FDR"
+)
+
+p_go_age_raw <- make_go_lollipop_age(
+  res_age,
+  sig_filter = P.Value <= raw_p_cutoff,
+  analysis_label = "raw-p-significant proteins",
+  file_tag = "RawP"
+)
+```
+
+## FDR-significant proteins
+
+```{r show-go-fdr, echo=FALSE}
+if (!is.null(p_go_age_fdr)) print(p_go_age_fdr) else cat("*No GO plot: no eligible enriched terms for this input set.*\n")
+```
+
+## Raw-*P*-significant proteins
+
+```{r show-go-raw, echo=FALSE}
+if (!is.null(p_go_age_raw)) print(p_go_age_raw) else cat("*No GO plot: no eligible enriched terms for this input set.*\n")
+```
+
+# Proteostasis (UPR / chaperone / folding) module
+
+A curated list of ER-folding, HSP70/HSP90, small-HSP and mitochondrial-folding genes is matched (case-insensitive, by first gene symbol) to the filtered insoluble proteome and displayed as row Z-scores next to the **Age-contrast** raw and FDR *P* values from the model above. Genes that were not retained are listed in `UPR/UPR_missing.csv`; statistics for matched proteins are in `UPR/UPR_stats.csv`.
+
+```{r upr-module-heatmap}
+# Uses the same 2x2 limma Age contrast as the main insoluble analysis.
+# Protein names are shown on the left.
+# Raw and FDR p-values are shown as a separate 2-column heatmap on the right.
+
+upr_dir <- file.path(out_dir, "UPR")
+safe_dir_create(upr_dir)
+
+upr_modules <- list(
+  "ER-related folding"    = c("Hspa5", "Hsp90b1", "Calr", "Canx", "P4hb", "Pdia3",
+                              "Pdia4", "Pdia6", "Erp44", "Ero1l", "Prdx4"),
+  "HSP70/HSP90 machinery" = c("Hspa8", "Hspa1a", "Hspa1l", "Hsp90aa1", "Hsp90ab1",
+                              "St13", "Stip1"),
+  "Small HSP"             = c("Hspb1", "Hspb2", "Hspb6", "Cryab"),
+  "Mitochondrial folding" = c("Hspa9", "Hspd1", "Hspe1", "Trap1", "Lonp1")
+)
+
+upr_module_key <- tibble(
+  Module     = rep(names(upr_modules), lengths(upr_modules)),
+  Gene_Query = unlist(upr_modules, use.names = FALSE)
+) %>%
+  mutate(
+    Gene_Label = Gene_Query,
+    Module     = factor(Module, levels = names(upr_modules)),
+    Gene_key   = str_to_lower(Gene_Query)
+  ) %>%
+  group_by(Module) %>%
+  mutate(Gene_order = row_number()) %>%
+  ungroup() %>%
+  mutate(Module_order = as.integer(Module))
+
+# Match curated UPR genes to filtered insoluble proteins
+upr_info <- protein_tbl_filt %>%
+  mutate(Gene_key = str_to_lower(Gene_clean)) %>%
+  inner_join(upr_module_key, by = "Gene_key") %>%
+  left_join(
+    res_age %>% select(Protein, logFC, P.Value, adj.P.Val),
+    by = "Protein"
+  ) %>%
+  arrange(Module_order, Gene_order, Protein)
+
+# Save missing genes for troubleshooting
+missing_upr_genes <- upr_module_key %>%
+  anti_join(
+    protein_tbl_filt %>%
+      mutate(Gene_key = str_to_lower(Gene_clean)) %>%
+      distinct(Gene_key),
+    by = "Gene_key"
+  ) %>%
+  arrange(Module_order, Gene_order)
+
+write.csv(
+  missing_upr_genes,
+  file.path(upr_dir, "UPR_missing.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  upr_info,
+  file.path(upr_dir, "UPR_stats.csv"),
+  row.names = FALSE
+)
+
+if (nrow(upr_info) >= 2) {
+
+  hm_upr_mat <- mat_log[upr_info$Protein, col_order, drop = FALSE]
+
+  hm_upr_z <- zscore_clip(hm_upr_mat)
+
+  upr_row_split <- factor(
+    as.character(upr_info$Module),
+    levels = levels(upr_module_key$Module)
+  )
+
+  upr_row_labels <- make.unique(upr_info$Gene_Label)
+
+  ht_upr_pvals <- pval_columns_heatmap(
+    upr_info,
+    raw_col = "P.Value",
+    fdr_col = "adj.P.Val",
+    row_names = rownames(hm_upr_z),
+    width_mm = 24,
+    font_size = nm_style$upr_p
+  )
+
+  ht_upr <- Heatmap(
+    hm_upr_z,
+    use_raster = FALSE,
+    name = "Z-score",
+    col = heatmap_col_fun,
+    na_col = "grey85",
+    top_annotation = top_ann,
+    column_split = sample_meta_ord$Age,
+    column_gap = unit(4, "mm"),
+    row_split = upr_row_split,
+    row_gap = unit(4, "mm"),
+    row_title_side = "left",
+    row_title_rot = 90,
+    row_title_gp = gpar(fontsize = nm_style$upr_module, fontface = "bold", fontfamily = nm_style$font_family),
+    cluster_rows = FALSE,
+    cluster_row_slices = FALSE,
+    cluster_columns = FALSE,
+    cluster_column_slices = FALSE,
+    show_column_names = FALSE,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    row_labels = upr_row_labels,
+    row_names_gp = gpar(fontsize = nm_style$upr_row_label, fontface = "bold", fontfamily = nm_style$font_family),
+    column_title = "UPR / folding proteins",
+    column_title_gp = gpar(fontsize = nm_style$upr_title, fontface = "bold"),
+    border = FALSE,
+    heatmap_legend_param = list(
+      title = "Z-score",
+      title_position = "topcenter",
+      at = c(-z_clip, 0, z_clip),
+      labels = c(paste0("-", z_clip), "0", as.character(z_clip))
+    )
+  )
+
+  ht_upr_combined <- ht_upr + ht_upr_pvals
+
+  upr_h_mm <- nm_heatmap_height(nrow(upr_info), family = "upr")
+
+  register_heatmap(
+    "HM_UPR",
+    ht_upr_combined,
+    file.path(upr_dir, "HM_UPR"),
+    height_mm = upr_h_mm,
+    legend_grob = heatmap_legend_grob
+  )
+
+} else {
+
+  message("Skipping UPR module heatmap: fewer than 2 UPR proteins found after filtering.")
+
+}
+```
+
+```{r show-upr-heatmap, echo=FALSE}
+if (exists("ht_upr_combined") && !is.null(ht_upr_combined)) {
+  ComplexHeatmap::draw(ht_upr_combined, heatmap_legend_side = "right",
+                       annotation_legend_side = "right", merge_legend = FALSE)
+} else {
+  cat("*UPR heatmap was not generated (fewer than two curated proteins retained).*\n")
+}
+```
+
+# Age × Sex interaction plots
+
+Proteins with a significant Age × Sex interaction (default: raw *P* ≤ 0.05 **or** FDR ≤ 0.05 — an exploratory list; set `interaction_fdr_only <- TRUE` for FDR only) are plotted as mean ± SEM of log2 abundance for Adult → Old, with Female and Male as separate lines. Means and SEMs use the available observations (n per cell is in `Int/Interaction_mean_SEM_summary.csv`). The panel title shows the interaction raw *P* and FDR.
+
+```{r interaction-mean-sem-plots, fig.keep="none"}
+
+interaction_plot_dir <- file.path(out_dir, "Int")
+safe_dir_create(interaction_plot_dir)
+
+# Which proteins count as "significant interaction proteins"?
+#   FALSE = raw p <= 0.05 OR FDR <= 0.05 (exploratory; default)
+#   TRUE  = FDR <= 0.05 only
+interaction_fdr_only <- FALSE
+
+# Optional |log2FC| threshold for the interaction term (0 = none).
+interaction_lfc_cutoff <- 0
+
+interaction_sig <- res_int %>%
+  filter(
+    Protein %in% rownames(mat_log),
+    abs(logFC) >= interaction_lfc_cutoff,
+    if (interaction_fdr_only) {
+      !is.na(adj.P.Val) & adj.P.Val <= fdr_cutoff
+    } else {
+      (!is.na(P.Value) & P.Value <= raw_p_cutoff) |
+        (!is.na(adj.P.Val) & adj.P.Val <= fdr_cutoff)
+    }
+  ) %>%
+  mutate(
+    SigLabel = case_when(
+      !is.na(adj.P.Val) & adj.P.Val <= fdr_cutoff ~ "FDR <= 0.05",
+      !is.na(P.Value) & P.Value <= raw_p_cutoff ~ "Raw p <= 0.05",
+      TRUE ~ "NS"
+    )
+  ) %>%
+  arrange(adj.P.Val, P.Value)
+
+write.csv(
+  interaction_sig,
+  file.path(interaction_plot_dir, "Interaction_significant_proteins.csv"),
+  row.names = FALSE
+)
+
+if (nrow(interaction_sig) == 0) {
+  
+  message(
+    "No significant interaction proteins found using the selected criteria. ",
+    "Mean ± SEM interaction plots were not generated."
+  )
+  
+} else {
+  
+  interaction_long <- mat_log[interaction_sig$Protein, sample_meta$ID, drop = FALSE] %>%
+    as.data.frame() %>%
+    rownames_to_column("Protein") %>%
+    pivot_longer(
+      cols = -Protein,
+      names_to = "ID",
+      values_to = "log2_abundance"
+    ) %>%
+    left_join(
+      sample_meta %>% select(ID, Age, Sex, Group),
+      by = "ID"
+    ) %>%
+    left_join(
+      interaction_sig %>%
+        select(Protein, logFC, P.Value, adj.P.Val, SigLabel),
+      by = "Protein"
+    ) %>%
+    mutate(
+      Age = factor(Age, levels = c("Adult", "Old")),
+      Sex = factor(Sex, levels = c("Female", "Male")),
+      Group = factor(
+        Group,
+        levels = c("Adult_Female", "Old_Female", "Adult_Male", "Old_Male")
+      ),
+      Protein_label = paste0(
+        Protein,
+        "\nInt p=", format_p(P.Value),
+        "; FDR=", format_p(adj.P.Val)
+      )
+    )
+  
+  interaction_summary <- interaction_long %>%
+    group_by(Protein, Protein_label, Age, Sex, logFC, P.Value, adj.P.Val, SigLabel) %>%
+    summarise(
+      n = sum(!is.na(log2_abundance)),
+      mean_log2 = mean(log2_abundance, na.rm = TRUE),
+      sd_log2 = sd(log2_abundance, na.rm = TRUE),
+      sem_log2 = sd_log2 / sqrt(n),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      sem_log2 = ifelse(is.na(sem_log2), 0, sem_log2)
+    )
+  
+  write.csv(
+    interaction_summary,
+    file.path(interaction_plot_dir, "Interaction_mean_SEM_summary.csv"),
+    row.names = FALSE
+  )
+  
+  # ── Combined faceted plot ──────────────────────────────────────────────────
+  n_prot <- length(unique(interaction_summary$Protein))
+  ncol_interaction <- ifelse(n_prot <= 2, n_prot, nm_layout$interaction_columns)
+  nrow_interaction <- ceiling(n_prot / ncol_interaction)
+  
+  plot_w <- max(8, ncol_interaction * 4.0)
+  plot_h <- max(5.5, nrow_interaction * 3.5)
+  
+  p_interaction_all <- ggplot(
+    interaction_summary,
+    aes(x = Age, y = mean_log2, color = Sex, group = Sex)
+  ) +
+    geom_line(linewidth = nm_style$data_line, na.rm = TRUE) +
+    geom_point(size = nm_style$point_medium + 0.20, na.rm = TRUE) +
+    geom_errorbar(
+      aes(ymin = mean_log2 - sem_log2, ymax = mean_log2 + sem_log2),
+      width = 0.12,
+      linewidth = nm_style$axis_line,
+      na.rm = TRUE
+    ) +
+    scale_color_manual(values = sex_colours, drop = FALSE) +
+    facet_wrap(~ Protein_label, scales = "free_y", ncol = ncol_interaction) +
+    labs(
+      title = "Insoluble Fraction — Significant Age × Sex Interaction Proteins",
+      x = NULL,
+      y = "Mean log2 abundance",
+      color = "Sex"
+    ) +
+    theme_nm(legend_position = "right") +
+    theme(
+      axis.text.x = element_text(face = "plain", size = nm_style$axis_text)
+    )
+  
+  int_w_mm <- 183
+  int_h_mm <- max(90, 20 + nrow_interaction * nm_layout$interaction_mm_per_row)
+
+  p_interaction_all_export <- p_interaction_all +
+    ggplot2::labs(title = NULL, subtitle = NULL) +
+    ggplot2::theme(plot.title = ggplot2::element_blank(), plot.subtitle = ggplot2::element_blank())
+
+  register_plot(
+    "Int_all",
+    p_interaction_all_export,
+    file.path(interaction_plot_dir, "Int_all"),
+    width_mm = int_w_mm,
+    height_mm = int_h_mm
+  )
+  
+  # Readable 12-protein overview pages, in addition to the full Int_all.
+  # These are presentation-only subsets of the existing interaction_summary.
+  proteins_for_pages <- unique(as.character(interaction_sig$Protein))
+  page_size <- nm_layout$interaction_columns * nm_layout$interaction_page_rows
+  if (length(proteins_for_pages) > page_size) {
+    for (pg in seq_len(ceiling(length(proteins_for_pages) / page_size))) {
+      included <- proteins_for_pages[
+        seq.int((pg - 1L) * page_size + 1L,
+                min(pg * page_size, length(proteins_for_pages)))]
+      page_df <- interaction_summary %>% filter(Protein %in% included)
+      page_id <- sprintf("Int_all_Page_%02d", pg)
+      page_plot <- ggplot(
+        page_df, aes(x = Age, y = mean_log2, color = Sex, group = Sex)
+      ) +
+        geom_line(linewidth = nm_style$interaction_line, na.rm = TRUE) +
+        geom_point(size = nm_style$interaction_point, na.rm = TRUE) +
+        geom_errorbar(aes(ymin = mean_log2 - sem_log2,
+                          ymax = mean_log2 + sem_log2),
+                      width = 0.12, linewidth = nm_style$interaction_errorbar, na.rm = TRUE) +
+        scale_color_manual(values = sex_colours, drop = FALSE) +
+        facet_wrap(~ Protein_label, scales = "free_y", ncol = nm_layout$interaction_columns) +
+        labs(x = NULL, y = "Mean log2 abundance", color = "Sex") +
+        theme_nm(legend_position = "right")
+      register_plot(page_id, page_plot,
+                    file.path(interaction_plot_dir, page_id),
+                    spec_id = "interaction_page")
+    }
+  }
+
+  # ── Individual plots for each interaction protein ──────────────────────────
+  for (prot in unique(interaction_sig$Protein)) {
+    
+    dat_p <- interaction_summary %>%
+      filter(Protein == prot)
+    
+    lab_p <- unique(dat_p$Protein_label)[1]
+    
+    p_one <- ggplot(
+      dat_p,
+      aes(x = Age, y = mean_log2, color = Sex, group = Sex)
+    ) +
+      geom_line(linewidth = nm_style$data_line, na.rm = TRUE) +
+      geom_point(size = nm_style$point_medium + 0.25, na.rm = TRUE) +
+      geom_errorbar(
+        aes(ymin = mean_log2 - sem_log2, ymax = mean_log2 + sem_log2),
+        width = 0.12,
+        linewidth = nm_style$axis_line,
+        na.rm = TRUE
+      ) +
+      scale_color_manual(values = sex_colours, drop = FALSE) +
+      labs(
+        title = paste0("Insoluble — ", prot),
+        subtitle = lab_p,
+        x = NULL,
+        y = "Mean log2 abundance",
+        color = "Sex"
+      ) +
+      theme_nm(legend_position = "right")
+    
+    prot_tag <- substr(safe_filename(prot), 1, 30)
+
+    p_one_export <- p_one +
+      ggplot2::labs(title = NULL, subtitle = NULL) +
+      ggplot2::theme(plot.title = ggplot2::element_blank(), plot.subtitle = ggplot2::element_blank())
+
+    register_plot(
+      paste0("Int_", prot_tag),
+      p_one_export,
+      file.path(interaction_plot_dir, paste0("Int_", prot_tag)),
+      spec_id = "interaction_single"
+    )
+  }
+}
+
+message("\n✓ Plot objects registered. Final PNG/SVG export occurs in the centralized Manuscript figure exports chunk.")
+```
+
+## All interaction proteins
+
+```{r show-interaction-combined, echo=FALSE}
+if (exists("Int_all", envir = panel_registry, inherits = FALSE)) {
+  print(get("Int_all", envir = panel_registry, inherits = FALSE)$object)
+} else {
+  cat("*No interaction plot: no proteins met the selected criteria.*\n")
+}
+```
+
+## Individual proteins
+
+```{r show-interaction-individual, echo=FALSE}
+int_ids <- setdiff(sort(grep("^Int_", ls(panel_registry), value = TRUE)), "Int_all")
+if (length(int_ids) > 0) {
+  for (id in int_ids) print(get(id, envir = panel_registry, inherits = FALSE)$object)
+} else {
+  cat("*No individual interaction plots were generated.*\n")
+}
+```
+
+# Female versus Male age effects
+
+A proteome-wide view of the same 2 × 2 framework (not restricted to the most abundant proteins). The cell-means fit from above is reused to extract two simple contrasts:
+
+- **Female age effect:** Old Female − Adult Female
+- **Male age effect:** Old Male − Adult Male
+
+The Age × Sex interaction, (Old M − Adult M) − (Old F − Adult F), is the difference between the two axes. The dotted y = x line marks identical age effects in both sexes; points far from it have different estimated effects. **Shape** shows the formal interaction result (diamond = FDR ≤ 0.05, filled circle = raw *P* ≤ 0.05 only, open circle = NS). **Colour** is the prioritised GO Cellular Component bin (first match in a fixed priority order, after expanding each root to all descendants; the same bins as in the composition analysis). Only the eight manuscript bins are displayed; other proteins remain in the underlying tables (`SexAge/`). Up to 15 interaction-associated proteins are labelled.
+
+```{r female-male-age-effect-scatter-analysis, fig.keep="none"}
+sex_age_dir <- file.path(out_dir, "SexAge")
+safe_dir_create(sex_age_dir)
+
+# 1. Simple Age effect within each sex, from the EXISTING cell-means fit
+#    (no new filtering or imputation).
+sex_age_cont_mat <- makeContrasts(
+  Female_Age = Old_Female - Adult_Female,
+  Male_Age   = Old_Male - Adult_Male,
+  levels = design
+)
+fit_sex_age <- contrasts.fit(fit, sex_age_cont_mat)
+fit_sex_age <- eBayes(fit_sex_age, trend = TRUE)
+
+get_simple_age_result <- function(coef_name, prefix) {
+  out <- topTable(fit_sex_age, coef = coef_name, number = Inf, sort.by = "none") %>%
+    rownames_to_column("Protein") %>%
+    select(Protein, logFC, P.Value, adj.P.Val)
+  names(out)[names(out) == "logFC"]     <- paste0(prefix, "_logFC")
+  names(out)[names(out) == "P.Value"]   <- paste0(prefix, "_P")
+  names(out)[names(out) == "adj.P.Val"] <- paste0(prefix, "_FDR")
+  out
+}
+
+res_female_age <- get_simple_age_result("Female_Age", "Female")
+res_male_age   <- get_simple_age_result("Male_Age", "Male")
+
+# 2. Interaction results from the main model
+res_interaction_for_scatter <- res_int %>%
+  select(Protein, Interaction_logFC = logFC, Interaction_P = P.Value, Interaction_FDR = adj.P.Val)
+
+# 3. Prioritised GO Cellular Component bin per protein. The first matching bin
+#    in this order wins; roots are expanded with all GO descendants. The same
+#    bins and order are used in the composition analysis (script 4).
+bin_roots_scatter <- list(
+  "ECM"                 = "GO:0031012",
+  "Extracellular"       = "GO:0005576",
+  "Sarcomere/Myofibril" = c("GO:0030017", "GO:0030016", "GO:0043292"),
+  "Cytoskeleton"        = "GO:0005856",
+  "Mitochondrion"       = "GO:0005739",
+  "Nucleus"             = "GO:0005634",
+  "Ribosome"            = "GO:0005840",
+  "ER"                  = "GO:0005783",
+  "Golgi"               = "GO:0005794",
+  "Plasma membrane"     = "GO:0005886",
+  "Endosome/Lysosome"   = c("GO:0005768", "GO:0005764"),
+  "Proteasome"          = "GO:0000502",
+  "Cytosol"             = "GO:0005829"
+)
+bin_priority_scatter <- names(bin_roots_scatter)
+
+go_cc_offspring_scatter <- AnnotationDbi::as.list(GO.db::GOCCOFFSPRING)
+get_offspring_scatter <- function(go_id) unique(c(go_id, go_cc_offspring_scatter[[go_id]]))
+
+bin_terms_scatter <- lapply(
+  bin_roots_scatter,
+  function(ids) unique(unlist(lapply(ids, get_offspring_scatter), use.names = FALSE))
+)
+
+assign_bin_scatter <- function(go_vec) {
+  go_vec <- unique(go_vec[!is.na(go_vec)])
+  if (length(go_vec) == 0) return("Other/Unassigned")
+  for (b in bin_priority_scatter) {
+    if (any(go_vec %in% bin_terms_scatter[[b]])) return(b)
+  }
+  "Other/Unassigned"
+}
+
+scatter_genes <- protein_tbl_filt %>%
+  transmute(SYMBOL = as.character(Gene_clean)) %>%
+  filter(!is.na(SYMBOL), SYMBOL != "") %>%
+  distinct() %>%
+  pull(SYMBOL)
+
+scatter_gene2entrez <- suppressMessages(
+  AnnotationDbi::select(org.Mm.eg.db::org.Mm.eg.db, keys = scatter_genes,
+                        keytype = "SYMBOL", columns = c("SYMBOL", "ENTREZID"))
+) %>%
+  distinct(SYMBOL, ENTREZID) %>%
+  filter(!is.na(ENTREZID))
+
+scatter_entrez2go <- suppressMessages(
+  AnnotationDbi::select(org.Mm.eg.db::org.Mm.eg.db,
+                        keys = sort(unique(scatter_gene2entrez$ENTREZID)),
+                        keytype = "ENTREZID", columns = c("ENTREZID", "GO", "ONTOLOGY"))
+) %>%
+  filter(ONTOLOGY == "CC", !is.na(GO)) %>%
+  distinct(ENTREZID, GO)
+
+scatter_gene_bin <- scatter_gene2entrez %>%
+  left_join(scatter_entrez2go, by = "ENTREZID") %>%
+  group_by(SYMBOL) %>%
+  summarise(GO_CC = list(unique(GO)), .groups = "drop") %>%
+  mutate(Bin = vapply(GO_CC, assign_bin_scatter, character(1)))
+
+# 4. Join Female, Male, interaction, annotation and GO-CC bin
+sex_age_effects <- res_female_age %>%
+  inner_join(res_male_age, by = "Protein") %>%
+  inner_join(res_interaction_for_scatter, by = "Protein") %>%
+  left_join(protein_tbl_filt %>% select(Protein, Protein.Group, Gene_clean), by = "Protein") %>%
+  left_join(scatter_gene_bin %>% select(SYMBOL, Bin), by = c("Gene_clean" = "SYMBOL")) %>%
+  mutate(
+    Bin = if_else(is.na(Bin), "Other/Unassigned", Bin),
+    InteractionClass = case_when(
+      !is.na(Interaction_FDR) & Interaction_FDR <= fdr_cutoff ~ "FDR <= 0.05",
+      !is.na(Interaction_P) & Interaction_P <= raw_p_cutoff ~ "Raw p <= 0.05 only",
+      TRUE ~ "NS"
+    ),
+    Distance_from_identity = abs(Male_logFC - Female_logFC)
+  )
+
+write.csv(sex_age_effects,
+          file.path(sex_age_dir, "Female_vs_Male_AgeEffects_limma.csv"), row.names = FALSE)
+
+write.csv(
+  sex_age_effects %>% filter(InteractionClass != "NS") %>% arrange(Interaction_FDR, Interaction_P),
+  file.path(sex_age_dir, "AgeXSex_interaction_rawP_or_FDR.csv"), row.names = FALSE
+)
+
+# 5. Cellular-component palette (over all assigned bins; only the eight
+#    manuscript bins are displayed)
+bin_order_scatter <- c("Sarcomere/Myofibril", "Cytoskeleton", "Extracellular", "ECM",
+                       "Nucleus", "Mitochondrion", "Plasma membrane", "Cytosol")
+
+all_assigned_bins_scatter <- sort(unique(sex_age_effects$Bin[sex_age_effects$Bin != "Other/Unassigned"]))
+
+bin_pal_scatter <- setNames(
+  viridisLite::viridis(length(all_assigned_bins_scatter), option = "D", end = 0.95),
+  all_assigned_bins_scatter
+)
+
+scatter_tbl <- sex_age_effects %>%
+  filter(Bin %in% bin_order_scatter, is.finite(Female_logFC), is.finite(Male_logFC)) %>%
+  mutate(
+    Bin = factor(Bin, levels = bin_order_scatter),
+    InteractionClass = factor(InteractionClass,
+                              levels = c("FDR <= 0.05", "Raw p <= 0.05 only", "NS"))
+  )
+
+# 6. Label (graphics only) up to 15 interaction-associated proteins
+scatter_labels <- scatter_tbl %>%
+  filter(InteractionClass != "NS") %>%
+  mutate(
+    label_priority = case_when(InteractionClass == "FDR <= 0.05" ~ 1L, TRUE ~ 2L),
+    sort_fdr = if_else(is.na(Interaction_FDR), Inf, Interaction_FDR),
+    sort_p   = if_else(is.na(Interaction_P), Inf, Interaction_P)
+  ) %>%
+  arrange(label_priority, sort_fdr, sort_p, desc(Distance_from_identity)) %>%
+  slice_head(n = 15)
+
+scatter_lim <- max(abs(c(scatter_tbl$Female_logFC, scatter_tbl$Male_logFC)), na.rm = TRUE)
+if (!is.finite(scatter_lim) || scatter_lim == 0) scatter_lim <- 1
+scatter_lim <- scatter_lim * 1.08
+
+# 7. Plot
+p_female_male_age <- ggplot(
+  scatter_tbl,
+  aes(
+    x = Female_logFC,
+    y = Male_logFC
+  )
+) +
+
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dotted",
+    colour = "grey35",
+    linewidth = nm_style$axis_line
+  ) +
+
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    colour = "grey70",
+    linewidth = nm_style$axis_line
+  ) +
+
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    colour = "grey70",
+    linewidth = nm_style$axis_line
+  ) +
+
+  geom_point(
+    aes(
+      colour = Bin,
+      shape = InteractionClass
+    ),
+    size = nm_style$point_medium,
+    alpha = 0.88,
+    stroke = 0.35
+  ) +
+
+  ggrepel::geom_text_repel(
+    data =
+      scatter_labels,
+
+    aes(
+      label = Gene_clean,
+      colour = Bin
+    ),
+
+    size = nm_style$small_text / 2.845276,
+    family = nm_style$font_family,
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    min.segment.length = 0,
+    segment.size = 0.18,
+    show.legend = FALSE
+  ) +
+
+  scale_colour_manual(
+    values =
+      bin_pal_scatter[
+        bin_order_scatter
+      ],
+    drop = FALSE,
+    name =
+      "Cellular component"
+  ) +
+
+  scale_shape_manual(
+    values = c(
+      "FDR <= 0.05" =
+        18,
+
+      "Raw p <= 0.05 only" =
+        16,
+
+      "NS" =
+        1
+    ),
+
+    breaks = c(
+      "FDR <= 0.05",
+      "Raw p <= 0.05 only",
+      "NS"
+    ),
+
+    name =
+      "Age x Sex interaction"
+  ) +
+
+  coord_equal(
+    xlim = c(
+      -scatter_lim,
+      scatter_lim
+    ),
+    ylim = c(
+      -scatter_lim,
+      scatter_lim
+    ),
+    clip = "off"
+  ) +
+
+  labs(
+    title =
+      "Age effects on insoluble protein abundance in Female and Male mice",
+
+    subtitle =
+      "Dotted y = x indicates identical age effects. \nA point away from y = x indicates different estimated aging effects between sexes",
+
+    x =
+      "Female age effect: log2FC (Old - Adult)",
+
+    y =
+      "Male age effect: log2FC (Old - Adult)",
+  ) +
+
+  theme_nm(legend_position = "right")
+
+
+p_female_male_age_export <- p_female_male_age +
+  ggplot2::labs(title = NULL, subtitle = NULL) +
+  ggplot2::theme(plot.title = ggplot2::element_blank(), plot.subtitle = ggplot2::element_blank())
+
+register_plot(
+  "Female_vs_Male_AgeEffects_Insoluble",
+  p_female_male_age_export,
+  file.path(
+    sex_age_dir,
+    "Female_vs_Male_AgeEffects_Insoluble"
+  )
+)
+```
+
+```{r show-female-male-age-effect-scatter, echo=FALSE}
+print(p_female_male_age)
+```
+
+# Figure export and reproducibility
+
+All registered panels are written here in one step: 600-dpi PNG, editable Inkscape-safe SVG, separate legend files, and `Ins_AO/Figure_Export_Manifest.csv` (final sizes and paths). To re-export one panel later, use `reexport("Panel_ID")` rather than rerunning everything.
+
+```{r manuscript-figure-exports, results="hide"}
+export_all_panels()
+figure_manifest <- figure_export_manifest()
+message("\n✓ Figure exports complete. Manifest: ", normalizePath(file.path(out_dir, "Figure_Export_Manifest.csv"), mustWork = FALSE))
+```
+
+```{r session-info}
+sessionInfo()
+```

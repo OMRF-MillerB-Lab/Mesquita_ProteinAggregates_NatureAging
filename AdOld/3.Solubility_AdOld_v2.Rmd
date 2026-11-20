@@ -1,0 +1,1236 @@
+---
+title: "Protein solubility — Adult vs Old"
+subtitle: "Soluble/Total display and log2(Insoluble/Soluble) Age × Sex analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    self_contained: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r rmarkdown-options, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE, error = FALSE,
+  fig.align = "center", cache = FALSE, dev = "ragg_png"
+)
+```
+
+# Overview {-}
+
+**Question.** How does the partitioning of each protein between the detergent-soluble and detergent-insoluble fractions of skeletal muscle change with age, and does the change differ between females and males?
+
+**Design.** Gastrocnemius, control mice only; Age (Adult, Old) × Sex (Female, Male). Soluble and insoluble measurements are matched **by protein and animal**. Sample sizes are printed in *Data preparation*.
+
+**Two related measures**
+
+| Measure | What it is | Used for |
+|---|---|---|
+| **Soluble versus total abundance** | For each protein and age group: mean soluble abundance plotted against mean total (soluble + insoluble) abundance, both volume-corrected. The dashed diagonal is 100 % solubility (Soluble = Total). | Descriptive display only (no test) |
+| **log2(Insoluble / Soluble)** | Per animal and protein: log2(Insoluble) − log2(Soluble), after volume correction. Higher = relatively more insoluble. | Statistical analysis (limma) |
+
+**Statistical approach (in brief)**
+
+| Step | What is done |
+|---|---|
+| Matching | Proteins present in both fraction tables; samples present in both; non-positive values treated as missing |
+| Volume correction | Soluble × 60 and insoluble × 40, so both fractions are expressed per whole-fraction equivalent (see *Settings*). This shifts every log2 ratio by the same constant and does not change the Age, Sex or interaction contrasts. |
+| Filter | ≥ 2 valid paired ratios in **each** Age group (sexes pooled). This differs from the 50 % detection filter of the single-fraction analyses. No imputation, no normalization. |
+| Model | limma cell-means model on the four Age × Sex groups; `eBayes(trend = TRUE)` |
+| Contrasts | **Age** (Old − Adult, averaged over sex), **Sex** (Male − Female, averaged over age), **Age × Sex interaction** |
+| Multiple testing | Benjamini–Hochberg across retained proteins, separately for each contrast |
+| Significance | Raw *P* ≤ 0.05 and FDR ≤ 0.05 are reported separately; **no log2FC threshold** (the ±0.5 volcano lines are visual references only) |
+
+**Outputs** (all under `Solubility_AO_v2/`; figures as PNG + editable SVG with separate legends):
+
+| Folder | Content |
+|---|---|
+| `SolTotal/` | Soluble-versus-total figure, GO-CC bin table, plotted table |
+| `Ratio/` | Retained proteins, group means, limma tables for each contrast, volcano plots, Female-versus-Male scatter |
+| `Interactions/` | Mean ± SEM plots (grid and one file per protein) with their tables |
+| `QC/` | Figure-export manifest and panel dimensions |
+
+> **To run:** keep the three input CSV files (see *Settings*) and the `R/` folder next to this file, then knit. Code is folded by default; use the **Code** buttons to expand it.
+
+# Setup
+
+## Packages
+
+All packages must be installed beforehand (the script stops and lists any that are missing). Package load order is kept identical to the original analysis because it determines which functions mask which.
+
+```{r packages}
+pkgs <- c("tidyverse", "ggrepel", "patchwork", "viridisLite", "ragg", "limma",
+          "org.Mm.eg.db", "GO.db", "AnnotationDbi", "svglite")
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Install missing packages first: ", paste(missing_pkgs, collapse = ", "), call. = FALSE)
+}
+invisible(lapply(pkgs[1:9], library, character.only = TRUE))
+select <- dplyr::select   # AnnotationDbi masks dplyr::select
+```
+
+## Settings
+
+```{r user-settings}
+data_dir   <- "."     # folder holding the three input files
+sol_file   <- file.path(data_dir, "Aggregates_Soluble.csv")
+ins_file   <- file.path(data_dir, "Aggregates_Insoluble.csv")
+meta_file  <- file.path(data_dir, "Aggregates_SampleList_Mesquita.csv")
+helper_dir <- "R"     # folder holding nm_export_engine_ratio_AO.R
+
+out_dir <- "Solubility_AO_v2"
+
+# Output sub-folders (organised by analysis class; nothing is written to the root)
+soltot_dir       <- file.path(out_dir, "SolTotal")
+soltot_fig_dir   <- file.path(soltot_dir, "Figures")
+soltot_data_dir  <- file.path(soltot_dir, "Data")
+ratio_dir        <- file.path(out_dir, "Ratio")
+ratio_vol_dir    <- file.path(ratio_dir, "Volcano")
+ratio_stats_dir  <- file.path(ratio_dir, "Statistics")
+ratio_sexage_dir <- file.path(ratio_dir, "SexAge")
+int_dir          <- file.path(out_dir, "Interactions")
+int_grid_dir     <- file.path(int_dir, "Grid")
+int_one_dir      <- file.path(int_dir, "Individual")
+int_stats_dir    <- file.path(int_dir, "Statistics")
+qc_dir           <- file.path(out_dir, "QC")
+
+for (d in c(soltot_fig_dir, soltot_data_dir, ratio_vol_dir, ratio_stats_dir,
+            ratio_sexage_dir, int_grid_dir, int_one_dir, int_stats_dir, qc_dir)) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+
+# Significance (volcano_lfc_ref is a visual reference only; it never defines significance)
+raw_p_cutoff    <- 0.05
+fdr_cutoff      <- 0.05
+volcano_lfc_ref <- 0.50
+
+# Keep a protein if it has at least this many valid paired ratios in EACH Age group
+min_n_ratio <- 2
+
+# Volume correction to whole-fraction equivalents: 5 uL LC input after a 1:1 Laemmli
+# dilution represents 2.5 uL of the original fraction.
+#   Soluble:   150 uL / 2.5 uL = 60        Insoluble: 100 uL / 2.5 uL = 40
+sol_scale_factor <- 60
+ins_scale_factor <- 40
+
+# Interaction plots: FALSE = raw-P or FDR-significant proteins, TRUE = FDR-significant only
+interaction_fdr_only   <- FALSE
+interaction_lfc_cutoff <- 0     # no effect-size threshold by default
+
+# Colours
+col_up      <- "#D62728"
+col_down    <- "#1F77B4"
+col_ns      <- "grey75"
+sex_colours <- c("Female" = "#CC78BC", "Male" = "#029E73")
+```
+
+## Figure export settings (presentation only)
+
+Panel sizes (mm), font sizes (pt) and line/point sizes used for the exported PNG/SVG files. Editing them changes only how figures are drawn and saved, never the statistics. Each panel ID is the exact PNG/SVG file name. The export functions live in `R/nm_export_engine_ratio_AO.R`.
+
+```{r NATURE_FIGURE_HELPER_EDIT_HERE, echo=FALSE}
+# ============================================================================
+# NATURE FIGURE HELPER — ADULT vs OLD INSOLUBLE/SOLUBLE RATIO
+# The only place to edit figure sizes, legends, fonts and interaction geometry.
+# Do not edit statistical models or individual ggsave() calls for figure sizing.
+# ============================================================================
+
+# ---- 1. Manuscript export settings ----
+nm_export_version <- "AO_Ratio_5.0_Explicit_Catalog"
+nm_export <- list(
+  dpi = 600,
+  font = "Arial",
+  legend_width_mm = 38,
+  legend_height_mm = 24,
+  separate_legends = TRUE,
+  compact_style = TRUE,
+  remove_plot_titles = TRUE
+)
+
+# ---- 2. Visual style: text in pt, lines/points in ggplot mm units ----
+nm_style <- list(
+  font_family = "sans",
+  axis_title = 7.0,
+  axis_text = 6.5,
+  strip_text = 7.0,
+  strip_stats = 6.0,
+  legend_title = 6.5,
+  legend_text = 6.0,
+  stat_text = 6.0,
+  small_text = 5.7,
+  axis_line = 0.18,
+  data_line = 0.28,
+  point_small = 0.85,
+  point_medium = 1.15,
+  point_mean = 1.40,
+  # Age × Sex interactions: grid AND each individual protein plot
+  interaction_line = 0.32,
+  interaction_errorbar = 0.25,
+  interaction_point = 1.35,
+  interaction_error_cap = 0.10,
+  interaction_strip_pt = 6.3
+)
+
+# ---- 3. EXACT PANEL IDs AND PHYSICAL DIMENSIONS (width, height; mm) ----
+# These names must match the basename (without .png/.svg) of the saved figure.
+# Re-export one: reexport("Volcano_Age_Old_vs_Adult")
+# For the all-interactions grid: NA means use the DATA-DRIVEN geometry in (6).
+# Override it with actual mm values here, or by set_panel_size() at runtime.
+nm_dims <- list(
+  # SolTotal/Figures/
+  Solubility_Adult_Old                  = c(width = 116, height = 60),
+
+  # Ratio/Volcano/
+  Volcano_Age_Old_vs_Adult             = c(width = 57, height = 55),
+  Volcano_Sex_Male_vs_Female           = c(width = 57, height = 55),
+  Volcano_AgeXSex_Interaction          = c(width = 57, height = 55),
+
+  # Interactions/Grid/ -- height grows with the number of protein facet rows
+  MeanSEM_Ratio_Interaction_All        = c(width = NA_real_, height = NA_real_),
+
+  # Ratio/SexAge/
+  Female_vs_Male_AgeEffects_InsSolRatio = c(width = 85, height = 75)
+)
+
+# ---- 4. CONDITIONAL INTERACTION FIGURES ----
+# Exported IDs: MeanSEM_Ratio_<safe_filename(protein row ID)>
+# All individual proteins default to 53 × 49 mm.
+# To set one protein to a different size, add e.g.:
+# nm_dims[["MeanSEM_Ratio_Capza2"]] <- c(width = 58, height = 53)
+# To change ALL individual interaction figures, change interaction_one below.
+# The other family values are DERIVED from nm_dims, so the static panel settings
+# above remain the single source of truth for those figures.
+nm_family_dims <- list(
+  soltotal        = nm_dims$Solubility_Adult_Old,
+  volcano         = nm_dims$Volcano_Age_Old_vs_Adult,
+  interaction_all = c(width = NA_real_, height = NA_real_),
+  interaction_one = c(width = 53, height = 49),
+  sex_scatter     = nm_dims$Female_vs_Male_AgeEffects_InsSolRatio
+)
+
+# Regex order is important: grid must be matched before individual proteins.
+nm_family_rules <- c(
+  "^Solubility_Adult_Old$" = "soltotal",
+  "^Volcano_" = "volcano",
+  "^MeanSEM_Ratio_Interaction_All$" = "interaction_all",
+  "^MeanSEM_Ratio_" = "interaction_one",
+  "^Female_vs_Male_AgeEffects_InsSolRatio$" = "sex_scatter"
+)
+
+# ---- 5. STANDALONE LEGEND DIMENSIONS (mm) ----
+# Identical defaults are written explicitly so each legend can be resized here.
+# The per-protein interactions share the legend saved alongside the grid.
+# set_legend_size("ID", 45, 30) remains available for interactive adjustment.
+nm_legend_dims <- list(
+  Solubility_Adult_Old                  = c(width = 38, height = 24),
+  Volcano_Age_Old_vs_Adult             = c(width = 38, height = 24),
+  Volcano_Sex_Male_vs_Female           = c(width = 38, height = 24),
+  Volcano_AgeXSex_Interaction          = c(width = 38, height = 24),
+  MeanSEM_Ratio_Interaction_All        = c(width = 38, height = 24),
+  Female_vs_Male_AgeEffects_InsSolRatio = c(width = 38, height = 24)
+)
+
+# ---- 6. DATA-DRIVEN ALL-INTERACTIONS GRID GEOMETRY (mm) ----
+# ncol = min(n_proteins, max_columns); nrow = ceiling(n_proteins / ncol).
+# With 3 columns: width=min(172, 16 + 3*50 + 2*3) = 172 mm.
+# height = 18 + 43 * nrow mm (e.g. 3 rows -> 147 mm; 5 -> 233 mm).
+# To change columns/spacing/row height, rerun the interaction plotting chunk.
+nm_grid_layout <- list(
+  max_columns = 3L,
+  facet_width_mm = 50,
+  facet_height_mm = 43,
+  outer_width_mm = 16,
+  outer_height_mm = 18,
+  between_col_mm = 3,
+  max_width_mm = 172
+)
+
+nm_interaction_grid_geometry <- function(n_proteins) {
+  stopifnot(length(n_proteins) == 1L,
+            is.finite(n_proteins), n_proteins > 0)
+  cols <- min(as.integer(n_proteins), nm_grid_layout$max_columns)
+  rows <- ceiling(n_proteins / cols)
+  width <- min(nm_grid_layout$max_width_mm,
+               nm_grid_layout$outer_width_mm +
+                 cols * nm_grid_layout$facet_width_mm +
+                 (cols - 1) * nm_grid_layout$between_col_mm)
+  height <- nm_grid_layout$outer_height_mm + rows * nm_grid_layout$facet_height_mm
+  list(ncol = cols, nrow = rows,
+       width_mm = width, height_mm = height)
+}
+
+# ---- 7. DETAILED FIGURE CATALOG (descriptions, folders and source chunks) ----
+# Exact names: one static ID per exported panel; the last entry is a template.
+# Each figure exports PNG + SVG. Legends export as *_legend.png and .svg
+# when a legend is present, except individual interactions (one shared legend).
+figure_specs <- list(
+  Solubility_Adult_Old = list(
+    family = "soltotal", folder = "SolTotal/Figures",
+    plotting_chunk = "solubility-figure", legend = "separate",
+    description = "Adult/Old log10 soluble versus total protein abundance; GO-CC colors"),
+  Volcano_Age_Old_vs_Adult = list(
+    family = "volcano", folder = "Ratio/Volcano",
+    plotting_chunk = "ratio-volcanoes", legend = "separate if present",
+    description = "Old versus Adult main effect on log2(Ins/Sol)"),
+  Volcano_Sex_Male_vs_Female = list(
+    family = "volcano", folder = "Ratio/Volcano",
+    plotting_chunk = "ratio-volcanoes", legend = "separate if present",
+    description = "Male versus Female main effect on log2(Ins/Sol)"),
+  Volcano_AgeXSex_Interaction = list(
+    family = "volcano", folder = "Ratio/Volcano",
+    plotting_chunk = "ratio-volcanoes", legend = "separate if present",
+    description = "Age × Sex effect on log2(Ins/Sol)"),
+  MeanSEM_Ratio_Interaction_All = list(
+    family = "interaction_all", folder = "Interactions/Grid",
+    plotting_chunk = "interaction-plots", legend = "shared separate legend",
+    description = "All eligible interaction proteins; female/male age trends and SEM; automatic grid height"),
+  MeanSEM_Ratio_INDIVIDUAL_PROTEIN = list(
+    family = "interaction_one", folder = "Interactions/Individual",
+    plotting_chunk = "interaction-plots", legend = "uses grid legend",
+    description = "TEMPLATE: MeanSEM_Ratio_<safe protein ID>; one protein, Age × Sex mean ± SEM"),
+  Female_vs_Male_AgeEffects_InsSolRatio = list(
+    family = "sex_scatter", folder = "Ratio/SexAge",
+    plotting_chunk = "female-male-solubility-age-effect-analysis",
+    legend = "separate if present",
+    description = "Sex-specific Old–Adult log2(Ins/Sol) effects across proteins")
+)
+
+# Keep dynamically generated protein descriptions when this chunk is rerun.
+if (!exists("nm_panel_notes", inherits = FALSE)) nm_panel_notes <- list()
+for (id in setdiff(names(figure_specs), "MeanSEM_Ratio_INDIVIDUAL_PROTEIN")) {
+  nm_panel_notes[[id]] <- figure_specs[[id]]$description
+}
+
+# A readable catalog of every possible figure TYPE. Individual interaction
+# IDs are data-dependent and become exact after the interaction-plots chunk.
+nm_dimension_catalog <- function() {
+  do.call(rbind, lapply(names(figure_specs), function(id) {
+    spec <- figure_specs[[id]]
+    sz <- if (identical(spec$family, "interaction_one")) {
+      nm_family_dims$interaction_one
+    } else nm_dims[[id]]
+    data.frame(
+      Panel_ID = if (id == "MeanSEM_Ratio_INDIVIDUAL_PROTEIN")
+        "MeanSEM_Ratio_<safe protein ID>" else id,
+      Family = spec$family,
+      Width_mm = if (is.na(sz[["width"]])) "auto" else as.character(sz[["width"]]),
+      Height_mm = if (is.na(sz[["height"]])) "auto" else as.character(sz[["height"]]),
+      Output_folder = file.path(out_dir, spec$folder),
+      Source_chunk = spec$plotting_chunk,
+      Legend = spec$legend,
+      Description = spec$description,
+      stringsAsFactors = FALSE
+    )
+  }))
+}
+
+# For all registered figures, including exact protein-specific names:
+# list_configured_panels() after running the plotting chunks.
+list_configured_panels <- function() {
+  # Search the enclosing chunk/global environment, not only this call frame.
+  registered_ids <- if (exists("nm_registry", inherits = TRUE) &&
+                        is.environment(nm_registry)) ls(nm_registry)
+                    else character()
+  ids <- sort(unique(c(names(nm_dims), registered_ids)))
+  if (!length(ids)) return(invisible(data.frame()))
+  z <- do.call(rbind, lapply(ids, function(id) {
+    registered <- id %in% registered_ids
+    dims <- if (registered) nm_dimensions(id) else nm_dims[[id]]
+    if (is.null(dims)) dims <- c(width = NA_real_, height = NA_real_)
+    data.frame(Panel_ID = id, Family = nm_family(id),
+               Width_mm = unname(dims[["width"]]),
+               Height_mm = unname(dims[["height"]]),
+               Status = if (registered) "Registered" else "Run plotting chunk",
+               stringsAsFactors = FALSE)
+  }))
+  print(z, row.names = FALSE)
+  invisible(z)
+}
+
+# ---- 8. RE-EXPORT EXAMPLES (run in Console after plotting chunks) ----
+# nm_dimension_catalog()                        # every figure type + output folder
+# list_configured_panels()                       # all IDs including generated proteins
+# list_panels("MeanSEM_Ratio_")                   # exact registered protein IDs
+# reexport("Solubility_Adult_Old")
+# set_panel_size("MeanSEM_Ratio_Interaction_All", 172, 220)
+# reexport("MeanSEM_Ratio_Interaction_All")
+# set_family_size("interaction_one", 58, 53)
+# reexport_family("interaction_one")
+# set_panel_size("MeanSEM_Ratio_Capza2", 60, 55) # only if Capza2 is registered
+# reexport("MeanSEM_Ratio_Capza2")
+# export_all_panels()
+# figure_export_manifest()
+```
+The table below is generated from the settings above. An interaction grid's `auto` height is calculated from its number of protein facets when the figure is built.
+
+```{r nm-display-figure-catalog, echo=FALSE, results='asis'}
+knitr::kable(nm_dimension_catalog(), format = "html", escape = TRUE)
+```
+
+```{r nm-export-engine, echo=FALSE}
+engine_file <- file.path(helper_dir, "nm_export_engine_ratio_AO.R")
+if (!file.exists(engine_file)) {
+  stop("Cannot find the figure-export file '", engine_file, "' (working directory: ", getwd(),
+       "). Copy the 'R' folder from the zip next to this Rmd and the input CSVs, or set helper_dir.",
+       call. = FALSE)
+}
+source(engine_file, local = knitr::knit_global())
+```
+
+## Helper functions
+
+```{r helpers}
+safe_filename <- function(x) {
+  x %>%
+    stringr::str_replace_all("[^A-Za-z0-9]+", "_") %>%
+    stringr::str_replace_all("^_|_$", "")
+}
+
+format_p <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "NA",
+    p < 0.001 ~ "<0.001",
+    TRUE ~ sprintf("%.3f", p)
+  )
+}
+
+# Shared PNG/SVG export (sizes are resolved from the figure settings above)
+save_plot_png <- function(plot, file, width, height, dpi = 300) {
+  nm_save_plot(plot, file, width, height, dpi)
+}
+
+# Show a saved figure in the report, or a note if it was not generated
+show_png <- function(file, missing_note) {
+  if (file.exists(file)) knitr::include_graphics(file) else cat(missing_note)
+}
+```
+
+# Data preparation
+
+Reads both fraction tables and the sample list, keeps **Control** animals aged **Adult** or **Old** that are present in both fractions, matches proteins by `Protein.Group`, converts non-positive values to missing and applies the volume correction. Proteins are labelled by gene symbol (made unique with `make.unique`).
+
+```{r load-match-data}
+for (f in c(sol_file, ins_file, meta_file)) {
+  if (!file.exists(f)) stop("File not found: ", f)
+}
+
+df_sol <- read.csv(sol_file, check.names = FALSE, stringsAsFactors = FALSE)
+df_ins <- read.csv(ins_file, check.names = FALSE, stringsAsFactors = FALSE)
+meta   <- read.csv(meta_file, check.names = FALSE, stringsAsFactors = FALSE)
+
+required_meta <- c("ID", "Age", "Treatment", "Sex")
+missing_meta <- setdiff(required_meta, colnames(meta))
+if (length(missing_meta) > 0) {
+  stop("Missing metadata columns: ", paste(missing_meta, collapse = ", "))
+}
+
+required_frac <- c("Protein.Group", "Genes")
+if (length(setdiff(required_frac, colnames(df_sol))) > 0) {
+  stop("Required columns are missing from the soluble table.")
+}
+if (length(setdiff(required_frac, colnames(df_ins))) > 0) {
+  stop("Required columns are missing from the insoluble table.")
+}
+
+ctrl <- meta %>%
+  mutate(
+    ID = as.character(ID),
+    Treatment = stringr::str_to_title(trimws(as.character(Treatment))),
+    Age = stringr::str_to_title(trimws(as.character(Age))),
+    Sex = stringr::str_to_title(trimws(as.character(Sex)))
+  ) %>%
+  filter(
+    Treatment == "Control",
+    Age %in% c("Adult", "Old")
+  ) %>%
+  mutate(
+    Age = factor(Age, levels = c("Adult", "Old")),
+    Sex = factor(Sex, levels = c("Female", "Male"))
+  )
+
+samples_both <- intersect(colnames(df_sol), colnames(df_ins))
+
+ctrl <- ctrl %>%
+  filter(ID %in% samples_both) %>%
+  mutate(
+    Group = factor(
+      paste(Age, Sex, sep = "_"),
+      levels = c(
+        "Adult_Female", "Adult_Male",
+        "Old_Female", "Old_Male"
+      )
+    )
+  ) %>%
+  arrange(Age, Sex, ID)
+
+if (nrow(ctrl) == 0) {
+  stop("No Adult/Old Control samples were found in both fraction tables.")
+}
+
+all_cols   <- ctrl$ID
+adult_cols <- ctrl %>% filter(Age == "Adult") %>% pull(ID)
+old_cols   <- ctrl %>% filter(Age == "Old") %>% pull(ID)
+
+cat("Sample counts per Age × Sex group:\n")
+print(table(ctrl$Age, ctrl$Sex))
+
+common_pg <- intersect(df_sol$Protein.Group, df_ins$Protein.Group)
+
+if (length(common_pg) == 0) {
+  stop("No overlapping Protein.Group entries were found between fractions.")
+}
+
+common_pg_sorted <- sort(common_pg)
+
+sol_sub <- df_sol %>%
+  filter(Protein.Group %in% common_pg) %>%
+  select(Protein.Group, Genes, all_of(all_cols)) %>%
+  arrange(match(Protein.Group, common_pg_sorted))
+
+ins_sub <- df_ins %>%
+  filter(Protein.Group %in% common_pg) %>%
+  select(Protein.Group, Genes, all_of(all_cols)) %>%
+  arrange(match(Protein.Group, common_pg_sorted))
+
+stopifnot(identical(sol_sub$Protein.Group, ins_sub$Protein.Group))
+
+gene_display <- ifelse(
+  !is.na(sol_sub$Genes) & sol_sub$Genes != "",
+  sol_sub$Genes,
+  ifelse(
+    !is.na(ins_sub$Genes) & ins_sub$Genes != "",
+    ins_sub$Genes,
+    sol_sub$Protein.Group
+  )
+)
+
+row_id <- make.unique(gene_display)
+
+row_map <- tibble(
+  row_id = row_id,
+  Protein.Group = sol_sub$Protein.Group,
+  Gene = gene_display
+)
+
+mat_sol <- sol_sub %>%
+  select(all_of(all_cols)) %>%
+  as.matrix()
+
+mat_ins <- ins_sub %>%
+  select(all_of(all_cols)) %>%
+  as.matrix()
+
+storage.mode(mat_sol) <- "numeric"
+storage.mode(mat_ins) <- "numeric"
+
+rownames(mat_sol) <- row_id
+rownames(mat_ins) <- row_id
+
+mat_sol[mat_sol <= 0] <- NA
+mat_ins[mat_ins <= 0] <- NA
+
+# Apply the fraction-volume correction before any cross-fraction ratio
+# or Soluble/Total calculation.
+mat_sol_corrected <- mat_sol * sol_scale_factor
+mat_ins_corrected <- mat_ins * ins_scale_factor
+```
+
+# Paired insoluble-to-soluble ratios
+
+A ratio exists only when the protein is detected in **both** fractions of the same animal. A protein is kept if it has at least `r min_n_ratio` valid ratios in each Age group. Because the filter is applied per Age group (sexes pooled), some Age × Sex cells can be sparse; the model diagnostics in the *limma* section report how many.
+
+```{r build-ratios}
+ratio_mat <- log2(mat_ins_corrected) - log2(mat_sol_corrected)
+
+cat(sprintf("Proteins before ratio filter: %d\n", nrow(ratio_mat)))
+
+keep_ratio <- (
+  rowSums(!is.na(ratio_mat[, adult_cols, drop = FALSE])) >= min_n_ratio &
+  rowSums(!is.na(ratio_mat[, old_cols, drop = FALSE])) >= min_n_ratio
+)
+
+ratio_filt <- ratio_mat[keep_ratio, , drop = FALSE]
+
+row_map_filt <- row_map %>%
+  filter(row_id %in% rownames(ratio_filt))
+
+cat(sprintf("Proteins after ratio filter: %d\n", nrow(ratio_filt)))
+
+if (nrow(ratio_filt) == 0) {
+  stop("No proteins passed the Insoluble/Soluble ratio filter.")
+}
+
+write.csv(
+  row_map_filt,
+  file.path(ratio_stats_dir, "Proteins_ratio_retained.csv"),
+  row.names = FALSE
+)
+
+ratio_long <- ratio_filt[, ctrl$ID, drop = FALSE] %>%
+  as.data.frame() %>%
+  rownames_to_column("row_id") %>%
+  pivot_longer(
+    cols = -row_id,
+    names_to = "ID",
+    values_to = "log2_InsSol"
+  ) %>%
+  left_join(
+    ctrl %>% select(ID, Age, Sex, Group),
+    by = "ID"
+  ) %>%
+  left_join(row_map_filt, by = "row_id")
+
+ratio_group_summary <- ratio_long %>%
+  group_by(row_id, Protein.Group, Gene, Age, Sex, Group) %>%
+  summarise(
+    n_valid = sum(!is.na(log2_InsSol)),
+    mean_ratio = mean(log2_InsSol, na.rm = TRUE),
+    sem_ratio = sd(log2_InsSol, na.rm = TRUE) /
+      sqrt(sum(!is.na(log2_InsSol))),
+    .groups = "drop"
+  )
+
+write.csv(
+  ratio_group_summary,
+  file.path(ratio_stats_dir, "Ratio_group_summary.csv"),
+  row.names = FALSE
+)
+```
+
+# Individual protein solubility
+
+The display uses the proteins retained for the ratio analysis. For every protein and age group, soluble and total abundance are averaged over animals that have **both** fractions measured (sexes pooled; mean taken on the linear scale, then log10-transformed).
+
+## GO Cellular Component bins
+
+Each protein is assigned to one GO Cellular Component bin using a fixed priority order (first match wins; each bin includes its GO-CC descendant terms). Proteins with no match are labelled "Other".
+
+```{r go-cc-bins}
+bin_roots <- list(
+  "ECM"                 = c("GO:0031012"),
+  "Extracellular"       = c("GO:0005576"),
+  "Sarcomere/Myofibril" = c("GO:0030017", "GO:0030016", "GO:0043292"),
+  "Cytoskeleton"        = c("GO:0005856"),
+  "Mitochondrion"       = c("GO:0005739"),
+  "Nucleus"             = c("GO:0005634"),
+  "Ribosome"            = c("GO:0005840"),
+  "ER"                  = c("GO:0005783"),
+  "Golgi"               = c("GO:0005794"),
+  "Plasma membrane"     = c("GO:0005886"),
+  "Endosome/Lysosome"   = c("GO:0005768", "GO:0005764"),
+  "Proteasome"          = c("GO:0000502"),
+  "Cytosol"             = c("GO:0005829")
+)
+
+bin_priority <- names(bin_roots)
+
+go_cc_offspring <- AnnotationDbi::as.list(GO.db::GOCCOFFSPRING)
+
+get_offspring <- function(go_id) {
+  kids <- go_cc_offspring[[go_id]]
+  unique(c(go_id, kids))
+}
+
+bin_terms <- lapply(
+  bin_roots,
+  function(ids) {
+    unique(unlist(lapply(ids, get_offspring), use.names = FALSE))
+  }
+)
+
+assign_bin <- function(go_vec) {
+  go_vec <- unique(go_vec[!is.na(go_vec)])
+
+  if (length(go_vec) == 0) return("Other")
+
+  for (b in bin_priority) {
+    if (any(go_vec %in% bin_terms[[b]])) {
+      return(b)
+    }
+  }
+
+  "Other"
+}
+
+genes_cc <- sort(unique(na.omit(row_map_filt$Gene)))
+
+g2e_cc <- suppressMessages(
+  AnnotationDbi::select(
+    org.Mm.eg.db::org.Mm.eg.db,
+    keys = genes_cc,
+    keytype = "SYMBOL",
+    columns = c("SYMBOL", "ENTREZID")
+  )
+) %>%
+  distinct(SYMBOL, ENTREZID) %>%
+  filter(!is.na(ENTREZID))
+
+e2go_cc <- suppressMessages(
+  AnnotationDbi::select(
+    org.Mm.eg.db::org.Mm.eg.db,
+    keys = unique(g2e_cc$ENTREZID),
+    keytype = "ENTREZID",
+    columns = c("ENTREZID", "GO", "ONTOLOGY")
+  )
+) %>%
+  filter(ONTOLOGY == "CC", !is.na(GO)) %>%
+  distinct(ENTREZID, GO)
+
+gene_bin_cc <- g2e_cc %>%
+  left_join(e2go_cc, by = "ENTREZID") %>%
+  group_by(SYMBOL) %>%
+  summarise(
+    GO_CC = list(unique(GO)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Bin = vapply(GO_CC, assign_bin, character(1))
+  )
+
+write.csv(
+  gene_bin_cc %>% select(SYMBOL, Bin),
+  file.path(soltot_data_dir, "GO_CC_bins.csv"),
+  row.names = FALSE
+)
+```
+
+## Soluble versus total abundance
+
+```{r solubility-figure, fig.keep="none"}
+sol_long_plot <- mat_sol_corrected[rownames(ratio_filt), ctrl$ID, drop = FALSE] %>%
+  as.data.frame() %>%
+  rownames_to_column("row_id") %>%
+  pivot_longer(cols = -row_id, names_to = "ID", values_to = "Soluble") %>%
+  left_join(ctrl %>% select(ID, Age, Sex, Group), by = "ID") %>%
+  left_join(row_map_filt, by = "row_id")
+
+ins_long_plot <- mat_ins_corrected[rownames(ratio_filt), ctrl$ID, drop = FALSE] %>%
+  as.data.frame() %>%
+  rownames_to_column("row_id") %>%
+  pivot_longer(cols = -row_id, names_to = "ID", values_to = "Insoluble") %>%
+  select(row_id, ID, Insoluble)
+
+sol_total_df <- sol_long_plot %>%
+  left_join(ins_long_plot, by = c("row_id", "ID")) %>%
+  filter(!is.na(Soluble), !is.na(Insoluble)) %>%
+  mutate(Total = Soluble + Insoluble) %>%
+  group_by(row_id, Protein.Group, Gene, Age) %>%
+  summarise(n_paired = n(), mean_soluble = mean(Soluble), mean_total = mean(Total), .groups = "drop") %>%
+  mutate(
+    log10_total = if_else(mean_total > 0, log10(mean_total), NA_real_),
+    log10_sol   = if_else(mean_soluble > 0, log10(mean_soluble), NA_real_)
+  ) %>%
+  filter(!is.na(log10_total), !is.na(log10_sol)) %>%
+  left_join(gene_bin_cc %>% select(SYMBOL, Bin), by = c("Gene" = "SYMBOL")) %>%
+  mutate(Bin = if_else(is.na(Bin), "Other", Bin), Age = factor(Age, levels = c("Adult", "Old")))
+
+# Colours by GO-CC bin (also reused by the Female-versus-Male scatter)
+bins_present <- sort(unique(sol_total_df$Bin[sol_total_df$Bin != "Other"]))
+bin_pal <- setNames(viridisLite::viridis(length(bins_present), option = "D", end = 0.95), bins_present)
+bin_pal["Other"] <- "grey75"
+bin_levels <- c(bins_present, "Other")
+
+sol_total_df <- sol_total_df %>% mutate(Bin = factor(Bin, levels = bin_levels))
+
+lims_soltot <- range(c(sol_total_df$log10_total, sol_total_df$log10_sol), na.rm = TRUE)
+lims_soltot <- c(floor(lims_soltot[1]), ceiling(lims_soltot[2]))
+
+p_sol_total <- ggplot(sol_total_df, aes(x = log10_total, y = log10_sol, colour = Bin)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "black", linewidth = 0.7) +
+  geom_point(data = sol_total_df %>% filter(Bin == "Other"), alpha = 0.30, size = 1.8) +
+  geom_point(data = sol_total_df %>% filter(Bin != "Other"), alpha = 0.75, size = 2.2) +
+  scale_colour_manual(
+    values = bin_pal, breaks = bin_levels, drop = TRUE, name = "Cellular Component",
+    guide = guide_legend(override.aes = list(size = 3.5, alpha = 1))
+  ) +
+  coord_equal(xlim = lims_soltot, ylim = lims_soltot) +
+  facet_wrap(~ Age, nrow = 1) +
+  labs(
+    title = "Individual Protein Solubility",
+    subtitle = paste0("Dashed diagonal: 100% solubility (Soluble = Total). ",
+                      "Points farther below the diagonal have lower solubility."),
+    x = expression(log[10]("Total Abundance (Soluble + Insoluble)")),
+    y = expression(log[10]("Soluble Abundance"))
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 17),
+    plot.subtitle = element_text(colour = "grey35", size = 11),
+    strip.text = element_text(face = "bold", size = 13),
+    legend.position = "right"
+  )
+
+soltot_png <- file.path(soltot_fig_dir, "Solubility_Adult_Old.png")
+save_plot_png(p_sol_total, soltot_png, width = 14, height = 5.5, dpi = 300)
+
+write.csv(sol_total_df, file.path(soltot_data_dir, "Solubility_Adult_Old_table.csv"), row.names = FALSE)
+```
+
+```{r show-solubility-figure, echo=FALSE, results="asis", out.width="100%"}
+show_png(soltot_png, "*Soluble-versus-total figure was not generated.*")
+```
+
+# limma analysis of log2(Insoluble/Soluble)
+
+The cell-means model contains the groups Adult Female, Adult Male, Old Female and Old Male. **Age** estimates Old − Adult averaged equally over sexes; **Sex** estimates Male − Female averaged equally over ages; the **interaction** tests whether the Age effect differs between males and females. Positive log2 fold changes mean a higher insoluble-to-soluble ratio.
+
+```{r limma-ratio}
+group_vec <- factor(ctrl$Group, levels = c("Adult_Female", "Adult_Male", "Old_Female", "Old_Male"))
+
+design <- model.matrix(~ 0 + group_vec)
+colnames(design) <- levels(group_vec)
+
+fit <- limma::lmFit(ratio_filt[, ctrl$ID, drop = FALSE], design)
+
+cont_mat <- limma::makeContrasts(
+  Age         = (Old_Female + Old_Male) / 2 - (Adult_Female + Adult_Male) / 2,
+  Sex         = (Adult_Male + Old_Male) / 2 - (Adult_Female + Old_Female) / 2,
+  Interaction = (Old_Male - Old_Female) - (Adult_Male - Adult_Female),
+  levels = design
+)
+
+fit2 <- limma::contrasts.fit(fit, cont_mat)
+fit2 <- limma::eBayes(fit2, trend = TRUE)
+
+get_res <- function(coef_name, contrast_label, x_label) {
+  limma::topTable(fit2, coef = coef_name, number = Inf, sort.by = "none") %>%
+    rownames_to_column("row_id") %>%
+    left_join(row_map_filt, by = "row_id") %>%
+    mutate(
+      Contrast = contrast_label,
+      X_label = x_label,
+      SigFDR = !is.na(adj.P.Val) & adj.P.Val <= fdr_cutoff,
+      SigRawOnly = !is.na(P.Value) & P.Value <= raw_p_cutoff & !SigFDR,
+      SigAny = SigFDR | SigRawOnly,
+      SigClass = case_when(SigFDR ~ "FDR <= 0.05", SigRawOnly ~ "Raw p <= 0.05", TRUE ~ "NS"),
+      Direction = case_when(SigAny & logFC > 0 ~ "Up", SigAny & logFC < 0 ~ "Down", TRUE ~ "NS")
+    )
+}
+
+res_age <- get_res("Age", "Age: Old vs Adult", "log2FC on ratio (Old / Adult)")
+res_sex <- get_res("Sex", "Sex: Male vs Female", "log2FC on ratio (Male / Female)")
+res_int <- get_res("Interaction", "Age × Sex interaction", "Interaction log2FC")
+
+write.csv(res_age, file.path(ratio_stats_dir, "DE_Ratio_Age_Old_vs_Adult.csv"), row.names = FALSE)
+write.csv(res_sex, file.path(ratio_stats_dir, "DE_Ratio_Sex_Male_vs_Female.csv"), row.names = FALSE)
+write.csv(res_int, file.path(ratio_stats_dir, "DE_Ratio_AgeXSex_Interaction.csv"), row.names = FALSE)
+
+summary_counts <- bind_rows(res_age, res_sex, res_int) %>%
+  count(Contrast, SigClass, Direction, name = "n") %>%
+  arrange(Contrast, SigClass, Direction)
+write.csv(summary_counts, file.path(ratio_stats_dir, "DE_Ratio_summary_counts.csv"), row.names = FALSE)
+```
+
+```{r limma-summary, echo=FALSE, results="asis"}
+print(knitr::kable(summary_counts, caption = "Number of proteins per contrast, significance class and direction."))
+
+cell_n <- sapply(levels(group_vec), function(g)
+  rowSums(!is.na(ratio_filt[, ctrl$ID[ctrl$Group == g], drop = FALSE])))
+print(knitr::kable(
+  tibble(Contrast = c("Age", "Sex", "Interaction"),
+         `Proteins tested` = nrow(ratio_filt),
+         `With NA statistics` = c(sum(is.na(res_age$P.Value)), sum(is.na(res_sex$P.Value)), sum(is.na(res_int$P.Value))),
+         `Proteins with an empty Age × Sex cell` = sum(apply(cell_n, 1, min) == 0),
+         `Proteins with < 2 ratios in a cell` = sum(apply(cell_n, 1, min) < 2)),
+  caption = "Model diagnostics: the filter is applied per Age group (sexes pooled), so some proteins can have sparsely populated Age × Sex cells."))
+```
+
+# Volcano plots
+
+Open coloured circles: raw *P* ≤ 0.05 but not FDR-significant. Solid coloured circles: FDR ≤ 0.05. Red = higher, blue = lower insoluble-to-soluble ratio. The horizontal dashed line is raw *P* = 0.05; the vertical lines at ±0.5 are visual references only. The five lowest-*P* proteins in each direction are labelled.
+
+```{r ratio-volcanoes, fig.keep="none"}
+make_ratio_volcano <- function(res, file_tag, plot_title) {
+
+  res_plot <- res %>%
+    mutate(
+      neg_log10_p = -log10(P.Value),
+      neg_log10_p = ifelse(is.finite(neg_log10_p), neg_log10_p, NA_real_),
+      DirectionLegend = case_when(SigAny & logFC > 0 ~ "Up", SigAny & logFC < 0 ~ "Down", TRUE ~ "NS"),
+      DirectionLegend = factor(DirectionLegend, levels = c("Up", "Down", "NS")),
+      SigShape = case_when(SigFDR ~ "FDR", SigRawOnly ~ "Raw p-value", TRUE ~ "NS"),
+      SigShape = factor(SigShape, levels = c("FDR", "Raw p-value", "NS"))
+    )
+
+  label_tbl <- bind_rows(
+    res_plot %>% filter(SigAny, logFC > 0) %>% slice_min(P.Value, n = 5, with_ties = FALSE),
+    res_plot %>% filter(SigAny, logFC < 0) %>% slice_min(P.Value, n = 5, with_ties = FALSE)
+  ) %>%
+    distinct(row_id, .keep_all = TRUE)
+
+  n_up   <- sum(res_plot$SigAny & res_plot$logFC > 0, na.rm = TRUE)
+  n_down <- sum(res_plot$SigAny & res_plot$logFC < 0, na.rm = TRUE)
+  n_ns   <- sum(!res_plot$SigAny, na.rm = TRUE)
+
+  direction_colors <- c("Up" = col_up, "Down" = col_down, "NS" = col_ns)
+  direction_labels <- c("Up" = paste0("Up (", n_up, ")"),
+                        "Down" = paste0("Down (", n_down, ")"),
+                        "NS" = paste0("NS (", n_ns, ")"))
+  shape_values <- c("FDR" = 16, "Raw p-value" = 1, "NS" = 16)
+
+  p <- ggplot(res_plot, aes(x = logFC, y = neg_log10_p)) +
+    geom_point(aes(color = DirectionLegend, shape = SigShape),
+               size = 2.3, stroke = 0.9, alpha = 0.90, na.rm = TRUE) +
+    geom_hline(yintercept = -log10(raw_p_cutoff), linetype = "dashed", colour = "grey55", linewidth = 0.45) +
+    geom_vline(xintercept = c(-volcano_lfc_ref, volcano_lfc_ref),
+               linetype = "dashed", colour = "grey65", linewidth = 0.45) +
+    ggrepel::geom_text_repel(
+      data = label_tbl, aes(label = row_id), size = 3, max.overlaps = 20,
+      box.padding = 0.35, point.padding = 0.25, segment.size = 0.25, segment.alpha = 0.55,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(values = direction_colors, labels = direction_labels, drop = FALSE, name = NULL) +
+    scale_shape_manual(
+      values = shape_values, breaks = c("FDR", "Raw p-value"),
+      labels = c(paste0("FDR ≤ ", fdr_cutoff), paste0("Raw p-value ≤ ", raw_p_cutoff)),
+      drop = FALSE, name = NULL
+    ) +
+    guides(
+      color = guide_legend(order = 1, override.aes = list(shape = 16, size = 3, alpha = 1)),
+      shape = guide_legend(order = 2, override.aes = list(color = "black", size = 3, alpha = 1))
+    ) +
+    labs(title = plot_title, x = unique(res$X_label), y = "-log10(raw p-value)") +
+    theme_classic(base_size = 13) +
+    theme(plot.title = element_text(face = "bold"), legend.position = "right",
+          legend.text = element_text(size = 9))
+
+  out_png <- file.path(ratio_vol_dir, paste0("Volcano_", file_tag, ".png"))
+  save_plot_png(p, out_png, width = 7.8, height = 6.2, dpi = 300)
+
+  list(plot = p, file = out_png)
+}
+
+v_age <- make_ratio_volcano(res_age, "Age_Old_vs_Adult", "Insoluble-to-Soluble Ratio — Age: Old vs Adult")
+v_sex <- make_ratio_volcano(res_sex, "Sex_Male_vs_Female", "Insoluble-to-Soluble Ratio — Sex: Male vs Female")
+v_int <- make_ratio_volcano(res_int, "AgeXSex_Interaction", "Insoluble-to-Soluble Ratio — Age × Sex interaction")
+```
+
+## Age effect
+
+```{r show-ratio-volcano-age, echo=FALSE, results="asis", out.width="75%"}
+show_png(v_age$file, "*Age volcano plot was not generated.*")
+```
+
+## Sex effect
+
+```{r show-ratio-volcano-sex, echo=FALSE, results="asis", out.width="75%"}
+show_png(v_sex$file, "*Sex volcano plot was not generated.*")
+```
+
+## Age × Sex interaction
+
+```{r show-ratio-volcano-interaction, echo=FALSE, results="asis", out.width="75%"}
+show_png(v_int$file, "*Interaction volcano plot was not generated.*")
+```
+
+# Mean ± SEM plots for Age × Sex interactions
+
+Plots are drawn for proteins with an interaction raw *P* ≤ 0.05 or FDR ≤ 0.05 (set `interaction_fdr_only <- TRUE` for FDR only). Raw-*P* selection can yield many proteins; treat these plots as descriptive. A cell with a single observation is drawn with SEM = 0.
+
+```{r interaction-plots, fig.keep="none"}
+interaction_sig <- res_int %>%
+  filter(
+    row_id %in% rownames(ratio_filt),
+    abs(logFC) >= interaction_lfc_cutoff,
+    if (interaction_fdr_only) SigFDR else SigAny
+  ) %>%
+  mutate(SigLabel = case_when(SigFDR ~ "FDR <= 0.05", SigRawOnly ~ "Raw p <= 0.05", TRUE ~ "NS")) %>%
+  arrange(adj.P.Val, P.Value)
+
+write.csv(interaction_sig, file.path(int_stats_dir, "Interaction_significant.csv"), row.names = FALSE)
+
+interaction_all_png <- NA_character_
+interaction_individual_files <- character(0)
+
+if (nrow(interaction_sig) == 0) {
+
+  message("No significant ratio interaction proteins were identified using the selected criteria.")
+
+} else {
+
+  interaction_long <- ratio_long %>%
+    filter(row_id %in% interaction_sig$row_id) %>%
+    left_join(interaction_sig %>% select(row_id, logFC, P.Value, adj.P.Val, SigLabel), by = "row_id") %>%
+    mutate(
+      Age = factor(Age, levels = c("Adult", "Old")),
+      Sex = factor(Sex, levels = c("Female", "Male")),
+      Protein_label = paste0(row_id, "\nInt p=", format_p(P.Value), "; FDR=", format_p(adj.P.Val))
+    )
+
+  protein_label_levels <- interaction_sig %>%
+    mutate(Protein_label = paste0(row_id, "\nInt p=", format_p(P.Value), "; FDR=", format_p(adj.P.Val))) %>%
+    pull(Protein_label)
+
+  interaction_long <- interaction_long %>%
+    mutate(Protein_label = factor(Protein_label, levels = protein_label_levels))
+
+  interaction_summary <- interaction_long %>%
+    group_by(row_id, Protein_label, Age, Sex, logFC, P.Value, adj.P.Val, SigLabel) %>%
+    summarise(
+      n = sum(!is.na(log2_InsSol)),
+      mean_ratio = mean(log2_InsSol, na.rm = TRUE),
+      sd_ratio = sd(log2_InsSol, na.rm = TRUE),
+      sem_ratio = sd_ratio / sqrt(n),
+      .groups = "drop"
+    ) %>%
+    mutate(sem_ratio = ifelse(is.na(sem_ratio), 0, sem_ratio))
+
+  write.csv(interaction_summary, file.path(int_stats_dir, "Interaction_mean_SEM_summary.csv"), row.names = FALSE)
+
+  n_prot <- length(unique(interaction_summary$row_id))
+
+  # Grid geometry (mm) comes from the figure settings; save_plot_png() takes inches
+  grid_geometry <- nm_interaction_grid_geometry(n_prot)
+  ncol_interaction <- grid_geometry$ncol
+  nrow_interaction <- grid_geometry$nrow
+  plot_w <- grid_geometry$width_mm / 25.4
+  plot_h <- grid_geometry$height_mm / 25.4
+
+  interaction_subtitle <- if (interaction_fdr_only) {
+    paste0("FDR ≤ ", fdr_cutoff, " | means ± SEM")
+  } else {
+    paste0("Raw p ≤ ", raw_p_cutoff, " or FDR ≤ ", fdr_cutoff, " | means ± SEM")
+  }
+
+  p_interaction_all <- ggplot(interaction_summary, aes(x = Age, y = mean_ratio, color = Sex, group = Sex)) +
+    geom_line(linewidth = nm_style$interaction_line, na.rm = TRUE) +
+    geom_point(aes(shape = Sex), size = nm_style$interaction_point, na.rm = TRUE) +
+    geom_errorbar(aes(ymin = mean_ratio - sem_ratio, ymax = mean_ratio + sem_ratio),
+                  width = nm_style$interaction_error_cap, linewidth = nm_style$interaction_errorbar,
+                  na.rm = TRUE) +
+    scale_color_manual(values = sex_colours, drop = FALSE) +
+    scale_shape_manual(values = c(Female = 16, Male = 17), drop = FALSE) +
+    facet_wrap(~ Protein_label, scales = "free_y", ncol = ncol_interaction) +
+    labs(
+      title = paste0("Significant Age × Sex Interaction Proteins — ", "Insoluble-to-Soluble Ratio"),
+      subtitle = interaction_subtitle,
+      x = NULL, y = "Mean log2(Insoluble/Soluble)", color = "Sex"
+    ) +
+    theme_classic(base_size = 8) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0, size = 8),
+      plot.subtitle = element_text(colour = "grey35", hjust = 0, size = 7),
+      strip.background = element_rect(fill = "white", color = "black", linewidth = nm_style$axis_line),
+      strip.text = element_text(face = "bold", size = nm_style$interaction_strip_pt),
+      axis.text.x = element_text(size = 6.5),
+      axis.title.y = element_text(face = "bold"),
+      legend.position = "right"
+    )
+
+  interaction_all_png <- file.path(int_grid_dir, "MeanSEM_Ratio_Interaction_All.png")
+  save_plot_png(p_interaction_all, interaction_all_png, width = plot_w, height = plot_h, dpi = 300)
+
+  for (prot in interaction_sig$row_id) {
+
+    dat_p <- interaction_summary %>% filter(row_id == prot)
+    lab_p <- as.character(unique(dat_p$Protein_label)[1])
+
+    p_one <- ggplot(dat_p, aes(x = Age, y = mean_ratio, color = Sex, group = Sex)) +
+      geom_line(linewidth = nm_style$interaction_line, na.rm = TRUE) +
+      geom_point(aes(shape = Sex), size = nm_style$interaction_point, na.rm = TRUE) +
+      geom_errorbar(aes(ymin = mean_ratio - sem_ratio, ymax = mean_ratio + sem_ratio),
+                    width = nm_style$interaction_error_cap, linewidth = nm_style$interaction_errorbar,
+                    na.rm = TRUE) +
+      scale_color_manual(values = sex_colours, drop = FALSE) +
+      scale_shape_manual(values = c(Female = 16, Male = 17), drop = FALSE) +
+      # The facet strip keeps protein ID and interaction P/FDR when the title is hidden for export
+      facet_wrap(~ Protein_label, ncol = 1, scales = "free_y") +
+      labs(
+        title = paste0("Insoluble-to-Soluble Ratio — ", prot),
+        subtitle = lab_p,
+        x = NULL, y = "Mean log2(Insoluble/Soluble)", color = "Sex"
+      ) +
+      theme_classic(base_size = 8) +
+      theme(
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(colour = "grey35", hjust = 0.5, size = nm_style$interaction_strip_pt),
+        axis.title.y = element_text(face = "bold"),
+        strip.background = element_rect(fill = "white", colour = "black", linewidth = nm_style$axis_line),
+        strip.text = element_text(size = nm_style$interaction_strip_pt, face = "bold"),
+        legend.position = "right"
+      )
+
+    this_file <- file.path(int_one_dir, paste0("MeanSEM_Ratio_", safe_filename(prot), ".png"))
+
+    nm_panel_notes[[paste0("MeanSEM_Ratio_", safe_filename(prot))]] <-
+      paste0("Protein ", prot, "; ", gsub("\n", "; ", lab_p), "; interaction means +/- SEM")
+
+    save_plot_png(p_one, this_file,
+                  width = nm_family_dims$interaction_one[["width"]] / 25.4,
+                  height = nm_family_dims$interaction_one[["height"]] / 25.4,
+                  dpi = 300)
+
+    interaction_individual_files <- c(interaction_individual_files, this_file)
+  }
+}
+```
+
+## All interaction proteins
+
+```{r show-interaction-combined, echo=FALSE, results="asis", out.width="100%"}
+if (length(interaction_all_png) == 1 && !is.na(interaction_all_png)) {
+  show_png(interaction_all_png, "*Interaction grid was not generated.*")
+} else {
+  cat("*No interaction plot: no proteins met the selected criteria.*")
+}
+```
+
+## Individual proteins
+
+```{r show-interaction-individual, echo=FALSE, results="asis", out.width="49%"}
+existing_files <- interaction_individual_files[file.exists(interaction_individual_files)]
+if (length(existing_files) > 0) knitr::include_graphics(existing_files) else cat("*No individual interaction plots were generated.*")
+```
+
+# Female versus Male age effects on protein solubility
+
+This plot is the solubility analogue of the Female-versus-Male insoluble-abundance scatter. Each point is a protein retained in the ratio analysis and assigned to one of eight displayed cellular-component bins (Sarcomere/Myofibril, Cytoskeleton, Extracellular, ECM, Nucleus, Mitochondrion, Plasma membrane, Cytosol); proteins in the other bins or in "Other" are in the output table but not drawn. It is not restricted to the most abundant proteins.
+
+The same paired-ratio matrix, protein filter and 2 × 2 limma fit as above are reused (no new filtering). Two simple age contrasts are extracted from that fit:
+
+$$\text{Female age effect} = \text{Old}_{F} - \text{Adult}_{F}, \qquad \text{Male age effect} = \text{Old}_{M} - \text{Adult}_{M}$$
+
+on the response $\log_2(\mathrm{Insoluble}/\mathrm{Soluble})$. A positive effect means aging shifts the protein toward a higher insoluble-to-soluble ratio; a negative effect means relatively greater solubility. The dotted *y = x* line marks identical effects in females and males. **Point shape shows the formal Age × Sex interaction from the main model**, so this scatter visualizes that test rather than adding a new one. Labels are limited to the 15 strongest interaction-associated proteins.
+
+```{r female-male-solubility-age-effect-analysis, fig.keep="none"}
+# Female- and male-specific age effects from the EXISTING fit (no new filter)
+sex_age_cont_mat <- limma::makeContrasts(
+  Female_Age = Old_Female - Adult_Female,
+  Male_Age   = Old_Male - Adult_Male,
+  levels = design
+)
+
+fit_sex_age <- limma::contrasts.fit(fit, sex_age_cont_mat)
+fit_sex_age <- limma::eBayes(fit_sex_age, trend = TRUE)
+
+get_simple_ratio_age_result <- function(coef_name, prefix) {
+  out <- limma::topTable(fit_sex_age, coef = coef_name, number = Inf, sort.by = "none") %>%
+    tibble::rownames_to_column("row_id") %>%
+    dplyr::select(row_id, logFC, P.Value, adj.P.Val)
+
+  names(out)[names(out) == "logFC"]     <- paste0(prefix, "_logFC")
+  names(out)[names(out) == "P.Value"]   <- paste0(prefix, "_P")
+  names(out)[names(out) == "adj.P.Val"] <- paste0(prefix, "_FDR")
+
+  out
+}
+
+res_female_ratio_age <- get_simple_ratio_age_result("Female_Age", "Female")
+res_male_ratio_age   <- get_simple_ratio_age_result("Male_Age", "Male")
+
+# The ORIGINAL Age × Sex interaction result
+res_ratio_interaction_scatter <- res_int %>%
+  dplyr::select(row_id, Interaction_logFC = logFC, Interaction_P = P.Value, Interaction_FDR = adj.P.Val)
+
+# Join effects, protein annotation and the GO-CC bins defined earlier
+ratio_sex_age_effects <- res_female_ratio_age %>%
+  inner_join(res_male_ratio_age, by = "row_id") %>%
+  inner_join(res_ratio_interaction_scatter, by = "row_id") %>%
+  left_join(row_map_filt %>% dplyr::select(row_id, Protein.Group, Gene), by = "row_id") %>%
+  left_join(gene_bin_cc %>% dplyr::select(SYMBOL, Bin), by = c("Gene" = "SYMBOL")) %>%
+  mutate(
+    Bin = if_else(is.na(Bin), "Other", Bin),
+    Gene_label = stringr::str_trim(stringr::str_remove(as.character(Gene), ";.*$")),
+    Gene_label = if_else(is.na(Gene_label) | Gene_label == "", as.character(Protein.Group), Gene_label),
+    InteractionClass = case_when(
+      !is.na(Interaction_FDR) & Interaction_FDR <= fdr_cutoff ~ "FDR <= 0.05",
+      !is.na(Interaction_P) & Interaction_P <= raw_p_cutoff ~ "Raw p <= 0.05 only",
+      TRUE ~ "NS"
+    ),
+    Distance_from_identity = abs(Male_logFC - Female_logFC)
+  )
+
+write.csv(ratio_sex_age_effects,
+          file.path(ratio_sexage_dir, "Female_vs_Male_AgeEffects_Ratio_limma.csv"), row.names = FALSE)
+
+write.csv(
+  ratio_sex_age_effects %>% filter(InteractionClass != "NS") %>% arrange(Interaction_FDR, Interaction_P),
+  file.path(ratio_sexage_dir, "AgeXSex_interaction_Ratio_rawP_or_FDR.csv"), row.names = FALSE
+)
+
+# Displayed cellular-component bins (kept only if present in the colour palette above)
+bin_order_ratio_scatter <- c("Sarcomere/Myofibril", "Cytoskeleton", "Extracellular", "ECM",
+                             "Nucleus", "Mitochondrion", "Plasma membrane", "Cytosol")
+bin_order_ratio_scatter <- bin_order_ratio_scatter[bin_order_ratio_scatter %in% names(bin_pal)]
+
+ratio_scatter_tbl <- ratio_sex_age_effects %>%
+  filter(Bin %in% bin_order_ratio_scatter, is.finite(Female_logFC), is.finite(Male_logFC)) %>%
+  mutate(
+    Bin = factor(Bin, levels = bin_order_ratio_scatter),
+    InteractionClass = factor(InteractionClass, levels = c("FDR <= 0.05", "Raw p <= 0.05 only", "NS"))
+  )
+
+# Labels: interaction-associated proteins only, FDR-significant first
+ratio_scatter_labels <- ratio_scatter_tbl %>%
+  filter(InteractionClass != "NS") %>%
+  mutate(
+    label_priority = case_when(InteractionClass == "FDR <= 0.05" ~ 1L, TRUE ~ 2L),
+    sort_fdr = if_else(is.na(Interaction_FDR), Inf, Interaction_FDR),
+    sort_p = if_else(is.na(Interaction_P), Inf, Interaction_P)
+  ) %>%
+  arrange(label_priority, sort_fdr, sort_p, dplyr::desc(Distance_from_identity)) %>%
+  slice_head(n = 15)
+
+ratio_scatter_lim <- max(abs(c(ratio_scatter_tbl$Female_logFC, ratio_scatter_tbl$Male_logFC)), na.rm = TRUE)
+if (!is.finite(ratio_scatter_lim) || ratio_scatter_lim == 0) ratio_scatter_lim <- 1
+ratio_scatter_lim <- ratio_scatter_lim * 1.08
+
+p_ratio_female_male_age <- ggplot(ratio_scatter_tbl, aes(x = Female_logFC, y = Male_logFC)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", colour = "grey35", linewidth = 0.65) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey70", linewidth = 0.45) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey70", linewidth = 0.45) +
+  geom_point(aes(colour = Bin, shape = InteractionClass), size = 2.7, alpha = 0.88, stroke = 0.95) +
+  ggrepel::geom_text_repel(
+    data = ratio_scatter_labels, aes(label = Gene_label, colour = Bin),
+    size = 3.0, max.overlaps = Inf, box.padding = 0.35, point.padding = 0.25,
+    min.segment.length = 0, segment.size = 0.25, show.legend = FALSE
+  ) +
+  scale_colour_manual(values = bin_pal[bin_order_ratio_scatter], breaks = bin_order_ratio_scatter,
+                      drop = FALSE, name = "Cellular component") +
+  scale_shape_manual(
+    values = c("FDR <= 0.05" = 18, "Raw p <= 0.05 only" = 16, "NS" = 1),
+    breaks = c("FDR <= 0.05", "Raw p <= 0.05 only", "NS"),
+    name = "Age x Sex interaction"
+  ) +
+  coord_equal(xlim = c(-ratio_scatter_lim, ratio_scatter_lim),
+              ylim = c(-ratio_scatter_lim, ratio_scatter_lim), clip = "off") +
+  labs(
+    title = "Age effects on protein solubility in Female and Male mice",
+    subtitle = "Dotted y = x indicates identical age effects. \nPositive values indicate an age-associated shift toward greater relative insolubility",
+    x = "Female age effect: log2FC on log2(Insoluble/Soluble) (Old - Adult)",
+    y = "Male age effect: log2FC on log2(Insoluble/Soluble) (Old - Adult)"
+  ) +
+  theme_classic(base_size = 12.5) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(colour = "grey35", size = 10),
+    plot.caption = element_text(colour = "grey45", size = 8, hjust = 0),
+    plot.caption.position = "plot",
+    legend.position = "right",
+    legend.text = element_text(size = 8.5),
+    plot.margin = margin(10, 15, 15, 10)
+  )
+
+ratio_female_male_age_png <- file.path(ratio_sexage_dir, "Female_vs_Male_AgeEffects_InsSolRatio.png")
+save_plot_png(p_ratio_female_male_age, ratio_female_male_age_png, width = 9.4, height = 7.7, dpi = 300)
+```
+
+```{r show-female-male-solubility-age-effect-scatter, echo=FALSE, results="asis", out.width="82%"}
+show_png(ratio_female_male_age_png, "*Female-versus-Male solubility age-effect scatter was not generated.*")
+```
+
+# Reproducibility
+
+The manifest under `QC/` lists every exported panel with its size (mm) and PNG/SVG location. Only plots created in the current R session can be re-exported; after restarting R, rerun the plotting chunks.
+
+```{r nm-export-manifest, results="hide"}
+figure_export_manifest()   # writes Solubility_AO_v2/QC/Figure_Export_Manifest.csv
+utils::write.csv(list_configured_panels(), file.path(qc_dir, "Figure_Dimensions.csv"), row.names = FALSE)
+```
+
+```{r session-info}
+sessionInfo()
+```

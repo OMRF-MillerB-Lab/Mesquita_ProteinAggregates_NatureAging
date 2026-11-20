@@ -1,0 +1,5336 @@
+---
+title: "Insoluble proteome composition — Adult vs Old"
+subtitle: "GO Cellular Component composition, abundance and detection prevalence: combined and sex-resolved analyses"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    self_contained: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r rmarkdown-options, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE, error = FALSE,
+  fig.align = "center", cache = FALSE, dev = "ragg_png"
+)
+```
+
+# Overview {-}
+
+**Question.** What is the cellular-component make-up of the insoluble skeletal-muscle proteome in adult and old mice, and do the age-related changes in composition, abundance and protein detection differ between females and males?
+
+**Design.** Gastrocnemius, control mice only; Age (Adult, Old) × Sex (Female, Male). Sample sizes are printed in *Load data*. Every protein is assigned to **one** GO Cellular Component bin and the same preprocessing and reproducibility filter are used throughout. Results are given twice:
+
+1. **Combined analysis:** Female and Male samples pooled within Adult and Old.
+2. **Sex-resolved analysis:** Adult Female, Old Female, Adult Male and Old Male kept separate, with Female- and Male-specific abundance and detection summaries.
+
+> **Scope.** The Age, Sex and Age × Sex tests in this report are **composition-level tests of cellular-component fractions**. Protein-level differential abundance (limma) is in the separate Insoluble report (script 2) and is not repeated here.
+
+**Methods in brief**
+
+| Step | What is done |
+|---|---|
+| Samples | Control animals, Adult or Old, Female or Male, present in the intensity table |
+| Detection | A protein is *detected* in a sample when its raw intensity is > 0; missing and non-positive values are non-detections. Raw (non-log) intensities are used for abundance weighting. |
+| GO-CC bins | The first listed gene symbol is annotated; each prespecified GO root is expanded with `GOCCOFFSPRING`; a protein gets the **first matching bin** in a fixed priority order. Unmatched proteins ("Other/Unassigned") are excluded from all bin-based analyses. |
+| Reproducibility filter | Keep a protein detected in **≥ 2 Adult OR ≥ 2 Old** samples (sexes pooled within age) |
+| Composition | **Abundance-weighted:** summed raw intensity of a bin ÷ total of all assigned, filtered proteins in that sample. **Count-weighted:** detected proteins in a bin ÷ all detected, assigned, filtered proteins. |
+| Composition tests | Per-sample fractions are arcsine-square-root transformed. Combined: `Fraction_asin ~ Age`. Factorial: `Fraction_asin ~ Age * Sex`, Type III *F* tests with sum-to-zero contrasts. Benjamini–Hochberg FDR across bins, separately for Age, Sex and Age × Sex. |
+| Summed raw abundance | Per mouse and bin, summed raw intensity; tests on `log2(sum)` with the same 2 × 2 model; Female- and Male-specific Old − Adult contrasts from `emmeans` (unadjusted *P*). BH across the eight displayed bins. |
+| Effect sizes | **Percentage-point:** Old − Adult in % of total insoluble abundance. **Within-bin relative:** `100 × (Old − Adult) / Adult`. 95 % percentile bootstrap CIs (5,000 resamples within age, fixed seeds). These are composition effect sizes, not protein-level effects. |
+| Protein summaries | Mean and median abundance among **positive detections only**; detection counts and prevalence are reported alongside |
+| Detection tests | Two-sided Fisher exact test of Adult vs Old detection per protein (pooled, and within each sex); BH across proteins within each analysis. Categories: **Old-only** (Old ≥ 2, Adult = 0), **Adult-only** (Adult ≥ 2, Old = 0), **Old-predominant** (Old ≥ 2, Adult ≤ 1). |
+
+**How to read the figures.** ER and Ribosome are omitted from several multi-panel figures because each is represented by one retained protein; they stay in the denominator, so the displayed fractions are **not** renormalized. Centered abundance displays subtract each protein's own across-group mean `log10` abundance and must not be used to compare absolute abundance between proteins. A protein that is Old-predominant in only one sex is a **descriptive** detection pattern, not evidence of an Age × Sex interaction; distance from the diagonal in the detection scatter is likewise not an interaction test.
+
+**Outputs.** Everything is written under `Comp_AO/` (`Shared/`, `Combined/`, `SexSplit/`); PNG and editable SVG with separate legends. The folder layout is listed in *Output guide*.
+
+> **To run:** keep the two input CSV files (see *Settings*) and the `R/` folder next to this file, then knit. Code is folded by default; use the **Code** buttons to expand it.
+
+# Setup
+
+## Packages
+
+All packages must be installed beforehand (the script stops and lists any that are missing). Package load order is kept identical to the original analysis because it determines which functions mask which.
+
+```{r packages}
+pkgs <- c("tidyverse", "scales", "viridisLite", "ggtext", "ggrepel", "patchwork", "ragg",
+          "car", "emmeans", "AnnotationDbi", "org.Mm.eg.db", "GO.db", "svglite")
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Install missing packages first: ", paste(missing_pkgs, collapse = ", "), call. = FALSE)
+}
+invisible(lapply(pkgs[1:12], library, character.only = TRUE))
+select <- dplyr::select   # AnnotationDbi masks dplyr::select
+```
+
+## Settings
+
+```{r user-settings}
+fraction_name <- "Insoluble"
+
+data_dir       <- "."     # folder holding the two input files
+intensity_file <- file.path(data_dir, "Aggregates_Insoluble.csv")
+meta_file      <- file.path(data_dir, "Aggregates_SampleList_Mesquita.csv")
+helper_dir     <- "R"     # folder holding nm_export_engine_comp_AO.R
+
+out_dir <- "Comp_AO"
+
+shared_dir <- file.path(out_dir, "Shared")
+
+combined_dir <- file.path(out_dir, "Combined")
+
+split_dir <- file.path(out_dir, "SexSplit")
+
+# Combined Adult-vs-Old outputs
+comp_dir <- file.path(combined_dir, "Composition")
+
+stats_dir <- file.path(combined_dir, "Stats")
+
+detect_dir <- file.path(combined_dir, "Detection")
+
+dot_dir <- file.path(combined_dir, "TopProteins")
+
+# Sex-resolved outputs
+comp_split_dir <- file.path(split_dir, "Composition")
+
+stats_split_dir <- file.path(split_dir, "Stats")
+
+split_detect_dir <- file.path(split_dir, "Detection")
+
+split_dot_dir <- file.path(split_dir, "TopProteins")
+
+for (
+  d in c(
+    out_dir,
+    shared_dir,
+    combined_dir,
+    split_dir,
+    comp_dir,
+    stats_dir,
+    detect_dir,
+    dot_dir,
+    comp_split_dir,
+    stats_split_dir,
+    split_detect_dir,
+    split_dot_dir
+  )
+) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+
+# Main reproducibility filter:
+# detected in >=2 Adult OR >=2 Old samples.
+min_detect_n <- 2
+
+# Bins omitted from selected final multi-panel figures because each is
+# represented by only one retained protein.
+bins_to_remove_display <- c("ER", "Ribosome")
+
+# Preferred order used in final multi-bin figures.
+bin_order_figure <- c(
+  "Sarcomere/Myofibril",
+  "Cytoskeleton",
+  "Extracellular",
+  "ECM",
+  "Nucleus",
+  "Mitochondrion",
+  "Plasma membrane",
+  "Cytosol"
+)
+
+col_adult <- "#3B528B"
+col_old   <- "#5DC863"
+
+sex_shapes <- c("Female" = 16, "Male"   = 17)
+```
+
+## Figure export settings (presentation only)
+
+Panel sizes (mm), font sizes (pt) and line/point sizes for the exported PNG/SVG files. Editing them changes only how figures are drawn and saved, never the statistics. Each panel ID is the exact PNG/SVG file name. The export functions live in `R/nm_export_engine_comp_AO.R`.
+
+The panel sizes approximate the placed artwork in **Figure 3** (180 × 225 mm page): `Mass_2x2` (a), `Count_2x2` (b), `Mass_2x2_noSarcoCyto_originalTotal` (c), `RawBin_2x2` (d), `RawBin_AgeEffects_E2` (e), `Top10_PooledOldRank_bySex_4Groups` (i) and `DetectionDelta_Female_vs_Male` (j); the microscopy panels f–h are not made here. To resize a figure after it has been generated, change its entry in `nm_dims`, run **this chunk only**, then call `reexport("Mass_2x2")` (or another ID). No model refitting is needed. Sizes embedded in a plotted layer (bar outlines, bubble sizes) need the plotting chunk to be rerun first.
+
+```{r NATURE_FIGURE_HELPER_EDIT_HERE, echo=FALSE}
+# Single source of truth: no second dimension or typography registry below.
+nm_export_version <- "Comp_AO_Fig3_v12_ReferenceScaled"
+nm_export <- list(dpi = 600, font = "Arial", legend_width_mm = 60,
+                  legend_height_mm = 58, separate_legends = TRUE,
+                  compact_style = TRUE, remove_plot_titles = TRUE,
+                  legend_auto_fit = TRUE, legend_padding_mm = 3.5)
+
+# Central Nature-format presentation settings (sizes in points, lines in mm).
+# Edit sizes in NATURE_FIGURE_HELPER_EDIT_HERE for all standard exported panels; original analyses and
+# fitted/statistical layers are not recalculated.
+nm_style <- list(
+  font_family = "sans",
+  axis_title = 7.0,
+  axis_text = 6.5,
+  strip_text = 6.5,
+  strip_stats = 4.2,
+  legend_title = 6.5,
+  legend_text = 6.0,
+  stat_text = 5.8,
+  small_text = 5.7,
+  axis_line = 0.18,
+  data_line = 0.23,
+  point_small = 0.47,
+  point_medium = 0.52,         # per-animal points in eight-component grids
+  point_mean = 0.86,           # group mean in component grids
+  age_effect_point = 0.93,    # sex symbols for Figure 3e
+  age_effect_ci_line = 0.17,
+  age_effect_zero_line = 0.14,
+  effect_point = 0.95,        # all percentage-point/within-bin effect figures
+  effect_ci_line = 0.16,
+  effect_zero_line = 0.14,
+  effect_y_label_pt = 6.2,
+  effect_axis_x_pt = 6.1,
+  detection_point_open = 0.85,
+  detection_point_filled = 0.95,
+  detection_point_stroke = 0.33,
+  detection_reference_line = 0.14,
+  detection_label_pt = 5.5,
+  detection_label_segment = 0.14,
+  detection_label_padding = 0.14,
+  bar_outline = 0.16,
+  sex_group_font = 6.0,
+  dot_top10_min = 0.65,       # Separate absolute-abundance Top-10 plots
+  dot_top10_max = 1.65,
+  dot_top10_pooled_min = 0.65, # Four-group abundance bubble plot (unchanged)
+  dot_top10_pooled_max = 1.65,
+  centered_bubble_min_mm = 0.35,  # ONLY the centered-bubble figure
+  centered_bubble_max_mm = 1.70,
+  centered_bubble_missing_mm = 0.86,
+  centered_bubble_missing_stroke = 0.24,
+  centered_bubble_grid_line = 0.10,
+  centered_top5_min_mm = 0.50,    # TOP 5 ONLY: centered bubble range
+  centered_top5_max_mm = 2.10,
+  centered_top5_missing_mm = 0.85,
+  centered_top5_protein_pt = 5.4,
+  centered_top5_group_pt = 5.0,
+  centered_top5_component_pt = 6.0,
+  oldpred_adult_symbol_mm = 2.0, # Adult absent X / singleton hollow circle
+  oldpred_old_symbol_mm = 2.5,   # Filled Old detection
+  oldpred_old_prevalence_text_mm = 2.5,
+  oldpred_fisher_text_mm = 2.0,
+  oldpred_adult_stroke_mm = 0.40,
+  centered_bubble_protein_pt = 5.3,
+  centered_bubble_group_pt = 5.0,
+  centered_bubble_component_pt = 6.0,
+  detect_matrix_zero = 2.0,
+  detect_matrix_min = 1.8,
+  detect_matrix_max = 5.6,
+  dot_protein_title_pt = 5.6,
+  dot_group_label_pt = 4.8,
+  dot_protein_label_pt = 4.8
+)
+
+# Reference Figure 3 axes. Composition panels (a,b) are 0–100%.
+# Non-contractile panel (c) uses its OWN maximum, without renormalization.
+nm_fig3 <- list(
+  full_composition_max_pct = 100,
+  full_composition_breaks_pct = seq(0, 100, by = 25),
+  noncontractile_tick_interval_pct = 2,
+  rawbin_age_labels = c("Adult", "Old", "Adult", "Old")
+)
+
+# Individual panel sizes (millimetres); these override family defaults.
+nm_dims <- list(
+  # COMPOSITION: Adult vs Old (pooled) / 2x2 (sex-resolved)
+  Mass_Age = c(width = 35, height = 43),
+  Count_Age = c(width = 35, height = 43),
+  Mass_2x2 = c(width = 35, height = 43),
+  Count_2x2 = c(width = 35, height = 43),
+  Mass_2x2_noSarcoCyto_originalTotal = c(width = 36, height = 43),
+  Mass_2x2_RawFDR = c(width = 122, height = 76), # 4 columns x 2; fits 180-mm figure
+  RawBin_2x2 = c(width = 122, height = 77),
+  RawBin_AgeEffects_E2 = c(width = 47, height = 73),
+
+  # COMPOSITION AGE EFFECTS
+  Effect_percentagePoint_overall = c(width = 54, height = 61),
+  Effect_percentagePoint_bySex = c(width = 55, height = 67),
+  Effect_withinBin_overall = c(width = 54, height = 61),
+  Effect_withinBin_bySex = c(width = 55, height = 67),
+
+  # DETECTION PREVALENCE
+  OldOnly_min2 = c(width = 72, height = 61),
+  OldPredominant_OldGe2_AdultLe1 = c(width = 72, height = 155),
+  OldPredominant_Female = c(width = 50, height = 165),
+  OldPredominant_Male = c(width = 50, height = 60),
+  OldPredominant_ComponentSummary_Count = c(width = 45, height = 61),
+  OldPredominant_ComponentSummary_Percent = c(width = 78, height = 61),
+  OldPredominant_ComponentSummary_CountAndPercent = c(width = 124, height = 72),
+  DetectionDelta_Female_vs_Male = c(width = 53, height = 58),
+  Proteinwise_Age = c(width = 76, height = 65),
+  Detection_SelectedCandidates_4GroupMatrix = c(width = 85, height = 70),
+
+  # TOP PROTEINS AND HEATMAP-LIKE DISPLAYS
+  Top10_AllBins = c(width = 138, height = 70),
+  Top10_PooledOldRank_bySex_4Groups = c(width = 137, height = 63),
+  Top10_Female_OldRank = c(width = 136, height = 75),
+  Top10_Male_OldRank = c(width = 136, height = 75),
+  Top10_PooledOldRank_bySex_AbsoluteHeatmap = c(width = 183, height = 120),
+  Top10_PooledOldRank_bySex_CenteredHeatmap = c(width = 183, height = 120),
+  Top10_PooledOldRank_bySex_CenteredBubbles = c(width = 120, height = 118),
+  Top5_PooledOldRank_bySex_CenteredBubbles = c(width = 120, height = 70)
+)
+nm_panel_notes <- list(
+  Mass_Age = "Abundance-weighted composition, pooled age groups",
+  Count_Age = "Count-weighted composition, pooled age groups",
+  Mass_2x2 = "Abundance-weighted composition by age and sex",
+  Count_2x2 = "Count-weighted composition by age and sex",
+  Mass_2x2_RawFDR = "Abundance by component with raw P and FDR labels",
+  RawBin_2x2 = "Raw component abundance by age and sex",
+  RawBin_AgeEffects_E2 = "Component-level age effects",
+  Top10_PooledOldRank_bySex_4Groups = "Top-10 proteins, four age-sex groups",
+  Top5_PooledOldRank_bySex_CenteredBubbles = "Top-5 pooled-Old-ranked proteins, centered Age × Sex bubbles"
+)
+# Family defaults apply only to other/dynamically named plots.
+nm_family_dims <- list(
+  composition = c(width = 35, height = 43),
+  two_by_two = c(width = 122, height = 77),
+  age_effect = c(width = 55, height = 67),
+  top_proteins = c(width = 137, height = 63),
+  detection = c(width = 75, height = 62),
+  detection_combined = c(width = 116, height = 67),
+  heatmap = c(width = 183, height = 120),
+  combined = c(width = 125, height = 72)
+)
+nm_family_rules <- c(
+  "CountAndPercent|ComponentSummary|Detection.*Combined|Component.*Combined" = "detection_combined",
+  "HM_|Heatmap|heatmap" = "heatmap",
+  "2x2|2_X_2" = "two_by_two",
+  "Top10|Top_10|TopProteins|Dotplot|DotPlot" = "top_proteins",
+  "Detection|Detect|OldOnly|OldPredominant|Old_Predom" = "detection",
+  "AgeEffects|Age_Effect|Within|Effect" = "age_effect",
+  "Composition|Comp_|Mass|Count" = "composition",
+  "Combined|Bubbles" = "combined"
+)
+```
+
+```{r nm-export-engine, echo=FALSE}
+engine_file <- file.path(helper_dir, "nm_export_engine_comp_AO.R")
+if (!file.exists(engine_file)) {
+  stop("Cannot find the figure-export file '", engine_file, "' (working directory: ", getwd(),
+       "). Copy the 'R' folder from the zip next to this Rmd and the input CSVs, or set helper_dir.",
+       call. = FALSE)
+}
+source(engine_file, local = knitr::knit_global())
+stopifnot(exists("nm_dims"), exists("nm_family_dims"), exists("nm_family_rules"))
+```
+
+## Helper functions
+
+```{r helpers}
+# Shared PNG/SVG export; preserves the original (plot, file, width, height) API.
+save_plot_png <- function(plot, file, width, height, dpi = 300) {
+  nm_save_plot(plot, file, width, height, dpi)
+}
+
+fmt_p <- function(p) {
+  dplyr::case_when(is.na(p) ~ "NA", p < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p))
+}
+
+# Compact facet labels for eight-panel (4 x 2) composition figures. The
+# Interaction P/FDR results are retained in the statistical data tables,
+# but not printed in the Figure 3 composition-grid facet headers.
+# A = Age; S = Sex; p = raw p-value; FDR = BH-adjusted p-value.
+nm_short_bin_name <- function(x) {
+  map <- c(
+    "Sarcomere/Myofibril" = "Sarcomere",
+    "Plasma membrane" = "Plasma mem.",
+    "Mitochondrion" = "Mitochondria"
+  )
+  x <- as.character(x)
+  y <- unname(map[x])
+  y[is.na(y)] <- x[is.na(y)]
+  y
+}
+
+nm_comp_strip_label <- function(bin, p_Age, p_Sex, p_AgeSex, FDR_Age, FDR_Sex, FDR_AgeSex) {
+  # Age and Sex only, exactly as Figure 3d; the statistical calculations
+  # still retain Age x Sex P/FDR values in tables for the manuscript.
+  paste0(
+    "<b><span style='font-size:", nm_style$strip_text, "pt;'>",
+    nm_short_bin_name(bin), "</span></b><br>",
+    "<span style='font-size:", nm_style$strip_stats, "pt;'>",
+    "p: A=", fmt_p(p_Age), " S=", fmt_p(p_Sex), "<br>",
+    "FDR: A=", fmt_p(FDR_Age), " S=", fmt_p(FDR_Sex),
+    "</span>"
+  )
+}
+
+fmt_p_detection <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "p=NA",
+    p < 0.001 ~ "p<0.001*",
+    p <= 0.050 ~ paste0("p=", formatC(p, format = "f", digits = 3), "*"),
+    TRUE ~ paste0("p=", formatC(p, format = "f", digits = 3))
+  )
+}
+```
+# Load data and select Adult/Old controls
+
+```{r load-data}
+df <- read.csv(intensity_file, check.names = FALSE, stringsAsFactors = FALSE)
+
+meta <- read.csv(meta_file, check.names = FALSE, stringsAsFactors = FALSE)
+
+required_meta <- c("ID", "Age", "Treatment", "Sex")
+missing_meta <- setdiff(required_meta, colnames(meta))
+
+if (length(missing_meta) > 0) {
+  stop("Missing metadata columns: ", paste(missing_meta, collapse = ", "))
+}
+
+required_df <- c("Protein.Group", "Genes")
+missing_df <- setdiff(required_df, colnames(df))
+
+if (length(missing_df) > 0) {
+  stop("Missing protein-data columns: ", paste(missing_df, collapse = ", "))
+}
+
+ctrl <- meta %>%
+  mutate(
+    ID = as.character(ID),
+    Treatment = str_to_title(trimws(as.character(Treatment))),
+    Age = str_to_title(trimws(as.character(Age))),
+    Sex = str_to_title(trimws(as.character(Sex)))
+  ) %>%
+  filter(Treatment == "Control", Age %in% c("Adult", "Old"), ID %in% colnames(df)) %>%
+  mutate(
+    Age = factor(Age, levels = c("Adult", "Old")),
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Group_2x2 = factor(
+      paste(Age, Sex, sep = "_"),
+      levels = c("Adult_Female", "Old_Female", "Adult_Male", "Old_Male")
+    )
+  ) %>%
+  arrange(Age, Sex, ID)
+
+if (nrow(ctrl) < 4) {
+  stop("Too few Adult/Old Control samples were found.")
+}
+
+all_cols <- ctrl$ID
+
+cat("Samples included:\n")
+print(table(ctrl$Age, ctrl$Sex))
+```
+# Build long-format intensity table
+
+Raw intensities are retained for composition weighting. Zeros and missing values are treated as non-detections with intensity zero.
+
+The first gene symbol in the `Genes` field is used for GO annotation; `Protein.Group` remains the unique protein identity.
+
+```{r long-table}
+mat_raw <- df %>%
+  select(Protein.Group, Genes, all_of(all_cols)) %>%
+  mutate(
+    Protein.Group = as.character(Protein.Group),
+    Genes = as.character(Genes),
+    Gene1 = str_trim(str_remove(Genes, ";.*$")),
+    Gene1 = if_else(is.na(Gene1) | Gene1 == "", Protein.Group, Gene1)
+  )
+
+long <- mat_raw %>%
+  pivot_longer(cols = all_of(all_cols), names_to = "Sample", values_to = "Intensity") %>%
+  mutate(
+    Intensity = suppressWarnings(as.numeric(Intensity)),
+    Intensity = if_else(is.na(Intensity) | Intensity <= 0, 0, Intensity)
+  ) %>%
+  left_join(ctrl %>% select(ID, Age, Sex, Group_2x2), by = c("Sample" = "ID"))
+```
+# GO Cellular Component single-bin assignment
+
+```{r go-cc-assignment}
+bin_roots <- list(
+  "ECM"                 = c("GO:0031012"),
+  "Extracellular"       = c("GO:0005576"),
+  "Sarcomere/Myofibril" = c("GO:0030017", "GO:0030016", "GO:0043292"),
+  "Cytoskeleton"        = c("GO:0005856"),
+  "Mitochondrion"       = c("GO:0005739"),
+  "Nucleus"             = c("GO:0005634"),
+  "Ribosome"            = c("GO:0005840"),
+  "ER"                  = c("GO:0005783"),
+  "Golgi"               = c("GO:0005794"),
+  "Plasma membrane"     = c("GO:0005886"),
+  "Endosome/Lysosome"   = c("GO:0005768", "GO:0005764"),
+  "Proteasome"          = c("GO:0000502"),
+  "Cytosol"             = c("GO:0005829")
+)
+
+bin_priority <- names(bin_roots)
+
+go_cc_offspring <- AnnotationDbi::as.list(GO.db::GOCCOFFSPRING)
+
+get_offspring <- function(go_id) {
+  kids <- go_cc_offspring[[go_id]]
+  unique(c(go_id, kids))
+}
+
+bin_terms <- lapply(
+  bin_roots,
+  function(ids) {
+    unique(unlist(lapply(ids, get_offspring), use.names = FALSE))
+  }
+)
+
+assign_bin <- function(go_vec) {
+  go_vec <- unique(go_vec[!is.na(go_vec)])
+
+  if (length(go_vec) == 0) {
+    return("Other/Unassigned")
+  }
+
+  for (b in bin_priority) {
+    if (any(go_vec %in% bin_terms[[b]])) {
+      return(b)
+    }
+  }
+
+  "Other/Unassigned"
+}
+
+genes <- sort(unique(na.omit(long$Gene1)))
+
+gene2entrez <- suppressMessages(
+  AnnotationDbi::select(org.Mm.eg.db, keys = genes, keytype = "SYMBOL", columns = c("SYMBOL", "ENTREZID"))
+) %>%
+  distinct(SYMBOL, ENTREZID) %>%
+  filter(!is.na(ENTREZID))
+
+entrez2go <- suppressMessages(
+  AnnotationDbi::select(
+    org.Mm.eg.db,
+    keys = sort(unique(gene2entrez$ENTREZID)),
+    keytype = "ENTREZID",
+    columns = c("ENTREZID", "GO", "ONTOLOGY")
+  )
+) %>%
+  filter(ONTOLOGY == "CC", !is.na(GO)) %>%
+  distinct(ENTREZID, GO)
+
+gene_bin <- gene2entrez %>%
+  left_join(entrez2go, by = "ENTREZID") %>%
+  group_by(SYMBOL) %>%
+  summarise(GO_CC = list(unique(GO)), .groups = "drop") %>%
+  mutate(Bin = vapply(GO_CC, assign_bin, character(1)))
+
+long <- long %>%
+  left_join(gene_bin %>% select(SYMBOL, Bin), by = c("Gene1" = "SYMBOL")) %>%
+  mutate(Bin = if_else(is.na(Bin), "Other/Unassigned", Bin))
+
+write.csv(
+  long %>%
+    distinct(Protein.Group, Gene1, Bin),
+  file.path(shared_dir, "Protein_GOCC_bin_assignment.csv"),
+  row.names = FALSE
+)
+
+cat("GO-CC assignment before removing unassigned proteins:\n")
+print(long %>% distinct(Protein.Group, Bin) %>% count(Bin, sort = TRUE))
+
+long_assigned <- long %>%
+  filter(Bin != "Other/Unassigned")
+```
+# Reproducibility filter
+
+A protein is retained if it is detected in at least two Adult samples **or** at least two Old samples.
+
+```{r min2-filter}
+keep_proteins <- long_assigned %>%
+  mutate(Detected = Intensity > 0) %>%
+  group_by(Protein.Group, Age) %>%
+  summarise(n_detected = sum(Detected, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Protein.Group) %>%
+  summarise(keep = any(n_detected >= min_detect_n), .groups = "drop") %>%
+  filter(keep) %>%
+  select(Protein.Group)
+
+long_filt <- long_assigned %>%
+  semi_join(keep_proteins, by = "Protein.Group")
+
+cat("Assigned proteins before filter: ", n_distinct(long_assigned$Protein.Group), "\n", sep = "")
+
+cat("Proteins after min2 filter: ", n_distinct(long_filt$Protein.Group), "\n", sep = "")
+
+protein_counts_by_bin <- long_filt %>%
+  distinct(Protein.Group, Gene1, Bin) %>%
+  count(Bin, name = "n_proteins") %>%
+  arrange(desc(n_proteins))
+
+write.csv(protein_counts_by_bin, file.path(shared_dir, "Protein_counts_by_bin.csv"), row.names = FALSE)
+
+protein_counts_by_bin
+```
+# Composition calculations
+
+```{r composition-functions}
+mass_composition_sample <- function(long_df, group_vars) {
+
+  long_df %>%
+    group_by(across(all_of(c(group_vars, "Sample")))) %>%
+    mutate(total = sum(Intensity, na.rm = TRUE)) %>%
+    ungroup() %>%
+    group_by(across(all_of(c(group_vars, "Sample", "Bin")))) %>%
+    summarise(Bin_intensity = sum(Intensity, na.rm = TRUE), total = dplyr::first(total), .groups = "drop") %>%
+    mutate(
+      Fraction = if_else(total > 0, Bin_intensity / total, 0),
+      Fraction_pct = Fraction * 100,
+      Fraction_asin = asin(sqrt(Fraction))
+    )
+}
+
+count_composition_sample <- function(long_df, group_vars) {
+
+  sample_meta_local <- long_df %>%
+    distinct(across(all_of(c(group_vars, "Sample"))))
+
+  bins_local <- sort(unique(long_df$Bin))
+
+  counts <- long_df %>%
+    filter(Intensity > 0) %>%
+    distinct(across(all_of(c(group_vars, "Sample", "Protein.Group", "Bin")))) %>%
+    count(across(all_of(c(group_vars, "Sample", "Bin"))), name = "n_bin")
+
+  complete_grid <- sample_meta_local %>%
+    tidyr::crossing(Bin = bins_local)
+
+  complete_grid %>%
+    left_join(counts, by = c(group_vars, "Sample", "Bin")) %>%
+    mutate(n_bin = replace_na(n_bin, 0L)) %>%
+    group_by(across(all_of(c(group_vars, "Sample")))) %>%
+    mutate(total_bin = sum(n_bin, na.rm = TRUE), Fraction = if_else(total_bin > 0, n_bin / total_bin, 0)) %>%
+    ungroup() %>%
+    mutate(Fraction_pct = Fraction * 100, Fraction_asin = asin(sqrt(Fraction)))
+}
+
+summarise_composition <- function(comp_df, group_vars) {
+
+  comp_df %>%
+    group_by(across(all_of(c(group_vars, "Bin")))) %>%
+    summarise(
+      mean_pct = mean(Fraction_pct, na.rm = TRUE),
+      sem_pct = sd(Fraction_pct, na.rm = TRUE) / sqrt(n()),
+      n = n(),
+      .groups = "drop"
+    )
+}
+
+mass_sample_age <- mass_composition_sample(long_filt, "Age")
+
+count_sample_age <- count_composition_sample(long_filt, "Age")
+
+mass_sample_2x2 <- mass_composition_sample(long_filt, c("Age", "Sex"))
+
+count_sample_2x2 <- count_composition_sample(long_filt, c("Age", "Sex"))
+
+mass_overall <- summarise_composition(mass_sample_age, "Age")
+
+count_overall <- summarise_composition(count_sample_age, "Age")
+
+mass_2x2 <- summarise_composition(mass_sample_2x2, c("Age", "Sex"))
+
+count_2x2 <- summarise_composition(count_sample_2x2, c("Age", "Sex"))
+
+write.csv(mass_sample_age, file.path(comp_dir, "Mass_perSample_Age.csv"), row.names = FALSE)
+
+write.csv(count_sample_age, file.path(comp_dir, "Count_perSample_Age.csv"), row.names = FALSE)
+
+write.csv(mass_sample_2x2, file.path(comp_split_dir, "Mass_perSample_2x2.csv"), row.names = FALSE)
+
+write.csv(count_sample_2x2, file.path(comp_split_dir, "Count_perSample_2x2.csv"), row.names = FALSE)
+```
+# Descriptive composition summaries
+
+These stacked summaries retain all assigned bins, including ER and Ribosome, because the purpose here is to describe the complete assigned composition.
+
+```{r descriptive-composition, fig.keep="none"}
+
+all_bins <- sort(unique(long_filt$Bin))
+
+pal <- setNames(viridisLite::viridis(length(all_bins), option = "D", end = 0.95), all_bins)
+
+# ── Overall Adult vs Old stacked plots ───────────────────────────────────────
+
+make_stacked_plot <- function(df_plot, x_var, title, x_levels = NULL) {
+
+  dd <- df_plot %>%
+    mutate(Bin = as.character(Bin))
+
+  if (!is.null(x_levels)) {
+    dd[[x_var]] <- factor(dd[[x_var]], levels = x_levels)
+  }
+
+  bin_order <- dd %>%
+    group_by(Bin) %>%
+    summarise(contribution = sum(mean_pct, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(contribution)) %>%
+    pull(Bin)
+
+  dd <- dd %>%
+    mutate(Bin = factor(Bin, levels = bin_order))
+
+  ggplot(dd, aes(x = .data[[x_var]], y = mean_pct, fill = Bin)) +
+    geom_col(width = 0.70, colour = "white", linewidth = 0.2) +
+    scale_fill_manual(values = pal, breaks = bin_order, drop = TRUE, name = "Cellular component") +
+    scale_y_continuous(
+      breaks = nm_fig3$full_composition_breaks_pct,
+      limits = c(0, nm_fig3$full_composition_max_pct),
+      labels = function(x) paste0(x, "%"),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    labs(title = title, x = NULL, y = "Percent of assigned insoluble proteome") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      legend.position = "right",
+      axis.text.x = element_text(size = 11, face = "bold"),
+      axis.ticks.x = element_blank(),
+      panel.grid = element_blank()
+    )
+}
+
+# ── Shared nested Age-within-Sex axis ────────────────────────────────────────
+# Adult and Old are close together within each sex.
+# Female and Male remain clearly separated.
+
+age_sex_x <- tibble(
+  Age = c("Adult", "Old", "Adult", "Old"),
+  Sex = c("Female", "Female", "Male", "Male"),
+
+  # Adult–Old gap = 0.40
+  # Female–Male gap = 0.60
+  x_pos = c(1.00, 1.40, 2.00, 2.40)
+)
+
+sex_axis_x <- tibble(
+  Sex_label = c("Female", "Male"),
+
+  x_start = c(0.85, 1.85),
+
+  x_end = c(1.55, 2.55),
+
+  x_mid = c(1.20, 2.20)
+)
+
+# ── Nested Age × Sex stacked plot function ───────────────────────────────────
+
+make_stacked_2x2_nested <- function(
+  df_plot,
+  title,
+  y_label = "Percent of assigned insoluble proteome",
+  full_proteome = FALSE
+) {
+
+  dd <- df_plot %>%
+    mutate(Age = as.character(Age), Sex = as.character(Sex), Bin = as.character(Bin)) %>%
+    left_join(age_sex_x, by = c("Age", "Sex"))
+
+  bin_order <- dd %>%
+    group_by(Bin) %>%
+    summarise(contribution = sum(mean_pct, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(contribution)) %>%
+    pull(Bin)
+
+  dd <- dd %>%
+    mutate(Bin = factor(Bin, levels = bin_order))
+
+  # Maximum stacked height.
+  # For the complete composition plots this will be ~100%.
+  # For the no-Sarco/Cyto plot it will be much smaller.
+  y_max <- dd %>%
+    group_by(Age, Sex) %>%
+    summarise(group_total = sum(mean_pct, na.rm = TRUE), .groups = "drop") %>%
+    summarise(y_max = max(group_total, na.rm = TRUE)) %>%
+    pull(y_max)
+
+  if (!is.finite(y_max) || y_max <= 0) {
+    y_max <- 100
+  }
+
+  # Nested Sex annotations below Adult / Old
+  sex_ann <- sex_axis_x %>%
+    mutate(y_line = -0.095 * y_max, y_text = -0.17 * y_max)
+
+  ggplot(dd, aes(x = x_pos, y = mean_pct, fill = Bin)) +
+
+    # Thinner columns
+    geom_col(width = 0.34, colour = "white", linewidth = nm_style$bar_outline) +
+
+    # Horizontal line grouping Adult + Old within each sex
+    geom_segment(
+      data = sex_ann,
+      aes(x = x_start, xend = x_end, y = y_line, yend = y_line),
+      inherit.aes = FALSE,
+      linewidth = nm_style$axis_line,
+      colour = "grey35"
+    ) +
+
+    # Female / Male labels
+    geom_text(
+      data = sex_ann,
+      aes(x = x_mid, y = y_text, label = Sex_label),
+      inherit.aes = FALSE,
+      size = nm_style$sex_group_font / ggplot2::.pt,
+      fontface = "bold",
+      colour = "grey25"
+    ) +
+
+    scale_fill_manual(values = pal, breaks = bin_order, drop = TRUE, name = "Cellular component") +
+
+    scale_x_continuous(
+      breaks = age_sex_x$x_pos,
+      labels = age_sex_x$Age,
+      limits = c(0.65, 2.75),
+      expand = expansion(mult = 0)
+    ) +
+
+    scale_y_continuous(
+      breaks = if (full_proteome) {
+        nm_fig3$full_composition_breaks_pct
+      } else {
+        seq(0, floor(y_max * 1.045 / nm_fig3$noncontractile_tick_interval_pct) *
+              nm_fig3$noncontractile_tick_interval_pct,
+            by = nm_fig3$noncontractile_tick_interval_pct)
+      },
+      labels = function(x) paste0(x, "%"),
+      expand = expansion(mult = c(0, 0))
+    ) +
+
+    coord_cartesian(
+      ylim = c(0, if (full_proteome) nm_fig3$full_composition_max_pct else y_max * 1.045),
+      clip = "off"
+    ) +
+
+    labs(title = title, x = NULL, y = y_label) +
+
+    theme_classic(base_size = 12) +
+
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+
+      legend.position = "right",
+
+      axis.text.x = element_text(size = nm_style$axis_text - 0.8, face = "plain", margin = margin(t = 1)),
+
+      axis.ticks.x = element_blank(),
+
+      panel.grid = element_blank(),
+
+      plot.margin = margin(t = 2, r = 1, b = 24, l = 5)
+    )
+}
+
+# ── Generate plots ────────────────────────────────────────────────────────────
+
+groups_4 <- c("Adult_Female", "Old_Female", "Adult_Male", "Old_Male")
+
+mass_2x2_plot <- mass_2x2 %>%
+  mutate(Group = paste(Age, Sex, sep = "_"))
+
+count_2x2_plot <- count_2x2 %>%
+  mutate(Group = paste(Age, Sex, sep = "_"))
+
+# Overall Adult vs Old
+p_mass_overall <- make_stacked_plot(
+  mass_overall,
+  "Age",
+  "Abundance-weighted insoluble proteome composition",
+  x_levels = c("Adult", "Old")
+)
+
+p_count_overall <- make_stacked_plot(
+  count_overall,
+  "Age",
+  "Count-weighted insoluble proteome composition",
+  x_levels = c("Adult", "Old")
+)
+
+# Age × Sex
+p_mass_2x2 <- make_stacked_2x2_nested(
+  mass_2x2,
+  "Abundance-weighted insoluble proteome composition",
+  y_label = "Percent of assigned insoluble proteome",
+  full_proteome = TRUE
+)
+
+p_count_2x2 <- make_stacked_2x2_nested(
+  count_2x2,
+  "Count-weighted insoluble proteome composition",
+  y_label = "Percent of assigned insoluble proteome",
+  full_proteome = TRUE
+)
+
+# ── Output names ──────────────────────────────────────────────────────────────
+
+mass_age_png <- file.path(comp_dir, "Mass_Age.png")
+
+count_age_png <- file.path(comp_dir, "Count_Age.png")
+
+mass_2x2_png <- file.path(comp_split_dir, "Mass_2x2.png")
+
+count_2x2_png <- file.path(comp_split_dir, "Count_2x2.png")
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+
+save_plot_png(p_mass_overall, mass_age_png, width = 7, height = 5)
+
+save_plot_png(p_count_overall, count_age_png, width = 7, height = 5)
+
+save_plot_png(p_mass_2x2, mass_2x2_png, width = 7, height = 5)
+
+save_plot_png(p_count_2x2, count_2x2_png, width = 7, height = 5)
+```
+
+```{r show-descriptive-composition, echo=FALSE, out.width="48%"}
+knitr::include_graphics(c(mass_age_png, count_age_png, mass_2x2_png, count_2x2_png))
+```
+## Abundance-weighted composition excluding Sarcomere/Myofibril and Cytoskeleton
+
+This figure removes **Sarcomere/Myofibril** and **Cytoskeleton** from the displayed bars but retains the **full assigned insoluble proteome as the denominator**. Therefore, the remaining bars are **not renormalized to 100%**. Their heights represent their original contributions to total insoluble abundance.
+
+```{r mass-2x2-no-sarco-cyto, fig.keep="none"}
+exclude_bins_focus <- c("Sarcomere/Myofibril", "Cytoskeleton")
+
+# mass_sample_2x2 already contains per-sample fractions calculated using
+# the FULL filtered insoluble proteome as the denominator.
+# We therefore filter bins only AFTER those fractions have been calculated.
+mass_2x2_focus <- mass_sample_2x2 %>%
+  filter(!Bin %in% exclude_bins_focus) %>%
+  group_by(Age, Sex, Bin) %>%
+  summarise(
+    mean_pct = mean(Fraction_pct, na.rm = TRUE),
+    sem_pct = sd(Fraction_pct, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Group = factor(paste(Age, Sex, sep = "_"), levels = c("Adult_Female", "Old_Female", "Adult_Male", "Old_Male"))
+  )
+
+focus_bins <- mass_2x2_focus %>%
+  group_by(Bin) %>%
+  summarise(contribution = sum(mean_pct, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(contribution)) %>%
+  pull(Bin)
+
+mass_2x2_focus <- mass_2x2_focus %>%
+  mutate(Bin = factor(Bin, levels = focus_bins))
+
+p_mass_2x2_focus <- make_stacked_2x2_nested(
+  mass_2x2_focus %>%
+    select(Age, Sex, Bin, mean_pct),
+  "Insoluble: abundance-weighted composition \n(Without Sarcomere/Myofibril & Cytoskeleton)",
+  y_label = "Percent of total insoluble abundance"
+)
+
+mass_2x2_focus_png <- file.path(comp_split_dir, "Mass_2x2_noSarcoCyto_originalTotal.png")
+
+save_plot_png(p_mass_2x2_focus, mass_2x2_focus_png, width = 7, height = 5, dpi = 300)
+
+write.csv(mass_2x2_focus, file.path(comp_split_dir, "Mass_2x2_noSarcoCyto_originalTotal.csv"), row.names = FALSE)
+```
+
+```{r show-mass-2x2-no-sarco-cyto, echo=FALSE, out.width="80%"}
+if (file.exists(mass_2x2_focus_png)) {
+  knitr::include_graphics(mass_2x2_focus_png)
+}
+```
+# Bin-level statistics
+
+## Statistical model
+
+For each cellular-component bin, abundance-weighted per-sample fractions are arcsine-square-root transformed before inference.
+
+The Age-only analysis uses:
+
+`Fraction_asin ~ Age`
+
+The factorial analysis uses:
+
+`Fraction_asin ~ Age * Sex`
+
+For the factorial model, Type III F tests with sum-to-zero contrasts are used so that the Age and Sex main effects are tested in the presence of the Age × Sex interaction. FDR is calculated separately across bins for Age, Sex, and Age × Sex.
+
+```{r bin-statistics}
+test_one_bin_age <- function(df_bin) {
+
+  out <- tibble(p_Age = NA_real_)
+
+  if (nrow(df_bin) < 4 || length(unique(df_bin$Fraction)) < 2) {
+    return(out)
+  }
+
+  fit <- tryCatch(lm(Fraction_asin ~ Age, data = df_bin), error = function(e) NULL)
+
+  if (is.null(fit)) {
+    return(out)
+  }
+
+  an <- tryCatch(anova(fit), error = function(e) NULL)
+
+  if (is.null(an)) {
+    return(out)
+  }
+
+  tibble(
+    p_Age = if ("Age" %in% rownames(an)) {
+      an["Age", "Pr(>F)"]
+    } else {
+      NA_real_
+    }
+  )
+}
+
+test_one_bin_2x2 <- function(df_bin) {
+
+  out <- tibble(p_Age = NA_real_, p_Sex = NA_real_, p_AgeSex = NA_real_)
+
+  if (nrow(df_bin) < 4 || length(unique(df_bin$Fraction)) < 2) {
+    return(out)
+  }
+
+  dd <- df_bin %>%
+    mutate(
+      Age = droplevels(factor(Age, levels = c("Adult", "Old"))),
+      Sex = droplevels(factor(Sex, levels = c("Female", "Male")))
+    )
+
+  if (nlevels(dd$Age) < 2 || nlevels(dd$Sex) < 2) {
+    return(out)
+  }
+
+  contrasts(dd$Age) <- contr.sum(nlevels(dd$Age))
+
+  contrasts(dd$Sex) <- contr.sum(nlevels(dd$Sex))
+
+  fit <- tryCatch(lm(Fraction_asin ~ Age * Sex, data = dd), error = function(e) NULL)
+
+  if (is.null(fit)) {
+    return(out)
+  }
+
+  an <- tryCatch(car::Anova(fit, type = 3), error = function(e) NULL)
+
+  if (is.null(an)) {
+    return(out)
+  }
+
+  tibble(
+    p_Age = if ("Age" %in% rownames(an)) {
+      an["Age", "Pr(>F)"]
+    } else {
+      NA_real_
+    },
+
+    p_Sex = if ("Sex" %in% rownames(an)) {
+      an["Sex", "Pr(>F)"]
+    } else {
+      NA_real_
+    },
+
+    p_AgeSex = if ("Age:Sex" %in% rownames(an)) {
+      an["Age:Sex", "Pr(>F)"]
+    } else {
+      NA_real_
+    }
+  )
+}
+
+run_bin_stats_age <- function(comp_df) {
+
+  p_tbl <- comp_df %>%
+    group_by(Bin) %>%
+    group_modify(~ test_one_bin_age(.x)) %>%
+    ungroup()
+
+  means_tbl <- comp_df %>%
+    group_by(Bin, Age) %>%
+    summarise(
+      mean_pct = mean(Fraction_pct, na.rm = TRUE),
+      sem_pct = sd(Fraction_pct, na.rm = TRUE) / sqrt(n()),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(names_from = Age, values_from = c(mean_pct, sem_pct, n)) %>%
+    mutate(delta_old_minus_adult = mean_pct_Old - mean_pct_Adult)
+
+  p_tbl %>%
+    left_join(means_tbl, by = "Bin") %>%
+    mutate(FDR_Age = p.adjust(p_Age, method = "BH")) %>%
+    arrange(FDR_Age, desc(abs(delta_old_minus_adult)))
+}
+
+run_bin_stats_2x2 <- function(comp_df) {
+
+  p_tbl <- comp_df %>%
+    group_by(Bin) %>%
+    group_modify(~ test_one_bin_2x2(.x)) %>%
+    ungroup()
+
+  means_group <- comp_df %>%
+    mutate(Group = paste(Age, Sex, sep = "_")) %>%
+    group_by(Bin, Group) %>%
+    summarise(
+      mean_pct = mean(Fraction_pct, na.rm = TRUE),
+      sem_pct = sd(Fraction_pct, na.rm = TRUE) / sqrt(n()),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(names_from = Group, values_from = c(mean_pct, sem_pct, n))
+
+  means_age <- comp_df %>%
+    group_by(Bin, Age) %>%
+    summarise(mean_pct_age = mean(Fraction_pct, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = Age, values_from = mean_pct_age, names_prefix = "mean_pct_") %>%
+    mutate(delta_old_minus_adult = mean_pct_Old - mean_pct_Adult)
+
+  p_tbl %>%
+    left_join(means_group, by = "Bin") %>%
+    left_join(means_age, by = "Bin") %>%
+    mutate(
+      FDR_Age = p.adjust(p_Age, method = "BH"),
+      FDR_Sex = p.adjust(p_Sex, method = "BH"),
+      FDR_AgeSex = p.adjust(p_AgeSex, method = "BH")
+    ) %>%
+    arrange(FDR_Age, FDR_Sex, FDR_AgeSex)
+}
+
+mass_stats_age <- run_bin_stats_age(mass_sample_age)
+
+mass_stats_2x2 <- run_bin_stats_2x2(mass_sample_2x2)
+
+count_stats_age <- run_bin_stats_age(count_sample_age)
+
+count_stats_2x2 <- run_bin_stats_2x2(count_sample_2x2)
+
+write.csv(mass_stats_age, file.path(stats_dir, "BinStats_mass_Age.csv"), row.names = FALSE)
+
+write.csv(mass_stats_2x2, file.path(stats_split_dir, "BinStats_mass_2x2.csv"), row.names = FALSE)
+
+write.csv(count_stats_age, file.path(stats_dir, "BinStats_count_Age.csv"), row.names = FALSE)
+
+write.csv(count_stats_2x2, file.path(stats_split_dir, "BinStats_count_2x2.csv"), row.names = FALSE)
+
+mass_stats_2x2
+```
+# Final abundance-weighted Age × Sex composition figure
+
+This plot shows each sample, the group mean ± SEM, and both raw and FDR-adjusted p-values for Age, Sex, and the Age × Sex interaction. ER and Ribosome are omitted from this display.
+
+```{r final-2x2-figure, fig.keep="none"}
+
+bin_order_pvals <- bin_order_figure[bin_order_figure %in% unique(as.character(mass_sample_2x2$Bin))]
+
+# ── Prepare plotting table ────────────────────────────────────────────────────
+
+plot_df_2x2 <- mass_sample_2x2 %>%
+
+  filter(!Bin %in% bins_to_remove_display, Bin %in% bin_order_pvals) %>%
+
+  left_join(
+    mass_stats_2x2 %>%
+      filter(!Bin %in% bins_to_remove_display, Bin %in% bin_order_pvals) %>%
+      select(Bin, p_Age, p_Sex, p_AgeSex, FDR_Age, FDR_Sex, FDR_AgeSex),
+    by = "Bin"
+  ) %>%
+
+  mutate(
+    Age_chr = as.character(Age),
+    Sex_chr = as.character(Sex),
+
+    # Close Adult/Old within sex;
+    # larger separation between Female and Male
+    x_pos = case_when(
+      Age_chr == "Adult" &
+        Sex_chr == "Female" ~ 1.00,
+
+      Age_chr == "Old" &
+        Sex_chr == "Female" ~ 1.30,
+
+      Age_chr == "Adult" &
+        Sex_chr == "Male" ~ 1.90,
+
+      Age_chr == "Old" &
+        Sex_chr == "Male" ~ 2.20
+    ),
+
+    Bin = factor(as.character(Bin), levels = bin_order_pvals),
+
+    Bin_lab = nm_comp_strip_label(Bin, p_Age, p_Sex, p_AgeSex, FDR_Age, FDR_Sex, FDR_AgeSex)
+  )
+
+# ── Preserve desired facet order ──────────────────────────────────────────────
+
+bin_lab_order <- plot_df_2x2 %>%
+  distinct(Bin, Bin_lab) %>%
+  arrange(Bin) %>%
+  pull(Bin_lab)
+
+plot_df_2x2 <- plot_df_2x2 %>%
+  mutate(Bin_lab = factor(Bin_lab, levels = bin_lab_order))
+
+# ── Sex grouping annotations ─────────────────────────────────────────────────
+# Only add these to the BOTTOM ROW.
+# This avoids the horizontal line appearing between facet rows.
+
+bottom_bins <- tail(bin_order_pvals, 4)
+
+bottom_bin_labs <- plot_df_2x2 %>%
+  filter(as.character(Bin) %in% bottom_bins) %>%
+  distinct(Bin_lab) %>%
+  pull(Bin_lab)
+
+sex_axis_ann <- tidyr::crossing(Bin_lab = bottom_bin_labs, Sex_label = c("Female", "Male")) %>%
+  mutate(
+    x_mid = if_else(Sex_label == "Female", 1.15, 2.05),
+
+    # Text-based rule avoids changing each panel's y-axis range.
+    line_label = "───────"
+  )
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+
+p_bin_2x2 <- ggplot(plot_df_2x2, aes(x = x_pos, y = Fraction_pct)) +
+
+  # Individual animals
+  geom_point(
+    aes(colour = Age, shape = Sex),
+    position = position_jitter(width = 0.055, height = 0),
+    alpha = 0.75,
+    size = nm_style$point_medium
+  ) +
+
+  # Group means
+  # Female mean = circle
+  # Male mean   = triangle
+  stat_summary(
+    aes(colour = Age, shape = Sex, group = interaction(Age, Sex)),
+    fun = mean,
+    geom = "point",
+    size = nm_style$point_mean
+  ) +
+
+  # SEM
+  stat_summary(
+    aes(colour = Age, group = interaction(Age, Sex)),
+    fun.data = mean_se,
+    geom = "errorbar",
+    width = 0.10,
+    linewidth = nm_style$data_line
+  ) +
+
+  # Sex group names alone are sufficient at this size; the previous
+  # text-drawn horizontal rule became oversized and is omitted.
+
+  # Female / Male labels
+  geom_text(
+    data = sex_axis_ann,
+    aes(x = x_mid, y = -Inf, label = Sex_label),
+    inherit.aes = FALSE,
+    vjust = 2.8,
+    size = nm_style$stat_text / ggplot2::.pt,
+    fontface = "bold",
+    colour = "grey25",
+    show.legend = FALSE
+  ) +
+
+  scale_colour_manual(values = c("Adult" = col_adult, "Old" = col_old)) +
+
+  scale_shape_manual(values = c("Female" = 16, "Male" = 17)) +
+
+  scale_x_continuous(
+    breaks = c(1.00, 1.30, 1.90, 2.20),
+
+    labels = c("A", "O", "A", "O"),
+
+    limits = c(0.65, 2.55),
+
+    expand = expansion(mult = 0)
+  ) +
+
+  # IMPORTANT:
+  # scales = "free_y" restores the individual y-axis range
+  # for each cellular-component panel.
+  facet_wrap(~ Bin_lab, scales = "free_y", ncol = 4) +
+
+  # Do NOT specify ylim here.
+  # That was what forced every panel to start at zero.
+  coord_cartesian(clip = "off") +
+
+  labs(
+    title = "Insoluble proteome composition by cellular component",
+    x = NULL,
+    y = "Percent of total insoluble abundance",
+    colour = "Age",
+    shape = "Sex"
+  ) +
+
+  theme_classic(base_size = 13) +
+
+  theme(
+    legend.position = "right",
+
+    strip.text = ggtext::element_markdown(lineheight = 0.90, margin = margin(1.5, 1, 1.5, 1)),
+
+    axis.text.x = element_text(face = "bold", size = nm_style$axis_text, margin = margin(t = 5)),
+
+    axis.ticks.x = element_blank(),
+
+    # Extra bottom room for Female/Male labels
+    plot.margin = margin(t = 5, r = 5, b = 18, l = 5)
+  )
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+
+comp_2x2_png <- file.path(comp_split_dir, "Mass_2x2_RawFDR.png")
+
+save_plot_png(p_bin_2x2, comp_2x2_png, width = 13, height = 6.5, dpi = 300)
+```
+
+```{r show-final-2x2-figure, echo=FALSE, out.width="100%"}
+knitr::include_graphics(comp_2x2_png)
+```
+# Summed raw insoluble abundance by cellular component
+
+This section analyzes the **absolute summed raw insoluble abundance** assigned to each cellular-component bin. This is distinct from the abundance-weighted composition analysis above: the y-axis is the summed raw intensity in each bin rather than that bin's percentage of the total insoluble proteome.
+
+For each mouse and cellular component, retained protein intensities are summed. Inferential tests are performed on `log2(summed raw abundance)` using the same 2 × 2 `Age × Sex` framework. The displayed raw-abundance panel shows the untransformed summed abundance, whereas the effect-size panel reports sex-specific **log2 fold changes (Old / Adult)** with 95% confidence intervals from the same log2-scale model.
+
+```{r raw-bin-abundance-analysis, fig.keep="none"}
+raw_bin_sample_2x2 <- long_filt %>%
+  filter(Bin %in% bin_order_figure) %>%
+  group_by(Sample, Age, Sex, Bin) %>%
+  summarise(RawBinAbundance = sum(Intensity, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    Age = factor(Age, levels = c("Adult", "Old")),
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Bin = factor(as.character(Bin), levels = bin_order_figure),
+    Group = factor(paste(Age, Sex, sep = "_"), levels = c("Adult_Female", "Old_Female", "Adult_Male", "Old_Male")),
+    log2_RawBin = if_else(is.finite(RawBinAbundance) & RawBinAbundance > 0, log2(RawBinAbundance), NA_real_)
+  )
+
+run_rawbin_type3 <- function(data) {
+
+  dd <- data %>%
+    filter(is.finite(log2_RawBin)) %>%
+    droplevels()
+
+  if (nrow(dd) < 4 || nlevels(dd$Age) < 2 || nlevels(dd$Sex) < 2) {
+    return(tibble(p_Age = NA_real_, p_Sex = NA_real_, p_AgeSex = NA_real_))
+  }
+
+  contrasts(dd$Age) <- contr.sum(nlevels(dd$Age))
+
+  contrasts(dd$Sex) <- contr.sum(nlevels(dd$Sex))
+
+  fit <- lm(log2_RawBin ~ Age * Sex, data = dd)
+
+  a <- car::Anova(fit, type = 3)
+
+  p_col <- grep("^Pr\\(", colnames(a), value = TRUE)[1]
+
+  tibble(
+    p_Age = if ("Age" %in% rownames(a)) {
+      as.numeric(a["Age", p_col])
+    } else {
+      NA_real_
+    },
+    p_Sex = if ("Sex" %in% rownames(a)) {
+      as.numeric(a["Sex", p_col])
+    } else {
+      NA_real_
+    },
+    p_AgeSex = if ("Age:Sex" %in% rownames(a)) {
+      as.numeric(a["Age:Sex", p_col])
+    } else {
+      NA_real_
+    }
+  )
+}
+
+run_rawbin_age_effects_by_sex <- function(data) {
+
+  dd <- data %>%
+    filter(is.finite(log2_RawBin)) %>%
+    droplevels()
+
+  if (nrow(dd) < 4 || nlevels(dd$Age) < 2 || nlevels(dd$Sex) < 2) {
+    return(
+      tibble(
+        Sex = factor(character(), levels = c("Female", "Male")),
+        log2FC = numeric(),
+        SE = numeric(),
+        df = numeric(),
+        CI_low = numeric(),
+        CI_high = numeric(),
+        p_value = numeric()
+      )
+    )
+  }
+
+  contrasts(dd$Age) <- contr.sum(nlevels(dd$Age))
+
+  contrasts(dd$Sex) <- contr.sum(nlevels(dd$Sex))
+
+  fit <- lm(log2_RawBin ~ Age * Sex, data = dd)
+
+  emm_age <- emmeans::emmeans(fit, ~ Age | Sex)
+
+  age_contrast <- emmeans::contrast(emm_age, method = "revpairwise", adjust = "none")
+
+  as.data.frame(summary(age_contrast, infer = c(TRUE, TRUE), adjust = "none")) %>%
+    transmute(
+      Sex = factor(as.character(Sex), levels = c("Female", "Male")),
+      log2FC = estimate,
+      SE = SE,
+      df = df,
+      CI_low = lower.CL,
+      CI_high = upper.CL,
+      p_value = p.value
+    )
+}
+
+raw_bin_stats_2x2 <- raw_bin_sample_2x2 %>%
+  group_by(Bin) %>%
+  group_modify(~ run_rawbin_type3(.x)) %>%
+  ungroup() %>%
+  mutate(
+    FDR_Age = p.adjust(p_Age, method = "BH"),
+    FDR_Sex = p.adjust(p_Sex, method = "BH"),
+    FDR_AgeSex = p.adjust(p_AgeSex, method = "BH")
+  )
+
+raw_bin_age_effects_by_sex <- raw_bin_sample_2x2 %>%
+  group_by(Bin) %>%
+  group_modify(~ run_rawbin_age_effects_by_sex(.x)) %>%
+  ungroup() %>%
+  mutate(Bin = factor(as.character(Bin), levels = rev(bin_order_figure)))
+
+write.csv(raw_bin_sample_2x2, file.path(stats_split_dir, "RawBin_perSample_2x2.csv"), row.names = FALSE)
+
+write.csv(raw_bin_stats_2x2, file.path(stats_split_dir, "RawBin_stats_2x2.csv"), row.names = FALSE)
+
+write.csv(raw_bin_age_effects_by_sex, file.path(stats_split_dir, "RawBin_AgeEffects_bySex.csv"), row.names = FALSE)
+```
+## Total raw insoluble abundance by cellular component
+
+```{r raw-bin-2x2-plot, fig.keep="none"}
+raw_bin_plot_df <- raw_bin_sample_2x2 %>%
+  left_join(raw_bin_stats_2x2, by = "Bin") %>%
+  mutate(
+    Bin_chr = as.character(Bin),
+    Bin_lab = nm_comp_strip_label(Bin, p_Age, p_Sex, p_AgeSex, FDR_Age, FDR_Sex, FDR_AgeSex)
+  )
+
+raw_bin_lab_order <- raw_bin_plot_df %>%
+  distinct(Bin, Bin_lab) %>%
+  mutate(Bin = factor(as.character(Bin), levels = bin_order_figure)) %>%
+  arrange(Bin) %>%
+  pull(Bin_lab)
+
+raw_bin_plot_df <- raw_bin_plot_df %>%
+  mutate(Bin_lab = factor(Bin_lab, levels = raw_bin_lab_order))
+
+p_raw_bin_2x2 <- ggplot(raw_bin_plot_df, aes(x = Group, y = RawBinAbundance)) +
+  geom_point(
+    aes(colour = Age, shape = Sex),
+    position = position_jitter(width = 0.07, height = 0),
+    size = nm_style$point_medium,
+    alpha = 0.72
+  ) +
+  stat_summary(
+    aes(colour = Age, shape = Sex, group = interaction(Age, Sex)),
+    fun = mean,
+    geom = "point",
+    size = nm_style$point_mean
+  ) +
+  stat_summary(
+    aes(colour = Age, group = interaction(Age, Sex)),
+    fun.data = mean_se,
+    geom = "errorbar",
+    width = 0.13,
+    linewidth = nm_style$data_line
+  ) +
+  scale_colour_manual(values = c("Adult" = col_adult, "Old" = col_old), name = "Age") +
+  scale_shape_manual(values = sex_shapes, name = "Sex") +
+  scale_x_discrete(labels = nm_fig3$rawbin_age_labels) +
+  facet_wrap(~ Bin_lab, scales = "free_y", ncol = 4) +
+  labs(
+    title = "Total insoluble abundance by cellular component",
+    subtitle = "Summed raw abundance of proteins assigned to each component",
+    x = NULL,
+    y = "Total raw insoluble abundance (A.U.)"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 17),
+    plot.subtitle = element_text(size = 13),
+    strip.background = element_rect(fill = "white", colour = "black", linewidth = nm_style$axis_line),
+    strip.text = ggtext::element_markdown(lineheight = 0.90, margin = margin(1.5, 1, 1.5, 1)),
+    axis.text.x = element_text(face = "bold", size = nm_style$axis_text),
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+raw_bin_2x2_png <- file.path(comp_split_dir, "RawBin_2x2.png")
+
+save_plot_png(p_raw_bin_2x2, raw_bin_2x2_png, width = 14, height = 7.2, dpi = 300)
+```
+
+```{r show-raw-bin-2x2, echo=FALSE, out.width="100%"}
+knitr::include_graphics(raw_bin_2x2_png)
+```
+## Sex-specific age effects on summed raw abundance
+
+```{r raw-bin-age-effects-plot, fig.keep="none"}
+raw_bin_effect_dodge <- position_dodge(width = 0.46)
+
+bin_colors_raw_effect <- pal[bin_order_figure]
+
+p_raw_bin_age_effects <- ggplot(raw_bin_age_effects_by_sex, aes(x = log2FC, y = Bin, colour = Bin, shape = Sex)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = nm_style$age_effect_zero_line) +
+  geom_errorbar(
+    aes(xmin = CI_low, xmax = CI_high),
+    orientation = "y",
+    width = 0.13,
+    linewidth = nm_style$age_effect_ci_line,
+    position = raw_bin_effect_dodge
+  ) +
+  geom_point(size = nm_style$age_effect_point, alpha = 0.98, position = raw_bin_effect_dodge) +
+  scale_colour_manual(values = bin_colors_raw_effect, breaks = bin_order_figure, drop = TRUE, guide = "none") +
+  scale_shape_manual(values = sex_shapes, breaks = c("Female", "Male"), name = "Sex") +
+  guides(
+    shape = guide_legend(override.aes = list(colour = "black", alpha = 1, size = nm_style$age_effect_point))
+  ) +
+  labs(
+    title = "Age effect on summed insoluble abundance",
+    subtitle = "Old vs Adult within each sex",
+    x = "log2FC (Old / Adult)",
+    y = NULL
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = nm_style$axis_title, hjust = 0),
+    plot.subtitle = element_text(size = nm_style$small_text, colour = "grey35", hjust = 0, margin = margin(b = 8)),
+    axis.title.x = element_text(size = nm_style$axis_title),
+    axis.text.x = element_text(size = nm_style$effect_y_label_pt, colour = "black"),
+    axis.text.y = element_text(size = nm_style$effect_y_label_pt, face = "bold", colour = "black"),
+    axis.line.x = element_line(colour = "black", linewidth = nm_style$axis_line),
+    axis.line.y = element_line(colour = "black", linewidth = nm_style$axis_line),
+    axis.ticks.y = element_blank(),
+    legend.position = "right",
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = nm_style$effect_y_label_pt)
+  )
+
+raw_bin_age_effect_png <- file.path(stats_split_dir, "RawBin_AgeEffects_E2.png")
+
+save_plot_png(p_raw_bin_age_effects, raw_bin_age_effect_png, width = 8, height = 6.8, dpi = 300)
+```
+
+```{r show-raw-bin-age-effects, echo=FALSE, out.width="75%"}
+knitr::include_graphics(raw_bin_age_effect_png)
+```
+# Effect-size analyses
+
+Two effect-size definitions are retained because they answer different questions:
+
+1. **Percentage-point effect:** Old − Adult in the percentage of the *total insoluble proteome* assigned to each bin.
+2. **Within-bin relative change:** `100 × (Old − Adult) / Adult`, describing the relative change in that component's contribution compared with its Adult value.
+
+Both pooled and sex-specific versions are exported.
+
+```{r effect-size-data}
+display_bins <- bin_order_figure[bin_order_figure %in% unique(mass_stats_age$Bin)]
+
+# -----------------------------------------------------------------------------
+# Bootstrap 95% CIs for the raw-scale descriptive effect sizes.
+#
+# Resampling is performed independently within Adult and Old for each
+# cellular-component × Sex combination. This preserves the point-estimate
+# definitions already used in the report:
+#
+#   percentage-point effect = mean(Old) - mean(Adult)
+#   relative effect         = 100 * [mean(Old) - mean(Adult)] / mean(Adult)
+# -----------------------------------------------------------------------------
+bootstrap_age_effect_ci <- function(
+  data,
+  value_col = "Fraction_pct",
+  effect_type = c("difference", "relative"),
+  n_boot = 5000
+) {
+
+  effect_type <- match.arg(effect_type)
+
+  adult_values <- data[as.character(data$Age) == "Adult", value_col][[1]]
+
+  old_values <- data[as.character(data$Age) == "Old", value_col][[1]]
+
+  adult_values <- adult_values[is.finite(adult_values)]
+
+  old_values <- old_values[is.finite(old_values)]
+
+  if (length(adult_values) < 2 || length(old_values) < 2) {
+    return(
+      tibble(
+        estimate_boot_reference = NA_real_,
+        CI_low = NA_real_,
+        CI_high = NA_real_,
+        n_Adult = length(adult_values),
+        n_Old = length(old_values)
+      )
+    )
+  }
+
+  adult_mean <- mean(adult_values)
+
+  old_mean <- mean(old_values)
+
+  estimate <- if (effect_type == "difference") {
+    old_mean -
+      adult_mean
+  } else {
+    if (adult_mean > 0) {
+      100 *
+        (old_mean - adult_mean) /
+        adult_mean
+    } else {
+      NA_real_
+    }
+  }
+
+  boot_values <- replicate(
+    n_boot,
+    {
+
+      adult_boot <- sample(adult_values, size = length(adult_values), replace = TRUE)
+
+      old_boot <- sample(old_values, size = length(old_values), replace = TRUE)
+
+      adult_boot_mean <- mean(adult_boot)
+
+      old_boot_mean <- mean(old_boot)
+
+      if (effect_type == "difference") {
+
+        old_boot_mean -
+          adult_boot_mean
+
+      } else {
+
+        if (adult_boot_mean > 0) {
+          100 *
+            (old_boot_mean - adult_boot_mean) /
+            adult_boot_mean
+        } else {
+          NA_real_
+        }
+      }
+    }
+  )
+
+  boot_values <- boot_values[is.finite(boot_values)]
+
+  if (length(boot_values) < 100) {
+    ci <- c(NA_real_, NA_real_)
+  } else {
+    ci <- as.numeric(quantile(boot_values, probs = c(0.025, 0.975), na.rm = TRUE, names = FALSE, type = 7))
+  }
+
+  tibble(
+    estimate_boot_reference = estimate,
+    CI_low = ci[1],
+    CI_high = ci[2],
+    n_Adult = length(adult_values),
+    n_Old = length(old_values)
+  )
+}
+
+set.seed(20260909)
+
+percentage_point_ci_by_sex <- mass_sample_2x2 %>%
+  filter(Bin %in% display_bins, !Bin %in% bins_to_remove_display) %>%
+  group_by(Bin, Sex) %>%
+  group_modify(
+    ~ bootstrap_age_effect_ci(.x, value_col = "Fraction_pct", effect_type = "difference", n_boot = 5000)
+  ) %>%
+  ungroup()
+
+set.seed(20260910)
+
+within_bin_ci_by_sex <- mass_sample_2x2 %>%
+  filter(Bin %in% display_bins, !Bin %in% bins_to_remove_display) %>%
+  group_by(Bin, Sex) %>%
+  group_modify(
+    ~ bootstrap_age_effect_ci(.x, value_col = "Fraction_pct", effect_type = "relative", n_boot = 5000)
+  ) %>%
+  ungroup()
+
+effect_overall <- mass_stats_age %>%
+  filter(Bin %in% display_bins, !Bin %in% bins_to_remove_display) %>%
+  mutate(Bin = factor(as.character(Bin), levels = rev(display_bins)))
+
+effect_by_sex <- mass_stats_2x2 %>%
+  filter(Bin %in% display_bins, !Bin %in% bins_to_remove_display) %>%
+  mutate(
+    delta_Female =
+      mean_pct_Old_Female -
+      mean_pct_Adult_Female,
+
+    delta_Male =
+      mean_pct_Old_Male -
+      mean_pct_Adult_Male
+  ) %>%
+  select(Bin, p_Age, p_Sex, p_AgeSex, FDR_Age, FDR_Sex, FDR_AgeSex, delta_Female, delta_Male) %>%
+  pivot_longer(cols = c(delta_Female, delta_Male), names_to = "Sex", values_to = "delta_old_minus_adult") %>%
+  mutate(Sex = dplyr::recode(Sex, delta_Female = "Female", delta_Male = "Male")) %>%
+  left_join(percentage_point_ci_by_sex %>% mutate(Sex = as.character(Sex)), by = c("Bin", "Sex")) %>%
+  mutate(
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Bin = factor(as.character(Bin), levels = rev(display_bins))
+  )
+
+within_overall <- mass_stats_age %>%
+  filter(Bin %in% display_bins, !Bin %in% bins_to_remove_display) %>%
+  mutate(
+    withinbin_pct_change = if_else(
+      !is.na(mean_pct_Adult) &
+        mean_pct_Adult > 0,
+      100 *
+        (mean_pct_Old - mean_pct_Adult) /
+        mean_pct_Adult,
+      NA_real_
+    ),
+    Bin = factor(as.character(Bin), levels = rev(display_bins))
+  )
+
+within_by_sex <- mass_stats_2x2 %>%
+  filter(Bin %in% display_bins, !Bin %in% bins_to_remove_display) %>%
+  mutate(
+    within_Female = if_else(
+      !is.na(mean_pct_Adult_Female) &
+        mean_pct_Adult_Female > 0,
+      100 *
+        (mean_pct_Old_Female - mean_pct_Adult_Female) /
+        mean_pct_Adult_Female,
+      NA_real_
+    ),
+
+    within_Male = if_else(
+      !is.na(mean_pct_Adult_Male) &
+        mean_pct_Adult_Male > 0,
+      100 *
+        (mean_pct_Old_Male - mean_pct_Adult_Male) /
+        mean_pct_Adult_Male,
+      NA_real_
+    )
+  ) %>%
+  select(Bin, p_Age, p_Sex, p_AgeSex, FDR_Age, FDR_Sex, FDR_AgeSex, within_Female, within_Male) %>%
+  pivot_longer(cols = c(within_Female, within_Male), names_to = "Sex", values_to = "withinbin_pct_change") %>%
+  mutate(Sex = dplyr::recode(Sex, within_Female = "Female", within_Male = "Male")) %>%
+  left_join(within_bin_ci_by_sex %>% mutate(Sex = as.character(Sex)), by = c("Bin", "Sex")) %>%
+  mutate(
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Bin = factor(as.character(Bin), levels = rev(display_bins))
+  )
+
+write.csv(effect_overall, file.path(stats_dir, "Effect_percentagePoint_overall.csv"), row.names = FALSE)
+
+write.csv(effect_by_sex, file.path(stats_split_dir, "Effect_percentagePoint_bySex.csv"), row.names = FALSE)
+
+write.csv(within_overall, file.path(stats_dir, "Effect_withinBin_overall.csv"), row.names = FALSE)
+
+write.csv(within_by_sex, file.path(stats_split_dir, "Effect_withinBin_bySex.csv"), row.names = FALSE)
+```
+## Percentage-point effects
+
+```{r percentage-point-effects, fig.keep="none"}
+bin_colors_display <- pal[display_bins]
+
+effect_style_by_sex <- function() {
+  theme_classic(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", size = nm_style$axis_title, hjust = 0),
+      plot.subtitle = element_text(
+        size = nm_style$small_text,
+        colour = "grey35",
+        hjust = 0,
+        margin = margin(b = 8)
+      ),
+      axis.title.x = element_text(size = nm_style$axis_title),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(size = nm_style$effect_axis_x_pt, colour = "black"),
+      axis.text.y = element_text(size = nm_style$effect_y_label_pt, face = "bold", colour = "black"),
+      axis.line.x = element_line(colour = "black", linewidth = nm_style$axis_line),
+      axis.line.y = element_line(colour = "black", linewidth = nm_style$axis_line),
+      axis.ticks.y = element_blank(),
+      legend.position = "right",
+      legend.title = element_text(size = nm_style$legend_title),
+      legend.text = element_text(size = nm_style$legend_text),
+      plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+    )
+}
+
+p_effect_overall <- ggplot(effect_overall, aes(x = delta_old_minus_adult, y = Bin, colour = Bin)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = nm_style$effect_zero_line) +
+  geom_point(size = nm_style$effect_point) +
+  scale_colour_manual(
+    values = bin_colors_display,
+    breaks = display_bins,
+    drop = TRUE,
+    name = "Cellular component"
+  ) +
+  labs(title = "Age effect by cellular component", x = "Change in total abundance (percentage points)", y = NULL) +
+  theme_classic(base_size = 13)
+
+p_effect_by_sex <- ggplot(effect_by_sex, aes(x = delta_old_minus_adult, y = Bin, colour = Bin, shape = Sex)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = nm_style$effect_zero_line) +
+  geom_errorbar(
+    aes(xmin = CI_low, xmax = CI_high),
+    orientation = "y",
+    width = 0.13,
+    linewidth = nm_style$effect_ci_line,
+    position = position_dodge(width = 0.45)
+  ) +
+  geom_point(size = nm_style$effect_point, alpha = 0.95, position = position_dodge(width = 0.45)) +
+  scale_colour_manual(values = bin_colors_display, breaks = display_bins, drop = TRUE, guide = "none") +
+  scale_shape_manual(values = sex_shapes, name = "Sex") +
+  labs(
+    title = "Age effect on insoluble proteome composition",
+    subtitle = "Old vs Adult within each sex",
+    x = "Change in total abundance (percentage points)",
+    y = NULL
+  ) +
+  guides(shape = guide_legend(override.aes = list(colour = "black", alpha = 1, size = nm_style$effect_point))) +
+  effect_style_by_sex()
+
+effect_overall_png <- file.path(stats_dir, "Effect_percentagePoint_overall.png")
+
+effect_sex_png <- file.path(stats_split_dir, "Effect_percentagePoint_bySex.png")
+
+save_plot_png(p_effect_overall, effect_overall_png, width = 8, height = 6)
+
+save_plot_png(p_effect_by_sex, effect_sex_png, width = 8, height = 6)
+```
+
+```{r show-percentage-point-effects, echo=FALSE, out.width="49%"}
+knitr::include_graphics(c(effect_overall_png, effect_sex_png))
+```
+## Within-bin relative effects
+
+```{r within-bin-effects, fig.keep="none"}
+add_minus10_xaxis <- function(x_values, ci_low = NULL, ci_high = NULL) {
+
+  all_values <- c(x_values, ci_low, ci_high)
+
+  x_min <- min(all_values, -10, na.rm = TRUE)
+
+  x_max <- max(all_values, na.rm = TRUE)
+
+  scale_x_continuous(
+    limits = c(x_min, x_max),
+
+    breaks = scales::breaks_pretty(n = 6),
+
+    expand = expansion(mult = c(0.03, 0.05))
+  )
+}
+
+p_within_overall <- ggplot(within_overall, aes(x = withinbin_pct_change, y = Bin, colour = Bin)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = nm_style$effect_zero_line) +
+  geom_point(size = nm_style$effect_point) +
+  scale_colour_manual(
+    values = bin_colors_display,
+    breaks = display_bins,
+    drop = TRUE,
+    name = "Cellular component"
+  ) +
+  add_minus10_xaxis(within_overall$withinbin_pct_change) +
+  labs(title = "Relative age effect within each cellular component", x = "Within-component change (%)", y = NULL) +
+  theme_classic(base_size = 13)
+
+p_within_by_sex <- ggplot(within_by_sex, aes(x = withinbin_pct_change, y = Bin, colour = Bin, shape = Sex)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = nm_style$effect_zero_line) +
+  geom_errorbar(
+    aes(xmin = CI_low, xmax = CI_high),
+    orientation = "y",
+    width = 0.13,
+    linewidth = nm_style$effect_ci_line,
+    position = position_dodge(width = 0.45)
+  ) +
+  geom_point(size = nm_style$effect_point, alpha = 0.95, position = position_dodge(width = 0.45)) +
+  scale_colour_manual(values = bin_colors_display, breaks = display_bins, drop = TRUE, guide = "none") +
+  scale_shape_manual(values = sex_shapes, name = "Sex") +
+  add_minus10_xaxis(within_by_sex$withinbin_pct_change, within_by_sex$CI_low, within_by_sex$CI_high) +
+  labs(
+    title = "Relative age effect within each cellular component",
+    subtitle = "Old vs Adult within each sex",
+    x = "Within-component change (%)",
+    y = NULL
+  ) +
+  guides(shape = guide_legend(override.aes = list(colour = "black", alpha = 1, size = nm_style$effect_point))) +
+  effect_style_by_sex()
+
+within_overall_png <- file.path(stats_dir, "Effect_withinBin_overall.png")
+
+within_sex_png <- file.path(stats_split_dir, "Effect_withinBin_bySex.png")
+
+save_plot_png(p_within_overall, within_overall_png, width = 8, height = 6)
+
+save_plot_png(p_within_by_sex, within_sex_png, width = 8, height = 6)
+```
+
+```{r show-within-bin-effects, echo=FALSE, out.width="49%"}
+knitr::include_graphics(c(within_overall_png, within_sex_png))
+```
+# Protein-level bin list
+
+This table supplies the abundance values used by the dot-plot section later in the report.
+
+```{r protein-bin-export}
+protein_bin_export <- long_filt %>%
+  filter(Intensity > 0) %>%
+  group_by(Protein.Group, Gene1, Bin, Age) %>%
+  summarise(mean_intensity = mean(Intensity, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Age, values_from = mean_intensity, names_prefix = "mean_intensity_") %>%
+  mutate(
+    Bin = factor(Bin, levels = bin_priority),
+    display_mean = rowMeans(cbind(mean_intensity_Adult, mean_intensity_Old), na.rm = TRUE)
+  ) %>%
+  arrange(Bin, desc(display_mean)) %>%
+  mutate(Bin = as.character(Bin)) %>%
+  select(-display_mean)
+
+write.csv(protein_bin_export, file.path(shared_dir, "Protein_bin_list_min2.csv"), row.names = FALSE)
+
+cat("Proteins exported to bin list: ", nrow(protein_bin_export), "\n", sep = "")
+```
+# Detection-frequency analysis
+
+Detection is tested using a pooled two-sided Fisher's exact test comparing Adult and Old detection prevalence for each protein. BH FDR correction is then applied across the tested proteins.
+
+The main reproducibility-filtered table uses the same `min2` protein set as the composition analysis. Exact Age-exclusive and relaxed Old-predominant subsets are exported separately.
+
+```{r detection-analysis}
+make_detection_table <- function(long_df) {
+
+  long_df %>%
+    group_by(Protein.Group, Gene1, Bin, Sample, Age, Sex) %>%
+    summarise(Detected = as.integer(any(Intensity > 0, na.rm = TRUE)), .groups = "drop")
+}
+
+test_one_protein_detect <- function(df_prot) {
+
+  adult_det <- sum(df_prot$Detected[df_prot$Age == "Adult"], na.rm = TRUE)
+
+  adult_n <- sum(df_prot$Age == "Adult")
+
+  old_det <- sum(df_prot$Detected[df_prot$Age == "Old"], na.rm = TRUE)
+
+  old_n <- sum(df_prot$Age == "Old")
+
+  fisher_mat <- matrix(c(adult_det, adult_n - adult_det, old_det, old_n - old_det), nrow = 2, byrow = TRUE)
+
+  p_fisher <- tryCatch(fisher.test(fisher_mat)$p.value, error = function(e) NA_real_)
+
+  tibble(
+    adult_detected_n = adult_det,
+    adult_total_n = adult_n,
+    old_detected_n = old_det,
+    old_total_n = old_n,
+    adult_prev = adult_det / adult_n,
+    old_prev = old_det / old_n,
+    delta_prev =
+      old_det / old_n -
+      adult_det / adult_n,
+    p_detect_age_pooled = p_fisher
+  )
+}
+
+run_detection_analysis <- function(long_df) {
+
+  make_detection_table(long_df) %>%
+    group_by(Protein.Group, Gene1, Bin) %>%
+    group_modify(~ test_one_protein_detect(.x)) %>%
+    ungroup() %>%
+    mutate(
+      FDR_detect_pooled = p.adjust(p_detect_age_pooled, method = "BH"),
+
+      old_only_min2 =
+        old_detected_n >= min_detect_n &
+        adult_detected_n == 0,
+
+      adult_only_min2 =
+        adult_detected_n >= min_detect_n &
+        old_detected_n == 0,
+
+      old_predominant =
+        old_detected_n >= min_detect_n &
+        adult_detected_n <= 1
+    ) %>%
+    arrange(FDR_detect_pooled, desc(delta_prev))
+}
+
+detect_stats_all <- run_detection_analysis(long_assigned)
+
+detect_stats_min2 <- run_detection_analysis(long_filt)
+
+old_only_min2 <- detect_stats_min2 %>%
+  filter(old_only_min2) %>%
+  arrange(Bin, desc(old_detected_n), p_detect_age_pooled)
+
+adult_only_min2 <- detect_stats_min2 %>%
+  filter(adult_only_min2) %>%
+  arrange(Bin, desc(adult_detected_n), p_detect_age_pooled)
+
+old_predominant <- detect_stats_min2 %>%
+  filter(old_predominant) %>%
+  arrange(Bin, desc(old_detected_n), p_detect_age_pooled)
+
+write.csv(detect_stats_all, file.path(detect_dir, "Detection_all.csv"), row.names = FALSE)
+
+write.csv(detect_stats_min2, file.path(detect_dir, "Detection_min2.csv"), row.names = FALSE)
+
+write.csv(old_only_min2, file.path(detect_dir, "OldOnly_min2.csv"), row.names = FALSE)
+
+write.csv(adult_only_min2, file.path(detect_dir, "AdultOnly_min2.csv"), row.names = FALSE)
+
+write.csv(old_predominant, file.path(detect_dir, "OldPredominant_OldGe2_AdultLe1.csv"), row.names = FALSE)
+```
+## Exact Old-only proteins
+
+```{r exact-old-only-plot, fig.keep="none"}
+bin_pal <- pal
+
+old_only_plot_df <- old_only_min2 %>%
+  left_join(
+    protein_bin_export %>%
+      select(Protein.Group, Gene1, Bin, mean_intensity_Adult, mean_intensity_Old) %>%
+      distinct(),
+    by = c("Protein.Group", "Gene1", "Bin")
+  ) %>%
+  mutate(
+    old_prev_label = sprintf("%d/%d", old_detected_n, old_total_n),
+    p_label = fmt_p_detection(p_detect_age_pooled),
+    Gene1 = factor(Gene1, levels = rev(unique(Gene1)))
+  )
+
+old_only_png <- file.path(detect_dir, "OldOnly_min2.png")
+
+if (nrow(old_only_plot_df) > 0) {
+
+  p_old_only <- ggplot(old_only_plot_df, aes(x = "Old", y = Gene1, colour = Bin)) +
+    geom_point(aes(size = log10(mean_intensity_Old)), alpha = 0.90) +
+    geom_point(aes(x = "Adult"), shape = 4, size = 2, colour = "grey70") +
+    geom_text(aes(label = old_prev_label), nudge_x = 0.17, hjust = 0, size = 3, colour = "grey25") +
+    geom_text(aes(label = p_label), nudge_x = 0.58, hjust = 0, size = 3, colour = "grey40") +
+    scale_colour_manual(values = bin_pal, name = "Cellular") +
+    scale_size_continuous(name = expression(log[10](Intensity)), range = c(3, 8)) +
+    scale_x_discrete(limits = c("Adult", "Old"), position = "top", expand = expansion(add = c(0.2, 1.3))) +
+    coord_cartesian(clip = "off") +
+    labs(
+      title = "Proteins detected in Old but not Adult",
+      subtitle = paste0("Insoluble fraction | Old ≥ ", min_detect_n, ", Adult = 0 | n = ", nrow(old_only_plot_df)),
+      x = NULL,
+      y = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid.major.y = element_line(colour = "grey93", linewidth = 0.3),
+      legend.position = "right",
+      plot.margin = margin(15, 100, 8, 8)
+    )
+
+  save_plot_png(p_old_only, old_only_png, width = 8.8, height = max(5, nrow(old_only_plot_df) * 0.28 + 2))
+}
+```
+
+```{r show-exact-old-only, echo=FALSE, out.width="80%"}
+if (file.exists(old_only_png)) {
+  knitr::include_graphics(old_only_png)
+}
+```
+## Relaxed Old-predominant proteins
+
+This display retains proteins detected in at least two Old samples and no more than one Adult sample. A grey X denotes complete Adult absence, whereas a hollow Adult symbol denotes a singleton Adult detection.
+
+```{r old-predominant-plot, fig.keep="none"}
+relaxed_old <- old_predominant %>%
+  left_join(
+    protein_bin_export %>%
+      select(Protein.Group, Gene1, Bin, mean_intensity_Adult, mean_intensity_Old) %>%
+      distinct(),
+    by = c("Protein.Group", "Gene1", "Bin")
+  ) %>%
+  mutate(
+    adult_absent =
+      adult_detected_n == 0,
+
+    adult_singleton =
+      adult_detected_n == 1,
+
+    old_prev_label = sprintf("%d/%d", old_detected_n, old_total_n),
+
+    p_label = fmt_p_detection(p_detect_age_pooled),
+
+    p_fontface = if_else(!is.na(p_detect_age_pooled) & p_detect_age_pooled <= 0.050, "bold", "plain"),
+
+    Gene1_label = if_else(
+      !is.na(p_detect_age_pooled) &
+        p_detect_age_pooled <= 0.050,
+      paste0("**", Gene1, "**"),
+      Gene1
+    )
+  ) %>%
+  arrange(factor(Bin, levels = bin_priority), desc(old_detected_n), desc(mean_intensity_Old), Gene1)
+
+old_pred_png <- file.path(detect_dir, "OldPredominant_OldGe2_AdultLe1.png")
+
+if (nrow(relaxed_old) > 0) {
+
+  used_bins <- bin_priority[bin_priority %in% unique(relaxed_old$Bin)]
+
+  relaxed_old <- relaxed_old %>%
+    mutate(Gene1 = factor(Gene1, levels = rev(unique(Gene1))), Bin = factor(Bin, levels = used_bins))
+
+  gene_label_map <- stats::setNames(relaxed_old$Gene1_label, as.character(relaxed_old$Gene1))
+
+  adult_x <- 1
+  old_x   <- 1.6
+  p_x     <- 2.0
+
+  row_guides <- tibble(Gene1 = levels(relaxed_old$Gene1))
+
+  p_relaxed <- ggplot() +
+    geom_segment(
+      data = row_guides,
+      aes(x = 0.7, xend = 1.85, y = Gene1, yend = Gene1),
+      colour = "grey92",
+      linewidth = 0.35
+    ) +
+    geom_vline(xintercept = c(adult_x, old_x), colour = "grey92", linewidth = 0.35) +
+    geom_point(
+      data = relaxed_old %>%
+        filter(adult_absent),
+      aes(x = adult_x, y = Gene1),
+      shape = 4,
+      size = nm_style$oldpred_adult_symbol_mm,
+      colour = "grey70",
+      stroke = nm_style$oldpred_adult_stroke_mm
+    ) +
+    geom_point(
+      data = relaxed_old %>%
+        filter(adult_singleton),
+      aes(x = adult_x, y = Gene1, colour = Bin),
+      shape = 1,
+      size = nm_style$oldpred_adult_symbol_mm,
+      stroke = nm_style$oldpred_adult_stroke_mm
+    ) +
+    geom_point(
+      data = relaxed_old,
+      aes(x = old_x, y = Gene1, colour = Bin),
+      shape = 16,
+      size = nm_style$oldpred_old_symbol_mm
+    ) +
+    geom_text(
+      data = relaxed_old,
+      aes(x = old_x, y = Gene1, label = old_prev_label),
+      nudge_x = 0.10,
+      hjust = 0,
+      size = nm_style$oldpred_old_prevalence_text_mm,
+      colour = "grey25"
+    ) +
+    geom_text(
+      data = relaxed_old,
+      aes(x = p_x, y = Gene1, label = p_label, fontface = p_fontface),
+      hjust = 0,
+      size = nm_style$oldpred_fisher_text_mm,
+      colour = "grey40",
+      show.legend = FALSE
+    ) +
+    scale_colour_manual(
+      values = bin_pal[used_bins],
+      breaks = used_bins,
+      drop = TRUE,
+      name = "Cellular component"
+    ) +
+    scale_y_discrete(labels = gene_label_map) +
+    scale_x_continuous(
+      breaks = c(adult_x, old_x, p_x),
+      labels = c("Adult", "Old", ""),
+      position = "top",
+      expand = expansion(add = c(0, 0.55))
+    ) +
+    coord_cartesian(clip = "off") +
+    labs(
+      title = NULL,
+      subtitle = NULL,
+      caption = paste0(
+        "Filled dot = Old detected (≥2); ",
+        "hollow dot = Adult singleton; ",
+        "grey X = Adult absent. ",
+        "* denotes pooled Fisher p ≤ 0.05."
+      ),
+      x = NULL,
+      y = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 15),
+      plot.subtitle = element_text(colour = "grey40", size = 11),
+      plot.caption = element_text(colour = "grey45", size = 8, hjust = 0.15),
+      axis.text.y = ggtext::element_markdown(size = 9.5),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "right"
+    )
+
+  save_plot_png(p_relaxed, old_pred_png, width = 6.2, height = max(5, nrow(relaxed_old) * 0.28 + 2.1))
+}
+```
+
+```{r show-old-predominant, echo=FALSE, out.width="75%"}
+if (file.exists(old_pred_png)) {
+  knitr::include_graphics(old_pred_png)
+}
+```
+# Top insoluble proteins by cellular component
+
+The dot plot ranks proteins **within each cellular component by Old abundance** and displays those same proteins in Adult and Old. Only the eight final cellular-component panels are retained. Dot size represents log10 mean intensity.
+
+```{r top10-dotplot, fig.keep="none"}
+dot_df <- protein_bin_export %>%
+  mutate(
+    Status = case_when(
+      !is.na(mean_intensity_Adult) &
+        !is.na(mean_intensity_Old) ~ "Both",
+
+      !is.na(mean_intensity_Adult) &
+        is.na(mean_intensity_Old) ~ "Adult only",
+
+      is.na(mean_intensity_Adult) &
+        !is.na(mean_intensity_Old) ~ "Old only",
+
+      TRUE ~ "Neither"
+    )
+  ) %>%
+  filter(Status != "Neither")
+
+bins_all_dot <- sort(unique(dot_df$Bin))
+
+bin_pal_dot <- setNames(viridisLite::viridis(length(bins_all_dot), option = "D", end = 0.95), bins_all_dot)
+
+all_log10 <- log10(c(dot_df$mean_intensity_Adult, dot_df$mean_intensity_Old))
+
+all_log10 <- all_log10[is.finite(all_log10)]
+
+size_limits <- c(floor(min(all_log10)), ceiling(max(all_log10)))
+
+size_breaks <- 4:7
+size_breaks <- size_breaks[size_breaks >= size_limits[1] & size_breaks <= size_limits[2]]
+
+if (length(size_breaks) == 0) {
+  size_breaks <- pretty(size_limits, n = 4)
+}
+
+size_scale <- scale_size_continuous(
+  name = expression(log[10](Intensity)),
+  range = c(nm_style$dot_top10_min, nm_style$dot_top10_max),
+  limits = size_limits,
+  breaks = size_breaks,
+  labels = paste0("10^", size_breaks),
+  guide = guide_legend(order = 2, override.aes = list(colour = "grey30", alpha = 1))
+)
+
+dot_bin_order <- bin_order_figure[bin_order_figure %in% bins_all_dot]
+
+color_scale_top10 <- scale_colour_manual(
+  name = "Cellular component",
+  values = bin_pal_dot,
+  breaks = dot_bin_order,
+  drop = FALSE,
+  guide = guide_legend(order = 1, nrow = 2, byrow = TRUE, override.aes = list(size = 2.6, alpha = 1))
+)
+
+plot_list <- list()
+
+for (i in seq_along(dot_bin_order)) {
+
+  bin_name <- dot_bin_order[i]
+  bin_col <- bin_pal_dot[[bin_name]]
+
+  top10 <- dot_df %>%
+    filter(Bin == bin_name, !is.na(mean_intensity_Old), mean_intensity_Old > 0) %>%
+    arrange(desc(mean_intensity_Old)) %>%
+    slice_head(n = 10)
+
+  if (nrow(top10) == 0) {
+    next
+  }
+
+  top10 <- top10 %>%
+    mutate(GeneLabel = make.unique(as.character(Gene1)))
+
+  plot_df <- top10 %>%
+    select(GeneLabel, mean_intensity_Adult, mean_intensity_Old) %>%
+    pivot_longer(
+      cols = c(mean_intensity_Adult, mean_intensity_Old),
+      names_to = "Group",
+      values_to = "Intensity"
+    ) %>%
+    mutate(
+      Group = dplyr::recode(Group, mean_intensity_Adult = "Adult", mean_intensity_Old = "Old"),
+
+      Group = factor(Group, levels = c("Adult", "Old")),
+
+      log10_int = if_else(!is.na(Intensity) & Intensity > 0, log10(Intensity), NA_real_),
+
+      GeneLabel = factor(GeneLabel, levels = rev(top10$GeneLabel)),
+
+      Bin = factor(bin_name, levels = dot_bin_order)
+    )
+
+  p <- ggplot(plot_df, aes(x = Group, y = GeneLabel, size = log10_int, colour = Bin)) +
+    geom_point(alpha = 0.90, na.rm = TRUE, show.legend = TRUE) +
+    size_scale +
+    color_scale_top10 +
+    scale_x_discrete(position = "top", labels = c("Adult" = "Adult", "Old" = "Old")) +
+    labs(title = bin_name, x = NULL, y = NULL) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = nm_style$dot_protein_title_pt, colour = bin_col),
+      axis.text.x = element_text(size = nm_style$dot_group_label_pt, face = "bold"),
+      axis.text.y = element_text(size = nm_style$dot_protein_label_pt),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid.major = element_line(colour = "grey93", linewidth = 0.3),
+      legend.position = if (i == 1) {
+        "bottom"
+      } else {
+        "none"
+      },
+      plot.margin = margin(2, 3, 2, 3)
+    )
+
+  plot_list[[bin_name]] <- p
+}
+
+combined_dotplot <- patchwork::wrap_plots(plotlist = plot_list, ncol = 4) +
+  patchwork::plot_layout(guides = "collect") +
+  patchwork::plot_annotation(
+    title = "Most abundant insoluble proteins by cellular component",
+    subtitle = "Top 10 proteins in each component ranked by Old abundance",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 8.0, hjust = 0.5),
+      plot.subtitle = element_text(size = 6.0, colour = "grey35", hjust = 0.5)
+    )
+  ) &
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 5.5),
+    legend.text = element_text(size = 4.8)
+  )
+
+dotplot_png <- file.path(dot_dir, "Top10_AllBins.png")
+
+save_plot_png(combined_dotplot, dotplot_png, width = 11.5, height = 6.5, dpi = 300)
+```
+
+```{r show-top10-dotplot, echo=FALSE, out.width="100%"}
+knitr::include_graphics(dotplot_png)
+```
+# Sex-resolved protein abundance summaries
+
+For each retained protein, abundance is summarized separately within Adult Female, Old Female, Adult Male, and Old Male groups. Mean and median intensity are calculated **only among samples with positive detected intensity**; non-detections are not entered as zero-valued abundance observations in these summaries.
+
+Detection counts are exported alongside the abundance values so low-prevalence means can be recognized. Detection prevalence is calculated as the number of samples with positive intensity divided by the total number of samples in that Age × Sex group. Both long- and wide-format tables are exported for downstream inspection.
+
+```{r abundance-summary}
+# ── Mean abundance among detected samples ─────────────────────────────────────
+abundance_by_sex <- long_filt %>%
+  filter(Intensity > 0) %>%
+  group_by(Protein.Group, Gene1, Bin, Sex, Age) %>%
+  summarise(
+    mean_intensity =
+      mean(Intensity, na.rm = TRUE),
+
+    median_intensity =
+      median(Intensity, na.rm = TRUE),
+
+    .groups = "drop"
+  )
+
+# ── Detection n / total for context ───────────────────────────────────────────
+detection_by_sex_for_abundance <- long_filt %>%
+  group_by(Protein.Group, Gene1, Bin, Sex, Age, Sample) %>%
+  summarise(Detected = as.integer(any(Intensity > 0, na.rm = TRUE)), .groups = "drop") %>%
+  group_by(Protein.Group, Gene1, Bin, Sex, Age) %>%
+  summarise(
+    detected_n =
+      sum(Detected, na.rm = TRUE),
+
+    total_n =
+      n(),
+
+    prevalence =
+      detected_n /
+      total_n,
+
+    .groups = "drop"
+  )
+
+abundance_by_sex_export <- abundance_by_sex %>%
+  full_join(detection_by_sex_for_abundance, by = c("Protein.Group", "Gene1", "Bin", "Sex", "Age")) %>%
+  arrange(factor(Bin, levels = bin_priority), Sex, Age, desc(mean_intensity))
+
+write.csv(abundance_by_sex_export, file.path(split_dot_dir, "Protein_abundance_bySex_long.csv"), row.names = FALSE)
+
+# Wide table useful for inspection
+abundance_by_sex_wide <- abundance_by_sex_export %>%
+  mutate(Group = paste(Age, Sex, sep = "_")) %>%
+  select(Protein.Group, Gene1, Bin, Group, mean_intensity, median_intensity, detected_n, total_n, prevalence) %>%
+  pivot_wider(
+    names_from = Group,
+    values_from = c(mean_intensity, median_intensity, detected_n, total_n, prevalence)
+  )
+
+write.csv(abundance_by_sex_wide, file.path(split_dot_dir, "Protein_abundance_bySex_wide.csv"), row.names = FALSE)
+```
+# Shared pooled-abundance table for sex-resolved Top-10 displays
+
+The pooled Adult/Old protein-abundance table created above is reused for the sex-resolved Top-10 displays. No second abundance calculation or GO assignment is performed.
+
+```{r pooled-top10-support}
+protein_bin_pooled <- protein_bin_export
+
+# The cellular-component palette and display order were created in the
+# combined Top-10 section and are reused below.
+```
+# Pooled Old-ranked Top 10 resolved into four Age × Sex groups
+
+Within each displayed cellular component, proteins are ranked by **pooled Old mean abundance** and the ten most abundant proteins are selected. Those same proteins are then displayed in four groups—Adult Female, Old Female, Adult Male, and Old Male—so that sex-resolved abundance patterns can be evaluated without changing the protein set between groups.
+
+```{r pooled-top10-bysex-data}
+pooled_top10 <- protein_bin_pooled %>%
+  filter(Bin %in% dot_bin_order, !is.na(mean_intensity_Old), mean_intensity_Old > 0) %>%
+  group_by(Bin) %>%
+  arrange(desc(mean_intensity_Old), .by_group = TRUE) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  select(Protein.Group, Gene1, Bin, pooled_Old_mean = mean_intensity_Old)
+
+pooled_top10_bysex <- pooled_top10 %>%
+  left_join(abundance_by_sex_export, by = c("Protein.Group", "Gene1", "Bin")) %>%
+  mutate(
+    Group = paste(Age, Sex, sep = "_"),
+
+    Group = factor(Group, levels = c("Adult_Female", "Old_Female", "Adult_Male", "Old_Male"))
+  )
+
+write.csv(pooled_top10_bysex, file.path(split_dot_dir, "Top10_PooledOldRank_bySex_table.csv"), row.names = FALSE)
+```
+
+```{r pooled-top10-bysex-plot, fig.keep="none"}
+all_log10_sex <- log10(pooled_top10_bysex$mean_intensity)
+
+all_log10_sex <- all_log10_sex[is.finite(all_log10_sex)]
+
+size_limits_sex <- c(floor(min(all_log10_sex)), ceiling(max(all_log10_sex)))
+
+size_breaks_sex <- 4:7
+
+size_breaks_sex <- size_breaks_sex[size_breaks_sex >= size_limits_sex[1] & size_breaks_sex <= size_limits_sex[2]]
+
+if (length(size_breaks_sex) == 0) {
+  size_breaks_sex <- pretty(size_limits_sex, n = 4)
+}
+
+size_scale_sex <- scale_size_continuous(
+  name =
+    expression(log[10](Intensity)),
+
+  range = c(nm_style$dot_top10_pooled_min, nm_style$dot_top10_pooled_max),
+
+  limits =
+    size_limits_sex,
+
+  breaks =
+    size_breaks_sex,
+
+  labels = paste0("10^", size_breaks_sex),
+
+  guide =
+    guide_legend(order = 2, override.aes = list(colour = "grey30", alpha = 1))
+)
+
+color_scale_top10_sex <- scale_colour_manual(
+  name = "Cellular component",
+  values = bin_pal_dot,
+  breaks = dot_bin_order,
+  drop = FALSE,
+  guide = guide_legend(order = 1, nrow = 2, byrow = TRUE, override.aes = list(size = 2.6, alpha = 1))
+)
+
+plot_list_4groups <- list()
+
+for (i in seq_along(dot_bin_order)) {
+
+  bin_name <-
+    dot_bin_order[i]
+
+  bin_col <-
+    bin_pal_dot[[bin_name]]
+
+  rank_tbl <- pooled_top10 %>%
+    filter(Bin == bin_name) %>%
+    arrange(desc(pooled_Old_mean)) %>%
+    mutate(GeneLabel = make.unique(as.character(Gene1)))
+
+  plot_df <- pooled_top10_bysex %>%
+    filter(Bin == bin_name) %>%
+    left_join(rank_tbl %>% select(Protein.Group, GeneLabel), by = "Protein.Group") %>%
+    mutate(
+      log10_int =
+        if_else(!is.na(mean_intensity) & mean_intensity > 0, log10(mean_intensity), NA_real_),
+
+      GeneLabel = factor(GeneLabel, levels = rev(rank_tbl$GeneLabel))
+    )
+
+  if (nrow(plot_df) == 0) {
+    next
+  }
+
+  p <- ggplot(plot_df, aes(x = Group, y = GeneLabel, size = log10_int, colour = Bin)) +
+
+    geom_point(alpha = 0.90, na.rm = TRUE, show.legend = TRUE) +
+
+    size_scale_sex +
+    color_scale_top10_sex +
+
+    scale_x_discrete(
+      position = "top",
+      labels = c(
+        "Adult_Female" =
+          "Adult\nF",
+        "Old_Female" =
+          "Old\nF",
+        "Adult_Male" =
+          "Adult\nM",
+        "Old_Male" =
+          "Old\nM"
+      )
+    ) +
+
+    labs(title = bin_name, x = NULL, y = NULL) +
+
+    theme_classic(base_size = 11) +
+
+    theme(
+      plot.title =
+        element_text(face = "bold", size = nm_style$dot_protein_title_pt, colour = bin_col),
+
+      axis.text.x =
+        element_text(size = nm_style$dot_group_label_pt, face = "bold"),
+
+      axis.text.y =
+        element_text(size = nm_style$dot_protein_label_pt),
+
+      axis.line =
+        element_blank(),
+
+      axis.ticks =
+        element_blank(),
+
+      panel.grid.major =
+        element_line(colour = "grey93", linewidth = 0.12),
+
+      legend.position =
+        if (i == 1) {
+          "bottom"
+        } else {
+          "none"
+        },
+
+      plot.margin =
+        margin(1, 1, 1, 1)
+    )
+
+  plot_list_4groups[[bin_name]] <- p
+}
+
+combined_4groups <-
+  patchwork::wrap_plots(plotlist = plot_list_4groups, ncol = 4) +
+
+  patchwork::plot_layout(guides = "collect") +
+
+  patchwork::plot_annotation(
+    title =
+      "Most abundant insoluble proteins resolved by sex",
+
+    subtitle =
+      "Pooled Old-ranked Top 10 proteins; F = Female, M = Male",
+
+    theme =
+      theme(
+        plot.title =
+          element_text(face = "bold", size = nm_style$axis_title, hjust = 0.5),
+
+        plot.subtitle =
+          element_text(size = nm_style$small_text, colour = "grey35", hjust = 0.5)
+      )
+  ) &
+
+  theme(
+    legend.position =
+      "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 5.5),
+    legend.text = element_text(size = 4.8)
+  )
+
+pooled_top10_bysex_png <- file.path(split_dot_dir, "Top10_PooledOldRank_bySex_4Groups.png")
+
+if (file.exists(pooled_top10_bysex_png)) {
+  unlink(pooled_top10_bysex_png)
+}
+
+save_plot_png(combined_4groups, pooled_top10_bysex_png, width = 13.5, height = 6.8, dpi = 300)
+```
+
+```{r show-pooled-top10-bysex, echo=FALSE, out.width="100%"}
+if (file.exists(pooled_top10_bysex_png)) {
+  knitr::include_graphics(pooled_top10_bysex_png)
+}
+```
+# Sex-specific Top-10 rankings
+
+The pooled Old-ranked display above fixes one common protein set for comparison across all four groups. The sex-specific rankings answer a different compositional question: **which proteins are most abundant within each cellular component in Old Female muscle, and which are most abundant in Old Male muscle?**
+
+Female and Male rankings are therefore generated independently. Within each sex and cellular component, proteins are ordered by mean positive intensity in Old mice, the ten most abundant are selected, and the corresponding Adult abundance for those same proteins is displayed. The membership-overlap analysis in the next section identifies proteins shared between the Female and Male Top-10 lists and proteins appearing in only one sex-specific list.
+
+```{r sex-specific-top10-function}
+make_sex_top10 <- function(sex_name, abundance_tbl, bins_order, palette) {
+
+  sex_tbl <- abundance_tbl %>%
+    filter(Sex == sex_name)
+
+  rank_tbl <- sex_tbl %>%
+    filter(Age == "Old", !is.na(mean_intensity), mean_intensity > 0, Bin %in% bins_order) %>%
+    group_by(Bin) %>%
+    arrange(desc(mean_intensity), .by_group = TRUE) %>%
+    slice_head(n = 10) %>%
+    ungroup() %>%
+    transmute(Protein.Group, Gene1, Bin, Old_rank_mean = mean_intensity)
+
+  plot_tbl <- rank_tbl %>%
+    left_join(sex_tbl, by = c("Protein.Group", "Gene1", "Bin"))
+
+  write.csv(
+    plot_tbl,
+    file.path(split_dot_dir, paste0("Top10_", sex_name, "_OldRank_table.csv")),
+    row.names = FALSE
+  )
+
+  logvals <- log10(plot_tbl$mean_intensity)
+
+  logvals <- logvals[is.finite(logvals)]
+
+  if (length(logvals) == 0) {
+    return(NULL)
+  }
+
+  lims <- c(floor(min(logvals)), ceiling(max(logvals)))
+
+  brks <- 4:7
+
+  brks <- brks[brks >= lims[1] & brks <= lims[2]]
+
+  if (length(brks) == 0) {
+    brks <- pretty(lims, n = 4)
+  }
+
+  this_size_scale <-
+    scale_size_continuous(
+      name =
+        expression(log[10](Intensity)),
+      range = c(2.5, 7),
+      limits = lims,
+      breaks = brks,
+      labels = paste0("10^", brks),
+      guide =
+        guide_legend(override.aes = list(colour = "grey30", alpha = 1))
+    )
+
+  plot_list <- list()
+
+  for (i in seq_along(bins_order)) {
+
+    bin_name <-
+      bins_order[i]
+
+    bin_col <-
+      palette[[bin_name]]
+
+    rank_bin <- rank_tbl %>%
+      filter(Bin == bin_name) %>%
+      arrange(desc(Old_rank_mean)) %>%
+      mutate(GeneLabel = make.unique(as.character(Gene1)))
+
+    if (nrow(rank_bin) == 0) {
+      next
+    }
+
+    plot_df <- plot_tbl %>%
+      filter(Bin == bin_name) %>%
+      left_join(rank_bin %>% select(Protein.Group, GeneLabel), by = "Protein.Group") %>%
+      mutate(
+        Age = factor(Age, levels = c("Adult", "Old")),
+
+        log10_int =
+          if_else(!is.na(mean_intensity) & mean_intensity > 0, log10(mean_intensity), NA_real_),
+
+        GeneLabel =
+          factor(GeneLabel, levels = rev(rank_bin$GeneLabel))
+      )
+
+    p <- ggplot(plot_df, aes(x = Age, y = GeneLabel, size = log10_int)) +
+
+      geom_point(colour = bin_col, alpha = 0.90, na.rm = TRUE, show.legend = i == 1) +
+
+      this_size_scale +
+
+      scale_x_discrete(position = "top") +
+
+      labs(title = bin_name, x = NULL, y = NULL) +
+
+      theme_classic(base_size = 12) +
+
+      theme(
+        plot.title =
+          element_text(face = "bold", size = 13, colour = bin_col),
+
+        axis.text.x =
+          element_text(size = 11, face = "bold"),
+
+        axis.text.y =
+          element_text(size = 9),
+
+        axis.line =
+          element_blank(),
+
+        axis.ticks =
+          element_blank(),
+
+        panel.grid.major =
+          element_line(colour = "grey93", linewidth = 0.3),
+
+        legend.position =
+          if (i == 1) {
+            "right"
+          } else {
+            "none"
+          },
+
+        plot.margin =
+          margin(6, 10, 6, 10)
+      )
+
+    plot_list[[bin_name]] <- p
+  }
+
+  combined <-
+    patchwork::wrap_plots(plotlist = plot_list, ncol = 4) +
+
+    patchwork::plot_layout(guides = "collect") +
+
+    patchwork::plot_annotation(
+      title =
+        paste0("Most abundant insoluble proteins — ", sex_name),
+
+      subtitle =
+        paste0("Top 10 proteins in each component ranked by Old ", sex_name, " abundance"),
+
+      theme =
+        theme(
+          plot.title =
+            element_text(face = "bold", size = 16, hjust = 0.5),
+
+          plot.subtitle =
+            element_text(size = 11, colour = "grey35", hjust = 0.5)
+        )
+    ) &
+
+    theme(legend.position = "right")
+
+  out_png <- file.path(split_dot_dir, paste0("Top10_", sex_name, "_OldRank.png"))
+
+  save_plot_png(combined, out_png, width = 11.5, height = 6.5, dpi = 300)
+
+  list(ranking = rank_tbl, data = plot_tbl, plot = combined, png = out_png)
+}
+```
+
+```{r run-sex-specific-top10, fig.keep="none"}
+female_top10 <- make_sex_top10(
+  sex_name = "Female",
+  abundance_tbl =
+    abundance_by_sex_export,
+  bins_order =
+    dot_bin_order,
+  palette =
+    bin_pal_dot
+)
+
+male_top10 <- make_sex_top10(
+  sex_name = "Male",
+  abundance_tbl =
+    abundance_by_sex_export,
+  bins_order =
+    dot_bin_order,
+  palette =
+    bin_pal_dot
+)
+```
+## Female
+
+```{r show-female-top10, echo=FALSE, out.width="100%"}
+if (!is.null(female_top10) && file.exists(female_top10$png)) {
+  knitr::include_graphics(female_top10$png)
+}
+```
+## Male
+
+```{r show-male-top10, echo=FALSE, out.width="100%"}
+if (!is.null(male_top10) && file.exists(male_top10$png)) {
+  knitr::include_graphics(male_top10$png)
+}
+```
+# Compare Female and Male Old Top-10 membership
+
+This table identifies whether each Old-ranked Top-10 protein appears in the Female list, Male list, or both.
+
+```{r top10-membership-overlap}
+female_membership <-
+  if (!is.null(female_top10)) {
+    female_top10$ranking %>%
+      transmute(Protein.Group, Gene1, Bin, Female_Top10 = TRUE)
+  } else {
+    tibble(Protein.Group = character(), Gene1 = character(), Bin = character(), Female_Top10 = logical())
+  }
+
+male_membership <-
+  if (!is.null(male_top10)) {
+    male_top10$ranking %>%
+      transmute(Protein.Group, Gene1, Bin, Male_Top10 = TRUE)
+  } else {
+    tibble(Protein.Group = character(), Gene1 = character(), Bin = character(), Male_Top10 = logical())
+  }
+
+top10_overlap <- full_join(female_membership, male_membership, by = c("Protein.Group", "Gene1", "Bin")) %>%
+  mutate(
+    Female_Top10 =
+      replace_na(Female_Top10, FALSE),
+
+    Male_Top10 =
+      replace_na(Male_Top10, FALSE),
+
+    Membership =
+      case_when(
+        Female_Top10 &
+          Male_Top10 ~
+          "Both",
+
+        Female_Top10 &
+          !Male_Top10 ~
+          "Female only",
+
+        !Female_Top10 &
+          Male_Top10 ~
+          "Male only",
+
+        TRUE ~
+          "Neither"
+      )
+  ) %>%
+  arrange(factor(Bin, levels = bin_order_figure), Membership, Gene1)
+
+write.csv(top10_overlap, file.path(split_dot_dir, "Top10_FemaleMale_membership_overlap.csv"), row.names = FALSE)
+
+top10_overlap_summary <- top10_overlap %>%
+  count(Bin, Membership, name = "n") %>%
+  arrange(factor(Bin, levels = bin_order_figure), Membership)
+
+write.csv(
+  top10_overlap_summary,
+  file.path(split_dot_dir, "Top10_FemaleMale_membership_summary.csv"),
+  row.names = FALSE
+)
+
+top10_overlap_summary
+```
+# Sex-specific detection-frequency analysis
+
+The detection analysis is run independently within Female and Male mice and treats detection as a binary outcome (`Intensity > 0`) rather than as a continuous abundance value.
+
+For each protein and sex:
+
+- Adult detection prevalence is calculated only from Adult samples of that sex.
+- Old detection prevalence is calculated only from Old samples of that sex.
+- A 2 × 2 table of Age (`Adult`, `Old`) by detection status (`detected`, `not detected`) is evaluated with a two-sided Fisher's exact test.
+- The prevalence difference is calculated as `Old prevalence − Adult prevalence`.
+- Benjamini-Hochberg FDR correction is applied separately across the Female protein tests and across the Male protein tests.
+
+Two protein universes are exported:
+
+1. **All GO-assigned proteins:** useful for complete prevalence inspection.
+2. **Sex-specific min2 universe:** proteins detected in at least 2 Adult samples **or** at least 2 Old samples within that sex.
+
+The sex-specific min2 universe is used for reproducible detection categories:
+
+- `old_only`: Old detected ≥2 and Adult detected =0.
+- `adult_only`: Adult detected ≥2 and Old detected =0.
+- `old_predominant`: Old detected ≥2 and Adult detected ≤1.
+
+These categories are descriptive filters. Fisher p-values quantify within-sex Adult-versus-Old detection differences, while BH-FDR values provide multiplicity-adjusted inference.
+
+```{r sex-specific-detection-functions}
+make_detection_table_sex <- function(long_df) {
+
+  long_df %>%
+    group_by(Protein.Group, Gene1, Bin, Sex, Sample, Age) %>%
+    summarise(Detected = as.integer(any(Intensity > 0, na.rm = TRUE)), .groups = "drop")
+}
+
+test_one_protein_detect_sex <- function(df_prot) {
+
+  adult_det <- sum(df_prot$Detected[df_prot$Age == "Adult"], na.rm = TRUE)
+
+  adult_n <- sum(df_prot$Age == "Adult")
+
+  old_det <- sum(df_prot$Detected[df_prot$Age == "Old"], na.rm = TRUE)
+
+  old_n <- sum(df_prot$Age == "Old")
+
+  if (adult_n == 0 || old_n == 0) {
+
+    return(
+      tibble(
+        adult_detected_n =
+          adult_det,
+        adult_total_n =
+          adult_n,
+        old_detected_n =
+          old_det,
+        old_total_n =
+          old_n,
+        adult_prev =
+          NA_real_,
+        old_prev =
+          NA_real_,
+        delta_prev =
+          NA_real_,
+        p_detect_age =
+          NA_real_
+      )
+    )
+  }
+
+  fisher_mat <- matrix(c(adult_det, adult_n - adult_det, old_det, old_n - old_det), nrow = 2, byrow = TRUE)
+
+  p_fisher <- tryCatch(fisher.test(fisher_mat, alternative = "two.sided")$p.value, error = function(e) NA_real_)
+
+  tibble(
+    adult_detected_n =
+      adult_det,
+
+    adult_total_n =
+      adult_n,
+
+    old_detected_n =
+      old_det,
+
+    old_total_n =
+      old_n,
+
+    adult_prev =
+      adult_det /
+      adult_n,
+
+    old_prev =
+      old_det /
+      old_n,
+
+    delta_prev =
+      old_det /
+      old_n -
+      adult_det /
+      adult_n,
+
+    p_detect_age =
+      p_fisher
+  )
+}
+
+run_detection_by_sex <- function(long_df, apply_sex_min2 = FALSE) {
+
+  det_long <-
+    make_detection_table_sex(long_df)
+
+  det_stats <- det_long %>%
+    group_by(Protein.Group, Gene1, Bin, Sex) %>%
+    group_modify(~ test_one_protein_detect_sex(.x)) %>%
+    ungroup()
+
+  if (apply_sex_min2) {
+
+    det_stats <- det_stats %>%
+      filter(adult_detected_n >= min_detect_n | old_detected_n >= min_detect_n)
+  }
+
+  det_stats %>%
+    group_by(Sex) %>%
+    mutate(
+      FDR_detect =
+        p.adjust(p_detect_age, method = "BH"),
+
+      old_only =
+        old_detected_n >=
+          min_detect_n &
+        adult_detected_n == 0,
+
+      adult_only =
+        adult_detected_n >=
+          min_detect_n &
+        old_detected_n == 0,
+
+      old_predominant =
+        old_detected_n >=
+          min_detect_n &
+        adult_detected_n <= 1
+    ) %>%
+    ungroup() %>%
+    arrange(Sex, FDR_detect, desc(delta_prev))
+}
+```
+
+```{r run-sex-specific-detection}
+detect_bysex_all <- run_detection_by_sex(long_assigned, apply_sex_min2 = FALSE)
+
+detect_bysex_min2 <- run_detection_by_sex(long_assigned, apply_sex_min2 = TRUE)
+
+write.csv(detect_bysex_all, file.path(split_detect_dir, "Detection_bySex_all.csv"), row.names = FALSE)
+
+write.csv(detect_bysex_min2, file.path(split_detect_dir, "Detection_bySex_min2.csv"), row.names = FALSE)
+
+# Exact Old-only lists
+old_only_bysex <- detect_bysex_min2 %>%
+  filter(old_only) %>%
+  arrange(Sex, factor(Bin, levels = bin_priority), desc(old_detected_n), p_detect_age)
+
+write.csv(old_only_bysex, file.path(split_detect_dir, "OldOnly_bySex.csv"), row.names = FALSE)
+
+# Relaxed Old-predominant lists
+old_predominant_bysex <- detect_bysex_min2 %>%
+  filter(old_predominant) %>%
+  arrange(Sex, factor(Bin, levels = bin_priority), desc(old_detected_n), p_detect_age)
+
+write.csv(old_predominant_bysex, file.path(split_detect_dir, "OldPredominant_bySex.csv"), row.names = FALSE)
+
+cat("\nSex-specific detection summary:\n")
+
+print(
+  detect_bysex_min2 %>%
+    group_by(Sex) %>%
+    summarise(
+      proteins_tested = n(),
+      old_only =
+        sum(old_only, na.rm = TRUE),
+      old_predominant =
+        sum(old_predominant, na.rm = TRUE),
+      raw_p_le_05 =
+        sum(p_detect_age <= 0.05, na.rm = TRUE),
+      FDR_le_05 =
+        sum(FDR_detect <= 0.05, na.rm = TRUE),
+      .groups = "drop"
+    )
+)
+```
+# Sex-specific Old-predominant detection plots
+
+These plots display proteins meeting the relaxed Old-predominant criterion within each sex (`Old detected ≥2`, `Adult detected ≤1`).
+
+A filled colored dot marks Old detection, a hollow colored Adult dot marks a singleton Adult detection, and a grey X marks complete Adult absence. The fraction printed beside the Old dot is the number of Old samples with detection divided by the total number of Old samples of that sex. The displayed p-value is the **within-sex two-sided Adult-versus-Old Fisher test**; BH-FDR values are retained in the exported table.
+
+```{r detection-plot-function}
+make_old_predominant_sex_plot <- function(sex_name, detect_tbl, long_df, palette) {
+
+  sex_det <- detect_tbl %>%
+    filter(Sex == sex_name, old_predominant)
+
+  if (nrow(sex_det) == 0) {
+
+    message("No Old-predominant proteins for ", sex_name, " using Old >= ", min_detect_n, " and Adult <= 1.")
+
+    return(NULL)
+  }
+
+  # Mean detected abundance, used only for ordering context/export.
+  sex_mean <- long_df %>%
+    filter(Sex == sex_name, Intensity > 0) %>%
+    group_by(Protein.Group, Gene1, Bin, Age) %>%
+    summarise(mean_intensity = mean(Intensity, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = Age, values_from = mean_intensity, names_prefix = "mean_intensity_")
+
+  plot_df <- sex_det %>%
+    left_join(sex_mean, by = c("Protein.Group", "Gene1", "Bin")) %>%
+    mutate(
+      adult_absent =
+        adult_detected_n == 0,
+
+      adult_singleton =
+        adult_detected_n == 1,
+
+      adult_prev_label =
+        sprintf("%d/%d", adult_detected_n, adult_total_n),
+
+      old_prev_label =
+        sprintf("%d/%d", old_detected_n, old_total_n),
+
+      p_label =
+        fmt_p_detection(p_detect_age),
+
+      p_fontface =
+        if_else(!is.na(p_detect_age) & p_detect_age <= 0.050, "bold", "plain"),
+
+      Gene1_label =
+        if_else(!is.na(p_detect_age) & p_detect_age <= 0.050, paste0("**", Gene1, "**"), Gene1)
+    ) %>%
+    arrange(factor(Bin, levels = bin_priority), desc(old_detected_n), desc(mean_intensity_Old), Gene1)
+
+  used_bins <- bin_priority[bin_priority %in% unique(plot_df$Bin)]
+
+  plot_df <- plot_df %>%
+    mutate(Gene1 = factor(Gene1, levels = rev(unique(Gene1))), Bin = factor(Bin, levels = used_bins))
+
+  gene_label_map <-
+    stats::setNames(plot_df$Gene1_label, as.character(plot_df$Gene1))
+
+  adult_x <- 1.00
+  old_x   <- 1.60
+  p_x     <- 2.02
+
+  row_guides <- tibble(Gene1 = levels(plot_df$Gene1))
+
+  p <- ggplot() +
+
+    geom_segment(
+      data =
+        row_guides,
+      aes(x = 0.72, xend = 1.84, y = Gene1, yend = Gene1),
+      colour = "grey92",
+      linewidth = 0.35
+    ) +
+
+    geom_vline(xintercept = c(adult_x, old_x), colour = "grey92", linewidth = 0.35) +
+
+    # Adult absent
+    geom_point(
+      data =
+        plot_df %>%
+        filter(adult_absent),
+      aes(x = adult_x, y = Gene1),
+      shape = 4,
+      size = nm_style$oldpred_adult_symbol_mm,
+      colour = "grey70",
+      stroke = nm_style$oldpred_adult_stroke_mm
+    ) +
+
+    # Adult singleton
+    geom_point(
+      data =
+        plot_df %>%
+        filter(adult_singleton),
+      aes(x = adult_x, y = Gene1, colour = Bin),
+      shape = 1,
+      size = nm_style$oldpred_adult_symbol_mm,
+      stroke = nm_style$oldpred_adult_stroke_mm
+    ) +
+
+    # Robust Old detection
+    geom_point(
+      data =
+        plot_df,
+      aes(x = old_x, y = Gene1, colour = Bin),
+      shape = 16,
+      size = nm_style$oldpred_old_symbol_mm
+    ) +
+
+    # Old prevalence
+    geom_text(
+      data =
+        plot_df,
+      aes(x = old_x, y = Gene1, label = old_prev_label),
+      nudge_x = 0.10,
+      hjust = 0,
+      size = nm_style$oldpred_old_prevalence_text_mm,
+      colour = "grey25"
+    ) +
+
+    # Fisher p-value
+    geom_text(
+      data =
+        plot_df,
+      aes(x = p_x, y = Gene1, label = p_label, fontface = p_fontface),
+      hjust = 0,
+      size = nm_style$oldpred_fisher_text_mm,
+      colour = "grey40",
+      show.legend = FALSE
+    ) +
+
+    scale_colour_manual(
+      values =
+        palette[used_bins],
+      breaks =
+        used_bins,
+      drop = TRUE,
+      name =
+        "Cellular component"
+    ) +
+
+    scale_y_discrete(labels = gene_label_map) +
+
+    scale_x_continuous(
+      breaks = c(adult_x, old_x, p_x),
+      labels = c("Adult", "Old", ""),
+      position = "top",
+      expand =
+        expansion(add = c(0, 0.58))
+    ) +
+
+    coord_cartesian(clip = "off") +
+
+    labs(
+      title = NULL,
+      subtitle = NULL,
+
+      caption =
+        paste0(
+          "Filled dot = Old detected (>=2); ",
+          "hollow dot = Adult singleton; grey X = Adult absent.\n",
+          "* denotes within-sex Fisher p <= 0.05; ",
+          "BH FDR values are exported in the accompanying table."
+        ),
+
+      x = NULL,
+      y = NULL
+    ) +
+
+    theme_classic(base_size = 12) +
+
+    theme(
+      plot.title =
+        element_text(face = "bold", size = 15),
+
+      plot.subtitle =
+        element_text(colour = "grey40", size = 10.5),
+
+      plot.caption =
+        element_text(colour = "grey45", size = 8, hjust = 0),
+
+      plot.caption.position =
+        "plot",
+
+      axis.text.y =
+        ggtext::element_markdown(size = 9.5),
+
+      axis.line =
+        element_blank(),
+
+      axis.ticks =
+        element_blank(),
+
+      panel.grid =
+        element_blank(),
+
+      legend.position =
+        "right",
+
+      plot.margin =
+        margin(10, 15, 15, 10)
+    )
+
+  out_png <- file.path(split_detect_dir, paste0("OldPredominant_", sex_name, ".png"))
+
+  out_csv <- file.path(split_detect_dir, paste0("OldPredominant_", sex_name, "_table.csv"))
+
+  save_plot_png(p, out_png, width = 6.4, height = max(5, nrow(plot_df) * 0.30 + 2.3), dpi = 300)
+
+  write.csv(plot_df, out_csv, row.names = FALSE)
+
+  list(data = plot_df, plot = p, png = out_png, csv = out_csv)
+}
+```
+
+```{r run-sex-detection-plots, fig.keep="none"}
+female_detection_plot <-
+  make_old_predominant_sex_plot(
+    sex_name =
+      "Female",
+    detect_tbl =
+      detect_bysex_min2,
+    long_df =
+      long_assigned,
+    palette =
+      bin_pal_dot
+  )
+
+male_detection_plot <-
+  make_old_predominant_sex_plot(
+    sex_name =
+      "Male",
+    detect_tbl =
+      detect_bysex_min2,
+    long_df =
+      long_assigned,
+    palette =
+      bin_pal_dot
+  )
+```
+## Female Old-predominant proteins
+
+```{r show-female-detection, echo=FALSE, out.width="75%"}
+if (!is.null(female_detection_plot) && file.exists(female_detection_plot$png)) {
+  knitr::include_graphics(female_detection_plot$png)
+}
+```
+## Male Old-predominant proteins
+
+```{r show-male-detection, echo=FALSE, out.width="75%"}
+if (!is.null(male_detection_plot) && file.exists(male_detection_plot$png)) {
+  knitr::include_graphics(male_detection_plot$png)
+}
+```
+# Female-versus-Male overlap of Old-predominant proteins
+
+This comparison joins the Female and Male Old-predominant lists by `Protein.Group`, gene, and GO-CC bin and classifies each protein as `Both sexes`, `Female only`, or `Male only`.
+
+This classification describes whether a protein crosses the predefined detection criterion in each sex. It is **not** a statistical test comparing Female and Male detection responses. A protein classified as `Female only` or `Male only` can arise because of small differences in prevalence or sample size; a formal sex difference would require an explicit interaction model for detection.
+
+```{r detection-sex-overlap}
+female_oldpred <- old_predominant_bysex %>%
+  filter(Sex == "Female") %>%
+  transmute(
+    Protein.Group,
+    Gene1,
+    Bin,
+    Female_old_predominant =
+      TRUE,
+    Female_Adult_n =
+      adult_detected_n,
+    Female_Adult_total =
+      adult_total_n,
+    Female_Old_n =
+      old_detected_n,
+    Female_Old_total =
+      old_total_n,
+    Female_delta_prev =
+      delta_prev,
+    Female_p =
+      p_detect_age,
+    Female_FDR =
+      FDR_detect
+  )
+
+male_oldpred <- old_predominant_bysex %>%
+  filter(Sex == "Male") %>%
+  transmute(
+    Protein.Group,
+    Gene1,
+    Bin,
+    Male_old_predominant =
+      TRUE,
+    Male_Adult_n =
+      adult_detected_n,
+    Male_Adult_total =
+      adult_total_n,
+    Male_Old_n =
+      old_detected_n,
+    Male_Old_total =
+      old_total_n,
+    Male_delta_prev =
+      delta_prev,
+    Male_p =
+      p_detect_age,
+    Male_FDR =
+      FDR_detect
+  )
+
+oldpred_overlap <- full_join(female_oldpred, male_oldpred, by = c("Protein.Group", "Gene1", "Bin")) %>%
+  mutate(
+    Female_old_predominant =
+      replace_na(Female_old_predominant, FALSE),
+
+    Male_old_predominant =
+      replace_na(Male_old_predominant, FALSE),
+
+    Detection_pattern =
+      case_when(
+        Female_old_predominant &
+          Male_old_predominant ~
+          "Both sexes",
+
+        Female_old_predominant &
+          !Male_old_predominant ~
+          "Female only",
+
+        !Female_old_predominant &
+          Male_old_predominant ~
+          "Male only",
+
+        TRUE ~
+          "Neither"
+      )
+  ) %>%
+  arrange(factor(Bin, levels = bin_order_figure), Detection_pattern, Gene1)
+
+write.csv(oldpred_overlap, file.path(split_detect_dir, "OldPredominant_FemaleMale_overlap.csv"), row.names = FALSE)
+
+oldpred_overlap_summary <- oldpred_overlap %>%
+  count(Detection_pattern, name = "n_proteins")
+
+write.csv(
+  oldpred_overlap_summary,
+  file.path(split_detect_dir, "OldPredominant_FemaleMale_overlap_summary.csv"),
+  row.names = FALSE
+)
+
+oldpred_overlap_summary
+```
+# Detection prevalence for all four Age × Sex groups
+
+For convenient manual inspection, this final table places Adult Female, Old Female, Adult Male, and Old Male detection prevalence side-by-side for every sex-specific min2 protein.
+
+```{r detection-four-group-export}
+detect_four_group <- detect_bysex_min2 %>%
+  select(
+    Protein.Group,
+    Gene1,
+    Bin,
+    Sex,
+    adult_detected_n,
+    adult_total_n,
+    adult_prev,
+    old_detected_n,
+    old_total_n,
+    old_prev,
+    delta_prev,
+    p_detect_age,
+    FDR_detect,
+    old_only,
+    old_predominant
+  ) %>%
+  pivot_wider(
+    names_from =
+      Sex,
+    values_from = c(
+      adult_detected_n,
+      adult_total_n,
+      adult_prev,
+      old_detected_n,
+      old_total_n,
+      old_prev,
+      delta_prev,
+      p_detect_age,
+      FDR_detect,
+      old_only,
+      old_predominant
+    )
+  )
+
+write.csv(
+  detect_four_group,
+  file.path(split_detect_dir, "Detection_AdultOld_FemaleMale_wide.csv"),
+  row.names = FALSE
+)
+```
+## Alternative manuscript-ready detection visualizations
+
+The complete Female and Male Old-predominant protein plots above are retained. The following additional visualizations provide more compact views of the same sex-resolved detection results.
+
+They answer four complementary questions:
+
+1. **Component-level summary:** Which cellular components contribute most to the Old-predominant detection pattern in Female and Male mice?
+2. **Female-versus-Male detection-change scatter:** How do the age-associated detection changes compare between sexes for proteins appearing in either sex-specific Old-predominant list?
+3. **Protein-wise delta view:** What is the magnitude of the Old-versus-Adult detection change for each Old-predominant protein in the sex(es) in which it meets the criterion?
+4. **Selected-candidate four-group matrix:** What are the actual Adult Female, Old Female, Adult Male, and Old Male detection prevalences for the strongest candidates?
+
+These analyses are descriptive/exploratory. In particular, distance from the diagonal in the Female-versus-Male detection scatter is **not** a formal statistical Age × Sex interaction test for binary detection.
+
+### Component-level summary of Old-predominant proteins
+
+The count panel shows the number of proteins meeting the sex-specific relaxed Old-predominant criterion:
+
+- Old detected in at least 2 samples within that sex
+- Adult detected in no more than 1 sample within that sex
+
+Because cellular components contain different numbers of testable proteins, a second panel expresses the same result as the percentage of sex-specific `min2` proteins within each component.
+
+```{r detection-component-summary, fig.keep="none"}
+sex_detection_cols <- c("Female" = "#CC66B4", "Male"   = "#00A087")
+
+component_detection_summary <- detect_bysex_min2 %>%
+  filter(Bin %in% bin_order_figure) %>%
+  mutate(Sex = as.character(Sex), Bin = as.character(Bin)) %>%
+  group_by(Sex, Bin) %>%
+  summarise(n_tested = n(), n_oldpred = sum(old_predominant, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::complete(Sex = c("Female", "Male"), Bin = bin_order_figure, fill = list(n_tested = 0, n_oldpred = 0)) %>%
+  mutate(
+    prop_oldpred = if_else(n_tested > 0, n_oldpred / n_tested, NA_real_),
+
+    Sex = factor(Sex, levels = c("Female", "Male")),
+
+    Bin = factor(Bin, levels = rev(bin_order_figure))
+  )
+
+write.csv(
+  component_detection_summary,
+  file.path(split_detect_dir, "OldPredominant_ComponentSummary_bySex.csv"),
+  row.names = FALSE
+)
+
+p_detection_component_count <- ggplot(component_detection_summary, aes(x = n_oldpred, y = Bin, fill = Sex)) +
+
+  geom_col(position = position_dodge(width = 0.76), width = 0.3) +
+
+  geom_text(aes(label = n_oldpred), position = position_dodge(width = 0.76), hjust = -0.20, size = 2.0) +
+
+  scale_fill_manual(values = sex_detection_cols) +
+
+  scale_x_continuous(expand = expansion(mult = c(0, 0.14))) +
+
+  labs(
+    title =
+      "Old-predominant proteins by cellular component",
+
+    subtitle =
+      "Number meeting Old >= 2 and Adult <= 1 within each sex",
+
+    x =
+      "Number of Old-predominant proteins",
+
+    y = NULL,
+
+    fill = "Sex"
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    plot.title =
+      element_text(face = "bold", size = 13),
+
+    plot.subtitle =
+      element_text(colour = "grey35", size = 9.5),
+
+    legend.position =
+      "top",
+
+    axis.text.y =
+      element_text(size = 9.5)
+  )
+
+p_detection_component_prop <- ggplot(component_detection_summary, aes(x = prop_oldpred, y = Bin, fill = Sex)) +
+
+  geom_col(position = position_dodge(width = 0.76), width = 0.3, na.rm = TRUE) +
+
+  geom_text(
+    data =
+      component_detection_summary %>%
+      filter(!is.na(prop_oldpred)),
+    aes(label = scales::percent(prop_oldpred, accuracy = 1)),
+    position =
+      position_dodge(width = 0.76),
+    hjust = -0.15,
+    size = 3.0
+  ) +
+
+  scale_fill_manual(values = sex_detection_cols) +
+
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1), expand = expansion(mult = c(0, 0.18))) +
+
+  labs(
+    title =
+      "Old-predominant proteins as a proportion of testable proteins",
+
+    subtitle =
+      "Denominator = sex-specific min2 proteins within each component",
+
+    x =
+      "Old-predominant proteins / testable proteins",
+
+    y = NULL,
+
+    fill = "Sex"
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    plot.title =
+      element_text(face = "bold", size = 13),
+
+    plot.subtitle =
+      element_text(colour = "grey35", size = 9.5),
+
+    legend.position =
+      "top",
+
+    axis.text.y =
+      element_text(size = 9.5)
+  )
+
+p_detection_component_combined <-
+  p_detection_component_count +
+  p_detection_component_prop +
+
+  patchwork::plot_layout(guides = "collect") &
+
+  theme(legend.position = "top")
+
+component_count_png <- file.path(split_detect_dir, "OldPredominant_ComponentSummary_Count.png")
+
+component_prop_png <- file.path(split_detect_dir, "OldPredominant_ComponentSummary_Percent.png")
+
+component_combined_png <- file.path(split_detect_dir, "OldPredominant_ComponentSummary_CountAndPercent.png")
+
+save_plot_png(p_detection_component_count, component_count_png, width = 7.0, height = 5.2, dpi = 300)
+
+save_plot_png(p_detection_component_prop, component_prop_png, width = 7.0, height = 5.2, dpi = 300)
+
+save_plot_png(p_detection_component_combined, component_combined_png, width = 13.5, height = 5.3, dpi = 300)
+```
+
+```{r show-detection-component-summary, echo=FALSE, out.width="100%"}
+if (file.exists(component_combined_png)) {
+  knitr::include_graphics(component_combined_png)
+}
+```
+### Female-versus-Male change in detection prevalence
+
+This plot is the detection analogue of the Female-versus-Male age-effect abundance scatter.
+
+For each protein:
+
+- **x-axis:** Female change in prevalence = Old Female prevalence − Adult Female prevalence
+- **y-axis:** Male change in prevalence = Old Male prevalence − Adult Male prevalence
+- dotted `y = x` = identical prevalence change in Female and Male mice
+- upper-right = detection increases with age in both sexes
+- lower-left = detection decreases with age in both sexes
+- lower-right = detection increases in Female mice but decreases in Male mice
+- upper-left = detection decreases in Female mice but increases in Male mice
+
+The delta figure is restricted to the **union of proteins meeting the relaxed Old-predominant criterion in Female or Male mice**, so the proteins shown correspond directly to the complete sex-specific lists above. The x-coordinate is `Old Female prevalence − Adult Female prevalence`; the y-coordinate is `Old Male prevalence − Adult Male prevalence`.
+
+A **circle** denotes a Female Old-predominant result and a **triangle** denotes a Male Old-predominant result. Open symbols indicate a nonsignificant within-sex Fisher test, whereas filled symbols indicate raw `p ≤ 0.05`. A sex-specific symbol is drawn only when that protein meets the Old-predominant criterion in that sex. Cellular-component identity is encoded by color. Small deterministic visual offsets are used only to separate proteins with identical prevalence-change coordinates; the underlying delta values are unchanged. Distance from `y = x` remains descriptive and is not a formal Age × Sex interaction test.
+
+```{r detection-female-male-scatter-data}
+detect_comparison_long <- detect_bysex_all %>%
+  filter(Bin %in% dot_bin_order) %>%
+  group_by(Protein.Group, Gene1, Bin) %>%
+  filter(any(adult_detected_n >= min_detect_n | old_detected_n >= min_detect_n)) %>%
+  ungroup()
+
+detect_female_male <- detect_comparison_long %>%
+  select(
+    Protein.Group,
+    Gene1,
+    Bin,
+    Sex,
+    adult_detected_n,
+    adult_total_n,
+    adult_prev,
+    old_detected_n,
+    old_total_n,
+    old_prev,
+    delta_prev,
+    p_detect_age,
+    FDR_detect,
+    old_only,
+    old_predominant
+  ) %>%
+  mutate(Sex = as.character(Sex)) %>%
+  pivot_wider(
+    names_from =
+      Sex,
+
+    values_from = c(
+      adult_detected_n,
+      adult_total_n,
+      adult_prev,
+      old_detected_n,
+      old_total_n,
+      old_prev,
+      delta_prev,
+      p_detect_age,
+      FDR_detect,
+      old_only,
+      old_predominant
+    ),
+
+    names_glue =
+      "{.value}_{Sex}"
+  ) %>%
+  mutate(
+    Female_raw_sig =
+      !is.na(p_detect_age_Female) &
+        p_detect_age_Female <=
+          0.05,
+
+    Male_raw_sig =
+      !is.na(p_detect_age_Male) &
+        p_detect_age_Male <=
+          0.05,
+
+    Female_FDR_sig =
+      !is.na(FDR_detect_Female) &
+        FDR_detect_Female <=
+          0.05,
+
+    Male_FDR_sig =
+      !is.na(FDR_detect_Male) &
+        FDR_detect_Male <=
+          0.05,
+
+    Fisher_pattern =
+      case_when(
+        Female_raw_sig &
+          Male_raw_sig ~
+          "Both sexes p <= 0.05",
+
+        Female_raw_sig &
+          !Male_raw_sig ~
+          "Female p <= 0.05 only",
+
+        !Female_raw_sig &
+          Male_raw_sig ~
+          "Male p <= 0.05 only",
+
+        TRUE ~
+          "NS"
+      ),
+
+    Sex_difference_delta =
+      delta_prev_Male -
+      delta_prev_Female,
+
+    Abs_sex_difference_delta =
+      abs(Sex_difference_delta),
+
+    Any_oldpred =
+      replace_na(old_predominant_Female, FALSE) |
+        replace_na(old_predominant_Male, FALSE)
+  ) %>%
+  arrange(pmin(p_detect_age_Female, p_detect_age_Male, na.rm = TRUE), desc(Abs_sex_difference_delta))
+
+# Plotting universe: union of the Female and Male Old-predominant lists.
+# This preserves the full detect_female_male object for downstream compact
+# matrix analyses while ensuring the delta plot matches the complete lists.
+detect_female_male_plot <- detect_female_male %>%
+  mutate(
+    old_predominant_Female =
+      tidyr::replace_na(old_predominant_Female, FALSE),
+
+    old_predominant_Male =
+      tidyr::replace_na(old_predominant_Male, FALSE)
+  ) %>%
+  filter(old_predominant_Female | old_predominant_Male)
+
+write.csv(
+  detect_female_male_plot,
+  file.path(split_detect_dir, "DetectionDelta_Female_vs_Male.csv"),
+  row.names = FALSE
+)
+```
+
+```{r detection-female-male-scatter, fig.keep="none"}
+# ==============================================================================
+# Adult-vs-Old Female/Male detection delta scatter
+#
+# Circle   = Female
+# Triangle = Male
+#
+# Open   = NS
+# Filled = raw Fisher p ≤ 0.05
+#
+# Color = cellular component
+#
+# A symbol is shown ONLY if the protein meets the Old-predominant criterion
+# in that sex.
+#
+# Proteins with identical Female/Male delta coordinates receive a very small
+# deterministic visual displacement. Significant labels are anchored to the
+# actual displayed significant symbol.
+# ==============================================================================
+
+base_delta_df <- detect_female_male_plot %>%
+
+  filter(is.finite(delta_prev_Female), is.finite(delta_prev_Male)) %>%
+
+  mutate(
+    Female_member =
+      tidyr::replace_na(old_predominant_Female, FALSE),
+
+    Male_member =
+      tidyr::replace_na(old_predominant_Male, FALSE)
+  )
+
+# ------------------------------------------------------------------------------
+# Protein-level displacement for exact coordinate ties
+# ------------------------------------------------------------------------------
+
+jitter_radius <- 0.026
+
+delta_jitter_tbl <- base_delta_df %>%
+
+  distinct(Protein.Group, Gene1, delta_prev_Female, delta_prev_Male) %>%
+
+  arrange(delta_prev_Female, delta_prev_Male, Gene1, Protein.Group) %>%
+
+  group_by(delta_prev_Female, delta_prev_Male) %>%
+
+  mutate(
+    overlap_n =
+      n(),
+
+    overlap_index =
+      row_number(),
+
+    jitter_angle =
+      if_else(overlap_n > 1, 2 * pi * (overlap_index - 1) / overlap_n, 0),
+
+    protein_jitter_x =
+      if_else(overlap_n > 1, jitter_radius * cos(jitter_angle), 0),
+
+    protein_jitter_y =
+      if_else(overlap_n > 1, jitter_radius * sin(jitter_angle), 0)
+  ) %>%
+
+  ungroup() %>%
+
+  select(Protein.Group, protein_jitter_x, protein_jitter_y, overlap_n)
+
+base_delta_df <- base_delta_df %>%
+
+  left_join(delta_jitter_tbl, by = "Protein.Group")
+
+# ------------------------------------------------------------------------------
+# Small sex-specific separation when the same protein is Old-predominant
+# in both Female and Male mice
+# ------------------------------------------------------------------------------
+
+sex_offset <- 0.012
+
+female_symbol_df <- base_delta_df %>%
+
+  filter(Female_member) %>%
+
+  transmute(
+    Protein.Group,
+    Gene1,
+    Bin,
+
+    True_x =
+      delta_prev_Female,
+
+    True_y =
+      delta_prev_Male,
+
+    Plot_x =
+      delta_prev_Female +
+      protein_jitter_x -
+      sex_offset,
+
+    Plot_y =
+      delta_prev_Male +
+      protein_jitter_y +
+      sex_offset,
+
+    Sex =
+      "Female",
+
+    Significant =
+      tidyr::replace_na(Female_raw_sig, FALSE)
+  )
+
+male_symbol_df <- base_delta_df %>%
+
+  filter(Male_member) %>%
+
+  transmute(
+    Protein.Group,
+    Gene1,
+    Bin,
+
+    True_x =
+      delta_prev_Female,
+
+    True_y =
+      delta_prev_Male,
+
+    Plot_x =
+      delta_prev_Female +
+      protein_jitter_x +
+      sex_offset,
+
+    Plot_y =
+      delta_prev_Male +
+      protein_jitter_y -
+      sex_offset,
+
+    Sex =
+      "Male",
+
+    Significant =
+      tidyr::replace_na(Male_raw_sig, FALSE)
+  )
+
+delta_symbol_df <- bind_rows(female_symbol_df, male_symbol_df) %>%
+
+  mutate(
+    SymbolClass = case_when(
+
+      Sex ==
+        "Female" &
+        !Significant ~
+        "Female — NS",
+
+      Sex ==
+        "Female" &
+        Significant ~
+        "Female — p ≤ 0.05",
+
+      Sex ==
+        "Male" &
+        !Significant ~
+        "Male — NS",
+
+      Sex ==
+        "Male" &
+        Significant ~
+        "Male — p ≤ 0.05"
+    ),
+
+    SymbolClass = factor(
+      SymbolClass,
+      levels = c("Female — NS", "Female — p ≤ 0.05", "Male — NS", "Male — p ≤ 0.05")
+    )
+  )
+
+# ------------------------------------------------------------------------------
+# Significant labels:
+# anchor each label to the actual displayed significant symbol.
+# If significant in both sexes, use the midpoint of the two displayed symbols.
+# ------------------------------------------------------------------------------
+
+detection_scatter_labels <- delta_symbol_df %>%
+
+  filter(Significant) %>%
+
+  group_by(Protein.Group, Gene1, Bin) %>%
+
+  summarise(label_x = mean(Plot_x, na.rm = TRUE), label_y = mean(Plot_y, na.rm = TRUE), .groups = "drop")
+
+# ------------------------------------------------------------------------------
+# Only cellular components represented in this figure
+# ------------------------------------------------------------------------------
+
+delta_bins_present <- dot_bin_order[dot_bin_order %in% unique(as.character(delta_symbol_df$Bin))]
+
+# ------------------------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------------------------
+
+p_detection_female_male <- ggplot() +
+
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dotted",
+    colour = "grey35",
+    linewidth = nm_style$detection_reference_line
+  ) +
+
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    colour = "grey72",
+    linewidth = nm_style$detection_reference_line
+  ) +
+
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    colour = "grey72",
+    linewidth = nm_style$detection_reference_line
+  ) +
+
+  # Female — NS = open circle
+  geom_point(
+    data =
+      delta_symbol_df %>%
+      filter(SymbolClass == "Female — NS"),
+
+    aes(x = Plot_x, y = Plot_y, colour = Bin, shape = SymbolClass),
+
+    size = nm_style$detection_point_open,
+    stroke = nm_style$detection_point_stroke
+  ) +
+
+  # Female — significant = filled circle
+  geom_point(
+    data =
+      delta_symbol_df %>%
+      filter(SymbolClass == "Female — p ≤ 0.05"),
+
+    aes(x = Plot_x, y = Plot_y, colour = Bin, shape = SymbolClass),
+
+    size = nm_style$detection_point_filled,
+    stroke = nm_style$detection_point_stroke
+  ) +
+
+  # Male — NS = open triangle
+  geom_point(
+    data =
+      delta_symbol_df %>%
+      filter(SymbolClass == "Male — NS"),
+
+    aes(x = Plot_x, y = Plot_y, colour = Bin, shape = SymbolClass),
+
+    size = nm_style$detection_point_open,
+    stroke = nm_style$detection_point_stroke
+  ) +
+
+  # Male — significant = filled triangle
+  geom_point(
+    data =
+      delta_symbol_df %>%
+      filter(SymbolClass == "Male — p ≤ 0.05"),
+
+    aes(x = Plot_x, y = Plot_y, colour = Bin, shape = SymbolClass),
+
+    size = nm_style$detection_point_filled,
+    stroke = nm_style$detection_point_stroke
+  ) +
+
+  ggrepel::geom_text_repel(
+    data =
+      detection_scatter_labels,
+
+    aes(x = label_x, y = label_y, label = Gene1, colour = Bin),
+
+    size = nm_style$detection_label_pt / ggplot2::.pt,
+
+    box.padding = nm_style$detection_label_padding,
+    point.padding = nm_style$detection_label_padding,
+
+    force = 2,
+
+    min.segment.length = 0,
+
+    segment.size = nm_style$detection_label_segment,
+    segment.colour = "grey45",
+
+    max.overlaps = Inf,
+
+    show.legend = FALSE
+  ) +
+
+  scale_shape_manual(
+    values = c("Female — NS" = 1, "Female — p ≤ 0.05" = 16, "Male — NS" = 2, "Male — p ≤ 0.05" = 17),
+
+    limits = c("Female — NS", "Female — p ≤ 0.05", "Male — NS", "Male — p ≤ 0.05"),
+
+    drop = FALSE,
+
+    name =
+      "Sex / Fisher test"
+  ) +
+
+  scale_colour_manual(
+    values =
+      bin_pal_dot[delta_bins_present],
+
+    breaks =
+      delta_bins_present,
+
+    limits =
+      delta_bins_present,
+
+    drop = FALSE,
+
+    name =
+      "Cellular component"
+  ) +
+
+  guides(
+    shape = guide_legend(
+      order = 1,
+
+      override.aes = list(colour = "black", size = nm_style$detection_point_open, alpha = 1)
+    ),
+
+    colour = guide_legend(
+      order = 2,
+
+      override.aes = list(shape = 16, size = nm_style$detection_point_filled, alpha = 1)
+    )
+  ) +
+
+  coord_equal(xlim = c(-1, 1), ylim = c(-1, 1), clip = "off") +
+
+  labs(
+    title =
+      "Proteins with Old-predominant detection",
+
+    subtitle =
+      "Dotted y = x indicates identical age-associated change between female and male",
+
+    x =
+      "Female change in detection (Old − Adult)",
+
+    y =
+      "Male change in detection (Old − Adult)"
+  ) +
+
+  theme_classic(base_size = 12.5) +
+
+  theme(
+    plot.title =
+      element_text(face = "bold", size = nm_style$axis_title),
+
+    plot.subtitle =
+      element_text(colour = "grey35", size = nm_style$small_text),
+
+    legend.position =
+      "right",
+
+    legend.box =
+      "vertical",
+
+    legend.text =
+      element_text(size = nm_style$legend_text),
+
+    plot.margin =
+      margin(10, 15, 15, 10)
+  )
+
+detection_female_male_png <- file.path(split_detect_dir, "DetectionDelta_Female_vs_Male.png")
+
+save_plot_png(p_detection_female_male, detection_female_male_png, width = 9.3, height = 7.5, dpi = 300)
+
+# QC table: these sex/component counts should match the complete
+# Female/Male Old-predominant lists above.
+delta_symbol_df %>%
+
+  count(Sex, Bin, name = "n_symbols") %>%
+
+  arrange(Sex, factor(Bin, levels = dot_bin_order))
+```
+
+```{r show-detection-female-male-scatter, echo=FALSE, out.width="80%"}
+if (file.exists(detection_female_male_png)) {
+  knitr::include_graphics(detection_female_male_png)
+}
+```
+### Alternative protein-wise delta plot
+
+As an alternative to the Female-versus-Male delta scatter, this view places each Old-predominant protein on a separate row. A symbol is shown only for the sex in which that protein meets the Old-predominant criterion, using the same circle/triangle and open/filled encoding as the delta scatter.
+
+```{r alternative-proteinwise-age-delta, fig.keep="none"}
+proteinwise_age_df <- detect_bysex_all %>%
+
+  filter(old_predominant, Bin %in% dot_bin_order) %>%
+
+  transmute(Protein.Group, Gene1, Bin, Sex = as.character(Sex), Delta = delta_prev, Fisher_p = p_detect_age) %>%
+
+  mutate(
+    Significant =
+      !is.na(Fisher_p) &
+        Fisher_p <=
+          0.05,
+
+    SymbolClass = case_when(
+
+      Sex ==
+        "Female" &
+        !Significant ~
+        "Female — NS",
+
+      Sex ==
+        "Female" &
+        Significant ~
+        "Female — p ≤ 0.05",
+
+      Sex ==
+        "Male" &
+        !Significant ~
+        "Male — NS",
+
+      Sex ==
+        "Male" &
+        Significant ~
+        "Male — p ≤ 0.05"
+    ),
+
+    SymbolClass = factor(
+      SymbolClass,
+      levels = c("Female — NS", "Female — p ≤ 0.05", "Male — NS", "Male — p ≤ 0.05")
+    )
+  )
+
+proteinwise_age_order <- proteinwise_age_df %>%
+
+  group_by(Protein.Group, Gene1, Bin) %>%
+
+  summarise(Mean_delta = mean(Delta, na.rm = TRUE), .groups = "drop") %>%
+
+  arrange(factor(Bin, levels = dot_bin_order), Mean_delta) %>%
+
+  mutate(ProteinLabel = make.unique(as.character(Gene1)))
+
+proteinwise_age_df <- proteinwise_age_df %>%
+
+  left_join(proteinwise_age_order %>% select(Protein.Group, ProteinLabel), by = "Protein.Group") %>%
+
+  mutate(ProteinLabel = factor(ProteinLabel, levels = rev(proteinwise_age_order$ProteinLabel)))
+
+proteinwise_age_bins <- dot_bin_order[dot_bin_order %in% unique(as.character(proteinwise_age_df$Bin))]
+
+p_proteinwise_age <- ggplot(
+  proteinwise_age_df,
+  aes(x = Delta, y = ProteinLabel, colour = Bin, shape = SymbolClass)
+) +
+
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey65", linewidth = 0.50) +
+
+  geom_point(size = 4.0, stroke = 1.20, alpha = 0.95) +
+
+  scale_shape_manual(
+    values = c("Female — NS" = 1, "Female — p ≤ 0.05" = 16, "Male — NS" = 2, "Male — p ≤ 0.05" = 17),
+
+    limits = c("Female — NS", "Female — p ≤ 0.05", "Male — NS", "Male — p ≤ 0.05"),
+
+    drop = FALSE,
+
+    name =
+      "Sex / Fisher test"
+  ) +
+
+  scale_colour_manual(
+    values =
+      bin_pal_dot[proteinwise_age_bins],
+
+    breaks =
+      proteinwise_age_bins,
+
+    limits =
+      proteinwise_age_bins,
+
+    drop = FALSE,
+
+    name =
+      "Cellular component"
+  ) +
+
+  guides(
+    shape = guide_legend(order = 1, override.aes = list(colour = "black", size = 3.7, alpha = 1)),
+
+    colour = guide_legend(order = 2, override.aes = list(shape = 16, size = 3.5, alpha = 1))
+  ) +
+
+  labs(
+    title =
+      "Proteins with Old-predominant detection",
+
+    subtitle =
+      "Age-associated change in detection prevalence by sex",
+
+    x =
+      "Change in detection prevalence (Old vs Adult)",
+
+    y = NULL
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    plot.title =
+      element_text(face = "bold", size = 14),
+
+    plot.subtitle =
+      element_text(colour = "grey35", size = 10),
+
+    axis.text.y =
+      element_text(size = 9.5),
+
+    axis.line.y =
+      element_blank(),
+
+    axis.ticks.y =
+      element_blank(),
+
+    panel.grid.major.y =
+      element_line(colour = "grey94", linewidth = 0.30),
+
+    legend.position =
+      "right",
+
+    legend.box =
+      "vertical"
+  )
+
+proteinwise_age_png <- file.path(split_detect_dir, "Proteinwise_Age.png")
+
+save_plot_png(
+  p_proteinwise_age,
+  proteinwise_age_png,
+  width = 8.8,
+  height = max(5.5, length(unique(proteinwise_age_df$Protein.Group)) * 0.30 + 2.6),
+  dpi = 300
+)
+
+write.csv(proteinwise_age_df, file.path(split_detect_dir, "Proteinwise_Age_values.csv"), row.names = FALSE)
+```
+
+```{r show-proteinwise-age-delta, echo=FALSE, out.width="80%"}
+if (file.exists(proteinwise_age_png)) {
+  knitr::include_graphics(proteinwise_age_png)
+}
+```
+### Compact four-group detection matrix for selected candidates
+
+This display retains the actual Adult Female, Old Female, Adult Male, and Old Male detection prevalences but limits the rows to the strongest candidates.
+
+Selection prioritizes:
+
+1. proteins with raw within-sex Fisher `p <= 0.05` in either sex;
+2. then other Old-predominant proteins with the largest detection shifts, if space remains.
+
+The default maximum is 18 proteins. This number can be changed with `max_detection_matrix_proteins`.
+
+Dot size represents detection prevalence. A grey X indicates zero detection.
+
+```{r selected-detection-matrix-data}
+max_detection_matrix_proteins <- 18
+
+candidate_ranking <- detect_female_male %>%
+  mutate(
+    Any_raw_sig =
+      Female_raw_sig |
+        Male_raw_sig,
+
+    Any_oldpred =
+      replace_na(old_predominant_Female, FALSE) |
+        replace_na(old_predominant_Male, FALSE),
+
+    min_raw_p = pmin(p_detect_age_Female, p_detect_age_Male, na.rm = TRUE),
+
+    max_positive_delta = pmax(delta_prev_Female, delta_prev_Male, na.rm = TRUE)
+  ) %>%
+  filter(Any_raw_sig | Any_oldpred) %>%
+  arrange(desc(Any_raw_sig), min_raw_p, desc(max_positive_delta), desc(Abs_sex_difference_delta)) %>%
+  slice_head(n = max_detection_matrix_proteins) %>%
+  mutate(
+    Selection_rank =
+      row_number(),
+
+    Selection_reason =
+      case_when(
+        Female_raw_sig &
+          Male_raw_sig ~
+          "Raw p <= 0.05 in both sexes",
+
+        Female_raw_sig ~
+          "Raw p <= 0.05 in Female",
+
+        Male_raw_sig ~
+          "Raw p <= 0.05 in Male",
+
+        Any_oldpred ~
+          "Old-predominant candidate",
+
+        TRUE ~
+          "Other"
+      ),
+
+    GeneLabel =
+      make.unique(as.character(Gene1))
+  )
+
+write.csv(
+  candidate_ranking,
+  file.path(split_detect_dir, "Detection_SelectedCandidates_ranking.csv"),
+  row.names = FALSE
+)
+
+selected_detection_matrix <- bind_rows(
+
+  candidate_ranking %>%
+    transmute(
+      Protein.Group,
+      Gene1,
+      GeneLabel,
+      Bin,
+      Selection_rank,
+      Selection_reason,
+      Group =
+        "Adult_Female",
+      detected_n =
+        adult_detected_n_Female,
+      total_n =
+        adult_total_n_Female,
+      prevalence =
+        adult_prev_Female
+    ),
+
+  candidate_ranking %>%
+    transmute(
+      Protein.Group,
+      Gene1,
+      GeneLabel,
+      Bin,
+      Selection_rank,
+      Selection_reason,
+      Group =
+        "Old_Female",
+      detected_n =
+        old_detected_n_Female,
+      total_n =
+        old_total_n_Female,
+      prevalence =
+        old_prev_Female
+    ),
+
+  candidate_ranking %>%
+    transmute(
+      Protein.Group,
+      Gene1,
+      GeneLabel,
+      Bin,
+      Selection_rank,
+      Selection_reason,
+      Group =
+        "Adult_Male",
+      detected_n =
+        adult_detected_n_Male,
+      total_n =
+        adult_total_n_Male,
+      prevalence =
+        adult_prev_Male
+    ),
+
+  candidate_ranking %>%
+    transmute(
+      Protein.Group,
+      Gene1,
+      GeneLabel,
+      Bin,
+      Selection_rank,
+      Selection_reason,
+      Group =
+        "Old_Male",
+      detected_n =
+        old_detected_n_Male,
+      total_n =
+        old_total_n_Male,
+      prevalence =
+        old_prev_Male
+    )
+) %>%
+  mutate(
+    Group = factor(Group, levels = c("Adult_Female", "Old_Female", "Adult_Male", "Old_Male")),
+
+    GeneLabel = factor(GeneLabel, levels = rev(candidate_ranking$GeneLabel)),
+
+    prevalence_label =
+      sprintf("%d/%d", detected_n, total_n)
+  )
+
+write.csv(
+  selected_detection_matrix,
+  file.path(split_detect_dir, "Detection_SelectedCandidates_4GroupMatrix.csv"),
+  row.names = FALSE
+)
+```
+
+```{r selected-detection-matrix-plot, fig.keep="none"}
+p_selected_detection_matrix <- ggplot(selected_detection_matrix, aes(x = Group, y = GeneLabel)) +
+
+  geom_segment(
+    data = tibble(GeneLabel = levels(selected_detection_matrix$GeneLabel)),
+    aes(x = 0.65, xend = 4.35, y = GeneLabel, yend = GeneLabel),
+    inherit.aes = FALSE,
+    colour = "grey93",
+    linewidth = 0.35
+  ) +
+
+  geom_vline(xintercept = 1:4, colour = "grey94", linewidth = 0.35) +
+
+  geom_point(
+    data =
+      selected_detection_matrix %>%
+      filter(!is.na(prevalence), prevalence > 0),
+
+    aes(size = prevalence, colour = Bin),
+
+    alpha = 0.92
+  ) +
+
+  geom_point(
+    data =
+      selected_detection_matrix %>%
+      filter(is.na(prevalence) | prevalence == 0),
+
+    shape = 4,
+    size = nm_style$detect_matrix_zero,
+    stroke = 0.75,
+    colour = "grey65"
+  ) +
+
+  scale_size_continuous(
+    limits = c(0, 1),
+
+    range = c(nm_style$detect_matrix_min, nm_style$detect_matrix_max),
+
+    breaks = c(0.25, 0.50, 0.75, 1.00),
+
+    labels =
+      scales::percent(c(0.25, 0.50, 0.75, 1.00)),
+
+    name =
+      "Detection prevalence"
+  ) +
+
+  scale_colour_manual(
+    values =
+      bin_pal_dot[dot_bin_order],
+
+    breaks =
+      dot_bin_order,
+
+    drop = TRUE,
+
+    name =
+      "Cellular component"
+  ) +
+
+  scale_x_discrete(
+    position =
+      "top",
+
+    labels = c(
+      "Adult_Female" =
+        "Adult\nF",
+
+      "Old_Female" =
+        "Old\nF",
+
+      "Adult_Male" =
+        "Adult\nM",
+
+      "Old_Male" =
+        "Old\nM"
+    )
+  ) +
+
+  labs(
+    title =
+      "Detection prevalence of selected Old-predominant candidates",
+
+    subtitle =
+      paste0(
+        "Raw-p-positive proteins prioritized; ",
+        "remaining rows selected by Old-predominant detection pattern"
+      ),
+
+    x = NULL,
+    y = NULL,
+
+    caption =
+      "Bubble size = detection prevalence; grey X = not detected."
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    plot.title =
+      element_text(face = "bold", size = 14),
+
+    plot.subtitle =
+      element_text(colour = "grey35", size = 9.5),
+
+    plot.caption =
+      element_text(colour = "grey45", size = 8, hjust = 0),
+
+    plot.caption.position =
+      "plot",
+
+    axis.text.x =
+      element_text(face = "bold", size = 10),
+
+    axis.text.y =
+      element_text(size = 9.5),
+
+    axis.line =
+      element_blank(),
+
+    axis.ticks =
+      element_blank(),
+
+    panel.grid =
+      element_blank(),
+
+    legend.position =
+      "right",
+
+    plot.margin =
+      margin(10, 15, 15, 10)
+  )
+
+selected_detection_matrix_png <- file.path(split_detect_dir, "Detection_SelectedCandidates_4GroupMatrix.png")
+
+save_plot_png(
+  p_selected_detection_matrix,
+  selected_detection_matrix_png,
+  width = 8.5,
+  height = max(5.5, nrow(candidate_ranking) * 0.30 + 2.4),
+  dpi = 300
+)
+```
+
+```{r show-selected-detection-matrix, echo=FALSE, out.width="75%"}
+if (file.exists(selected_detection_matrix_png)) {
+  knitr::include_graphics(selected_detection_matrix_png)
+}
+```
+# Heatmap and centered-abundance alternatives
+
+The four-group bubble plot encodes absolute abundance by circle size, which can make modest differences difficult to judge. The next two heatmaps display the **pooled Old-ranked Top-10 proteins** across the same four Age × Sex groups using color-based abundance scales.
+
+The two heatmaps answer different questions:
+
+1. **Absolute abundance heatmap:** preserves between-protein abundance differences using `log10(mean intensity)`.
+2. **Within-protein centered heatmap:** emphasizes whether a particular protein is relatively higher or lower in Adult Female, Old Female, Adult Male, or Old Male muscle.
+
+The centered heatmap is not a Z-score. For each protein, the mean of the available group-level `log10(mean intensity)` values is subtracted from each Age × Sex group value:
+
+`centered log10 abundance = group log10(mean intensity) − protein mean log10(mean intensity across groups)`.
+
+Thus, zero represents that protein's own across-group mean, positive values indicate relatively higher abundance, and negative values indicate relatively lower abundance. Because values are not divided by the protein-specific standard deviation, the scale remains a log10 difference rather than a standardized Z-score. Missing groups remain `ND` rather than being imputed.
+
+## Prepare heatmap data
+
+```{r top10-heatmap-data}
+top10_heatmap_tbl <- pooled_top10_bysex %>%
+  mutate(
+    log10_intensity = if_else(!is.na(mean_intensity) & mean_intensity > 0, log10(mean_intensity), NA_real_)
+  ) %>%
+  group_by(Protein.Group) %>%
+  mutate(
+    protein_mean_log10 = if_else(any(is.finite(log10_intensity)), mean(log10_intensity, na.rm = TRUE), NA_real_),
+
+    centered_log10 = if_else(
+      is.finite(log10_intensity) &
+        is.finite(protein_mean_log10),
+      log10_intensity -
+        protein_mean_log10,
+      NA_real_
+    )
+  ) %>%
+  ungroup()
+
+write.csv(
+  top10_heatmap_tbl,
+  file.path(split_dot_dir, "Top10_PooledOldRank_bySex_heatmap_values.csv"),
+  row.names = FALSE
+)
+
+absolute_limits <- range(top10_heatmap_tbl$log10_intensity, na.rm = TRUE)
+
+center_abs_max <- max(abs(top10_heatmap_tbl$centered_log10), na.rm = TRUE)
+
+if (!is.finite(center_abs_max) || center_abs_max == 0) {
+  center_abs_max <- 1
+}
+```
+## Absolute abundance heatmap
+
+The same color scale is used across all cellular components. Consequently, proteins that are intrinsically much more abundant retain stronger absolute-abundance values than lower-abundance proteins; the colors are not normalized separately by component.
+
+Grey cells labeled `ND` indicate that the protein was not detected in that Age × Sex group.
+
+```{r absolute-heatmap, fig.keep="none"}
+absolute_heatmap_list <- list()
+
+for (i in seq_along(dot_bin_order)) {
+
+  bin_name <- dot_bin_order[i]
+  bin_col  <- bin_pal_dot[[bin_name]]
+
+  rank_tbl <- pooled_top10 %>%
+    filter(Bin == bin_name) %>%
+    arrange(desc(pooled_Old_mean)) %>%
+    mutate(GeneLabel = make.unique(as.character(Gene1)))
+
+  plot_df <- top10_heatmap_tbl %>%
+    filter(Bin == bin_name) %>%
+    left_join(rank_tbl %>% select(Protein.Group, GeneLabel), by = "Protein.Group") %>%
+    mutate(GeneLabel = factor(GeneLabel, levels = rev(rank_tbl$GeneLabel)))
+
+  if (nrow(plot_df) == 0) {
+    next
+  }
+
+  p <- ggplot(plot_df, aes(x = Group, y = GeneLabel, fill = log10_intensity)) +
+
+    geom_tile(colour = "white", linewidth = 0.55) +
+
+    geom_text(
+      data = plot_df %>%
+        filter(is.na(log10_intensity)),
+      aes(label = "ND"),
+      colour = "grey55",
+      size = 2.4
+    ) +
+
+    scale_fill_viridis_c(
+      option = "C",
+      limits = absolute_limits,
+      oob = scales::squish,
+      na.value = "grey95",
+      name = expression(log[10]("mean intensity"))
+    ) +
+
+    scale_x_discrete(
+      position = "top",
+      labels = c(
+        "Adult_Female" = "Adult\nF",
+        "Old_Female"   = "Old\nF",
+        "Adult_Male"   = "Adult\nM",
+        "Old_Male"     = "Old\nM"
+      )
+    ) +
+
+    labs(title = bin_name, x = NULL, y = NULL) +
+
+    theme_classic(base_size = 11) +
+
+    theme(
+      plot.title = element_text(face = "bold", size = nm_style$dot_protein_title_pt, colour = bin_col),
+
+      axis.text.x = element_text(size = nm_style$dot_group_label_pt, face = "bold"),
+
+      axis.text.y = element_text(size = nm_style$dot_protein_label_pt),
+
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+
+      legend.position = if (i == 1) {
+        "right"
+      } else {
+        "none"
+      },
+
+      plot.margin = margin(6, 8, 6, 8)
+    )
+
+  absolute_heatmap_list[[bin_name]] <- p
+}
+
+absolute_heatmap_combined <-
+  patchwork::wrap_plots(plotlist = absolute_heatmap_list, ncol = 4) +
+
+  patchwork::plot_layout(guides = "collect") +
+
+  patchwork::plot_annotation(
+    title =
+      "Absolute abundance of the most abundant insoluble proteins",
+
+    subtitle =
+      "Pooled Old-ranked Top 10 proteins; fill = log10(mean intensity)",
+
+    theme =
+      theme(
+        plot.title = element_text(face = "bold", size = 7.5, hjust = 0.5),
+
+        plot.subtitle = element_text(size = 5.5, colour = "grey35", hjust = 0.5)
+      )
+  ) &
+
+  theme(legend.position = "right")
+
+absolute_heatmap_png <- file.path(split_dot_dir, "Top10_PooledOldRank_bySex_AbsoluteHeatmap.png")
+
+if (file.exists(absolute_heatmap_png)) {
+  unlink(absolute_heatmap_png)
+}
+
+save_plot_png(absolute_heatmap_combined, absolute_heatmap_png, width = 13.3, height = 6.8, dpi = 300)
+```
+
+```{r show-absolute-heatmap, echo=FALSE, out.width="100%"}
+if (file.exists(absolute_heatmap_png)) {
+  knitr::include_graphics(absolute_heatmap_png)
+}
+```
+## Within-protein centered abundance heatmap
+
+This version suppresses the very large differences in baseline abundance between proteins and emphasizes the **pattern across the four Age × Sex groups for each protein**.
+
+For example:
+
+- positive values = higher than that protein's own four-group mean
+- negative values = lower than that protein's own four-group mean
+- zero = approximately equal to that protein's four-group mean
+
+Because this is centered but **not divided by the protein-specific standard deviation**, the magnitude still represents a difference in `log10` abundance rather than an arbitrary Z-score.
+
+```{r centered-heatmap, fig.keep="none"}
+centered_heatmap_list <- list()
+
+for (i in seq_along(dot_bin_order)) {
+
+  bin_name <- dot_bin_order[i]
+  bin_col  <- bin_pal_dot[[bin_name]]
+
+  rank_tbl <- pooled_top10 %>%
+    filter(Bin == bin_name) %>%
+    arrange(desc(pooled_Old_mean)) %>%
+    mutate(GeneLabel = make.unique(as.character(Gene1)))
+
+  plot_df <- top10_heatmap_tbl %>%
+    filter(Bin == bin_name) %>%
+    left_join(rank_tbl %>% select(Protein.Group, GeneLabel), by = "Protein.Group") %>%
+    mutate(GeneLabel = factor(GeneLabel, levels = rev(rank_tbl$GeneLabel)))
+
+  if (nrow(plot_df) == 0) {
+    next
+  }
+
+  p <- ggplot(plot_df, aes(x = Group, y = GeneLabel, fill = centered_log10)) +
+
+    geom_tile(colour = "white", linewidth = 0.55) +
+
+    geom_text(data = plot_df %>% filter(is.na(centered_log10)), aes(label = "ND"), colour = "grey55", size = 2.4) +
+
+    scale_fill_gradient2(
+      low = "#3B528B",
+      mid = "white",
+      high = "#D62728",
+      midpoint = 0,
+      limits = c(-center_abs_max, center_abs_max),
+      oob = scales::squish,
+      na.value = "grey95",
+      name = expression(Delta ~ log[10]("intensity"))
+    ) +
+
+    scale_x_discrete(
+      position = "top",
+      labels = c(
+        "Adult_Female" = "Adult\nF",
+        "Old_Female"   = "Old\nF",
+        "Adult_Male"   = "Adult\nM",
+        "Old_Male"     = "Old\nM"
+      )
+    ) +
+
+    labs(title = bin_name, x = NULL, y = NULL) +
+
+    theme_classic(base_size = 11) +
+
+    theme(
+      plot.title = element_text(face = "bold", size = nm_style$dot_protein_title_pt, colour = bin_col),
+
+      axis.text.x = element_text(size = nm_style$dot_group_label_pt, face = "bold"),
+
+      axis.text.y = element_text(size = nm_style$dot_protein_label_pt),
+
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+
+      legend.position = if (i == 1) {
+        "right"
+      } else {
+        "none"
+      },
+
+      plot.margin = margin(6, 8, 6, 8)
+    )
+
+  centered_heatmap_list[[bin_name]] <- p
+}
+
+centered_heatmap_combined <-
+  patchwork::wrap_plots(plotlist = centered_heatmap_list, ncol = 4) +
+
+  patchwork::plot_layout(guides = "collect") +
+
+  patchwork::plot_annotation(
+    title =
+      "Relative abundance across age and sex",
+
+    subtitle =
+      "Within-protein centered log10(mean intensity); red = relatively higher, blue = relatively lower",
+
+    theme =
+      theme(
+        plot.title = element_text(face = "bold", size = 7.5, hjust = 0.5),
+
+        plot.subtitle = element_text(size = 5.5, colour = "grey35", hjust = 0.5)
+      )
+  ) &
+
+  theme(legend.position = "right")
+
+centered_heatmap_png <- file.path(split_dot_dir, "Top10_PooledOldRank_bySex_CenteredHeatmap.png")
+
+if (file.exists(centered_heatmap_png)) {
+  unlink(centered_heatmap_png)
+}
+
+save_plot_png(centered_heatmap_combined, centered_heatmap_png, width = 13.3, height = 6.8, dpi = 300)
+```
+
+```{r show-centered-heatmap, echo=FALSE, out.width="100%"}
+if (file.exists(centered_heatmap_png)) {
+  knitr::include_graphics(centered_heatmap_png)
+}
+```
+## Within-protein centered bubble plots (Top 10 and Top 5)
+
+This figure shows the same centered values as the preceding heatmap, but with:
+
+- **color** = direction relative to that protein's own four-group mean
+  - red = relatively higher
+  - blue = relatively lower
+- **bubble size** = absolute magnitude of that deviation
+- **grey X** = not detected
+
+Bubble size here does **not** represent absolute protein abundance.
+
+The Top-10 view includes all ten Old-ranked proteins per component. The separate
+Top-5 view selects the five highest-ranked proteins **from those same Old pooled
+rankings**, retaining their precomputed four-group centered values. Both plots
+use the same numerical color limits; only the rendered bubble sizes differ.
+
+```{r centered-bubble-plot, fig.keep="none"}
+centered_bubble_list <- list()
+
+bubble_mag_max <- max(abs(top10_heatmap_tbl$centered_log10), na.rm = TRUE)
+
+if (!is.finite(bubble_mag_max) || bubble_mag_max == 0) {
+  bubble_mag_max <- 1
+}
+
+bubble_size_breaks <- pretty(c(0, bubble_mag_max), n = 4)
+
+bubble_size_breaks <- bubble_size_breaks[bubble_size_breaks >= 0 & bubble_size_breaks <= bubble_mag_max]
+
+for (i in seq_along(dot_bin_order)) {
+
+  bin_name <- dot_bin_order[i]
+  bin_col  <- bin_pal_dot[[bin_name]]
+
+  rank_tbl <- pooled_top10 %>%
+    filter(Bin == bin_name) %>%
+    arrange(desc(pooled_Old_mean)) %>%
+    mutate(GeneLabel = make.unique(as.character(Gene1)))
+
+  plot_df <- top10_heatmap_tbl %>%
+    filter(Bin == bin_name) %>%
+    left_join(rank_tbl %>% dplyr::select(Protein.Group, GeneLabel), by = "Protein.Group") %>%
+    mutate(
+      GeneLabel = factor(GeneLabel, levels = rev(rank_tbl$GeneLabel)),
+
+      deviation_magnitude =
+        abs(centered_log10)
+    )
+
+  if (nrow(plot_df) == 0) {
+    next
+  }
+
+  row_guides <- tibble(GeneLabel = levels(plot_df$GeneLabel))
+
+  p <- ggplot(plot_df, aes(x = Group, y = GeneLabel)) +
+
+    geom_segment(
+      data = row_guides,
+      aes(x = 0.65, xend = 4.35, y = GeneLabel, yend = GeneLabel),
+      inherit.aes = FALSE,
+      colour = "grey93",
+      linewidth = nm_style$centered_bubble_grid_line
+    ) +
+
+    geom_vline(xintercept = 1:4, colour = "grey94", linewidth = nm_style$centered_bubble_grid_line) +
+
+    geom_point(
+      data = plot_df %>%
+        filter(!is.na(centered_log10)),
+      aes(size = deviation_magnitude, colour = centered_log10),
+      alpha = 0.92
+    ) +
+
+    geom_point(
+      data = plot_df %>%
+        filter(is.na(centered_log10)),
+      shape = 4,
+      size = nm_style$centered_bubble_missing_mm,
+      stroke = nm_style$centered_bubble_missing_stroke,
+      colour = "grey65"
+    ) +
+
+    scale_colour_gradient2(
+      low = "#3B528B",
+      mid = "grey92",
+      high = "#D62728",
+      midpoint = 0,
+      limits = c(-bubble_mag_max, bubble_mag_max),
+      oob = scales::squish,
+      name = expression(Delta ~ log[10]("intensity"))
+    ) +
+
+    scale_size_continuous(
+      range = c(nm_style$centered_bubble_min_mm, nm_style$centered_bubble_max_mm),
+      limits = c(0, bubble_mag_max),
+      breaks =
+        bubble_size_breaks,
+      name =
+        "|centered value|"
+    ) +
+
+    scale_x_discrete(
+      position = "top",
+      labels = c(
+        "Adult_Female" =
+          "Adult\nF",
+        "Old_Female" =
+          "Old\nF",
+        "Adult_Male" =
+          "Adult\nM",
+        "Old_Male" =
+          "Old\nM"
+      )
+    ) +
+
+    labs(title = bin_name, x = NULL, y = NULL) +
+
+    theme_classic(base_size = 11) +
+
+    theme(
+      plot.title =
+        element_text(face = "bold", size = nm_style$centered_bubble_component_pt, colour = bin_col),
+      axis.text.x =
+        element_text(size = nm_style$centered_bubble_group_pt, face = "bold"),
+      axis.text.y =
+        element_text(size = nm_style$centered_bubble_protein_pt),
+      axis.line =
+        element_blank(),
+      axis.ticks =
+        element_blank(),
+      panel.grid =
+        element_blank(),
+      legend.position =
+        if (i == 1) {
+          "right"
+        } else {
+          "none"
+        },
+      plot.margin =
+        margin(1, 2, 1, 2)
+    )
+
+  centered_bubble_list[[bin_name]] <- p
+}
+
+centered_bubble_combined <-
+  patchwork::wrap_plots(plotlist = centered_bubble_list, ncol = 4) +
+
+  patchwork::plot_layout(guides = "collect") +
+
+  patchwork::plot_annotation(
+    title =
+      "Relative abundance across age and sex",
+    subtitle =
+      paste0(
+        "Within-protein centered log10(mean intensity); ",
+        "size = magnitude of deviation; ",
+        "red = relatively higher, blue = relatively lower"
+      ),
+    theme =
+      theme(
+        plot.title =
+          element_text(face = "bold", size = 7.5, hjust = 0.5),
+        plot.subtitle =
+          element_text(size = 5.5, colour = "grey35", hjust = 0.5)
+      )
+  ) &
+
+  theme(legend.position = "right")
+
+centered_bubble_png <- file.path(split_dot_dir, "Top10_PooledOldRank_bySex_CenteredBubbles.png")
+
+if (file.exists(centered_bubble_png)) {
+  unlink(centered_bubble_png)
+}
+
+save_plot_png(centered_bubble_combined, centered_bubble_png, width = 120 / 25.4, height = 80 / 25.4, dpi = 300)
+```
+
+```{r show-centered-bubbles, echo=FALSE, out.width="100%"}
+if (file.exists(centered_bubble_png)) {
+  knitr::include_graphics(centered_bubble_png)
+}
+```
+## Top-5 pooled Old-ranked centered bubble plot (Figure 3 companion)
+
+This additional figure uses the five highest pooled Old-abundance proteins
+within each cellular component. The underlying within-protein centered values
+are identical to the Top-10 analysis; group means and missing detections are not
+recomputed. The Top-10 figure is retained separately.
+
+```{r centered-bubble-top5-plot, fig.keep="none"}
+# Requires: pooled_top10, top10_heatmap_tbl, dot_bin_order, bin_pal_dot,
+# and the centered-bubble-plot chunk (for bubble_mag_max / breaks).
+stopifnot(exists("pooled_top10"), exists("top10_heatmap_tbl"),
+          exists("bubble_mag_max"), exists("bubble_size_breaks"))
+
+centered_top5_panels <- list()
+
+for (bin_name in dot_bin_order) {
+  rank5 <- pooled_top10 %>%
+    dplyr::filter(Bin == bin_name) %>%
+    dplyr::arrange(dplyr::desc(pooled_Old_mean)) %>%
+    dplyr::slice_head(n = 5L) %>%
+    dplyr::mutate(GeneLabel = make.unique(as.character(Gene1)))
+
+  if (nrow(rank5) == 0L) next
+
+  dat5 <- top10_heatmap_tbl %>%
+    dplyr::filter(Bin == bin_name, Protein.Group %in% rank5$Protein.Group) %>%
+    dplyr::left_join(rank5 %>% dplyr::select(Protein.Group, GeneLabel), by = "Protein.Group") %>%
+    dplyr::mutate(
+      GeneLabel = factor(GeneLabel, levels = rev(rank5$GeneLabel)),
+      deviation_magnitude = abs(centered_log10)
+    )
+
+  if (nrow(dat5) == 0L) next
+
+  row5 <- tibble::tibble(GeneLabel = levels(dat5$GeneLabel))
+
+  p5 <- ggplot2::ggplot(dat5, ggplot2::aes(x = Group, y = GeneLabel)) +
+    ggplot2::geom_segment(
+      data = row5,
+      ggplot2::aes(x = 0.65, xend = 4.35, y = GeneLabel, yend = GeneLabel),
+      inherit.aes = FALSE,
+      colour = "grey93", linewidth = nm_style$centered_bubble_grid_line
+    ) +
+    ggplot2::geom_vline(xintercept = 1:4, colour = "grey94", linewidth = nm_style$centered_bubble_grid_line) +
+    ggplot2::geom_point(
+      data = dat5 %>% dplyr::filter(is.finite(centered_log10)),
+      ggplot2::aes(size = deviation_magnitude, colour = centered_log10),
+      alpha = 0.92
+    ) +
+    ggplot2::geom_point(
+      data = dat5 %>% dplyr::filter(!is.finite(centered_log10)),
+      shape = 4, size = nm_style$centered_top5_missing_mm,
+      stroke = nm_style$centered_bubble_missing_stroke,
+      colour = "grey65"
+    ) +
+    ggplot2::scale_colour_gradient2(
+      low = "#3B528B", mid = "grey92", high = "#D62728",
+      midpoint = 0, limits = c(-bubble_mag_max, bubble_mag_max),
+      oob = scales::squish,
+      name = expression(Delta ~ log[10]("intensity"))
+    ) +
+    ggplot2::scale_size_continuous(
+      range = c(nm_style$centered_top5_min_mm, nm_style$centered_top5_max_mm),
+      limits = c(0, bubble_mag_max), breaks = bubble_size_breaks,
+      name = "|centered value|"
+    ) +
+    ggplot2::scale_x_discrete(
+      position = "top",
+      labels = c("Adult_Female" = "Adult\nF",
+                 "Old_Female" = "Old\nF",
+                 "Adult_Male" = "Adult\nM",
+                 "Old_Male" = "Old\nM")
+    ) +
+    ggplot2::labs(title = bin_name, x = NULL, y = NULL) +
+    ggplot2::theme_classic(base_size = 8) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        face = "bold", size = nm_style$centered_top5_component_pt,
+        colour = bin_pal_dot[[bin_name]]
+      ),
+      axis.text.x = ggplot2::element_text(size = nm_style$centered_top5_group_pt, face = "bold"),
+      axis.text.y = ggplot2::element_text(size = nm_style$centered_top5_protein_pt),
+      axis.line = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank(),
+      panel.grid = ggplot2::element_blank(),
+      legend.position = "right",
+      plot.margin = ggplot2::margin(1, 1, 1, 1)
+    )
+
+  centered_top5_panels[[bin_name]] <- p5
+}
+
+# No overall title/subtitle: retain only the colored component headings.
+centered_top5_combined <- patchwork::wrap_plots(plotlist = centered_top5_panels, ncol = 4) +
+  patchwork::plot_layout(guides = "collect") &
+  ggplot2::theme(legend.position = "right")
+
+centered_top5_png <- file.path(split_dot_dir, "Top5_PooledOldRank_bySex_CenteredBubbles.png")
+save_plot_png(
+  centered_top5_combined,
+  centered_top5_png,
+  width = nm_dims$Top5_PooledOldRank_bySex_CenteredBubbles[["width"]] / 25.4,
+  height = nm_dims$Top5_PooledOldRank_bySex_CenteredBubbles[["height"]] / 25.4,
+  dpi = nm_export$dpi
+)
+```
+
+```{r show-centered-top5-bubbles, echo=FALSE, out.width="100%"}
+if (file.exists(centered_top5_png)) knitr::include_graphics(centered_top5_png)
+```
+# Output guide
+
+All results are written under `Comp_AO/` using a shared/combined/sex-resolved directory structure.
+
+```text
+Comp_AO/
+|
+|-- Shared/
+|   |-- Protein_GOCC_bin_assignment.csv
+|   |-- Protein_counts_by_bin.csv
+|   `-- Protein_bin_list_min2.csv
+|
+|-- Combined/
+|   |
+|   |-- Composition/
+|   |   |-- Mass_perSample_Age.csv
+|   |   |-- Count_perSample_Age.csv
+|   |   |-- Mass_Age.png
+|   |   `-- Count_Age.png
+|   |
+|   |-- Stats/
+|   |   |-- BinStats_mass_Age.csv
+|   |   |-- BinStats_count_Age.csv
+|   |   |-- Effect_percentagePoint_overall.csv
+|   |   |-- Effect_percentagePoint_overall.png
+|   |   |-- Effect_withinBin_overall.csv
+|   |   `-- Effect_withinBin_overall.png
+|   |
+|   |-- Detection/
+|   |   |-- Detection_all.csv
+|   |   |-- Detection_min2.csv
+|   |   |-- OldOnly_min2.csv
+|   |   |-- AdultOnly_min2.csv
+|   |   |-- OldPredominant_OldGe2_AdultLe1.csv
+|   |   |-- OldOnly_min2.png
+|   |   `-- OldPredominant_OldGe2_AdultLe1.png
+|   |
+|   `-- TopProteins/
+|       `-- Top10_AllBins.png
+|
+`-- SexSplit/
+    |
+    |-- Composition/
+    |   |-- Mass_perSample_2x2.csv
+    |   |-- Count_perSample_2x2.csv
+    |   |-- Mass_2x2.png
+    |   |-- Count_2x2.png
+    |   |-- Mass_2x2_noSarcoCyto_originalTotal.csv
+    |   |-- Mass_2x2_noSarcoCyto_originalTotal.png
+    |   `-- Mass_2x2_RawFDR.png
+    |
+    |-- Stats/
+    |   |-- BinStats_mass_2x2.csv
+    |   |-- BinStats_count_2x2.csv
+    |   |-- Effect_percentagePoint_bySex.csv
+    |   |-- Effect_percentagePoint_bySex.png
+    |   |-- Effect_withinBin_bySex.csv
+    |   `-- Effect_withinBin_bySex.png
+    |
+    |-- TopProteins/
+    |   |-- Protein_abundance_bySex_long.csv
+    |   |-- Protein_abundance_bySex_wide.csv
+    |   |-- Top10_PooledOldRank_bySex_4Groups.png
+    |   |-- Top10_PooledOldRank_bySex_table.csv
+    |   |-- Top10_Female_OldRank.png
+    |   |-- Top10_Female_OldRank_table.csv
+    |   |-- Top10_Male_OldRank.png
+    |   |-- Top10_Male_OldRank_table.csv
+    |   |-- Top10_FemaleMale_membership_overlap.csv
+    |   |-- Top10_FemaleMale_membership_summary.csv
+    |   |-- Top10_PooledOldRank_bySex_AbsoluteHeatmap.png
+    |   |-- Top10_PooledOldRank_bySex_CenteredHeatmap.png
+    |   |-- Top10_PooledOldRank_bySex_CenteredBubbles.png
+    |   |-- Top5_PooledOldRank_bySex_CenteredBubbles.png
+    |   `-- Top10_PooledOldRank_bySex_heatmap_values.csv
+    |
+    `-- Detection/
+        |-- Detection_bySex_all.csv
+        |-- Detection_bySex_min2.csv
+        |-- Detection_AdultOld_FemaleMale_wide.csv
+        |-- OldOnly_bySex.csv
+        |-- OldPredominant_bySex.csv
+        |-- OldPredominant_Female.png
+        |-- OldPredominant_Female_table.csv
+        |-- OldPredominant_Male.png
+        |-- OldPredominant_Male_table.csv
+        |-- OldPredominant_FemaleMale_overlap.csv
+        |-- OldPredominant_FemaleMale_overlap_summary.csv
+        |-- OldPredominant_ComponentSummary_bySex.csv
+        |-- OldPredominant_ComponentSummary_Count.png
+        |-- OldPredominant_ComponentSummary_Percent.png
+        |-- OldPredominant_ComponentSummary_CountAndPercent.png
+        |-- DetectionDelta_Female_vs_Male.csv
+        |-- DetectionDelta_Female_vs_Male.png
+        |-- Proteinwise_Age_values.csv
+        |-- Proteinwise_Age.png
+        |-- Detection_SelectedCandidates_ranking.csv
+        |-- Detection_SelectedCandidates_4GroupMatrix.csv
+        `-- Detection_SelectedCandidates_4GroupMatrix.png
+```
+
+The report intentionally does **not** create the protein-level Female-versus-Male insoluble-abundance age-effect scatter or rerun protein-level insoluble limma differential abundance. Those analyses are maintained in the dedicated Insoluble report.
+
+# Session information
+
+## Export manifest
+
+The manifest lists all registered panels, their current **mm** dimensions and
+exact PNG/SVG locations. Only the completed plot objects from this session can
+be re-exported; rerun the relevant plotting chunks after restarting R.
+
+```{r nm-export-manifest, results="hide"}
+figure_export_manifest()
+```
+
+```{r session-info}
+sessionInfo()
+```
+
