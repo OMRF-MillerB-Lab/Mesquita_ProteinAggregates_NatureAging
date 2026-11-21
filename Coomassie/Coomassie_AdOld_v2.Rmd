@@ -1,0 +1,626 @@
+---
+title: "Bulk soluble / insoluble coomassie analysis — Adult vs Old"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    self_contained: true
+editor_options:
+  chunk_output_type: console
+---
+
+# Overview {-}
+
+**Question.** Does bulk Coomassie-stained soluble and insoluble protein content, or the insoluble-to-soluble ratio, differ between Adult and Old sedentary mice, and does the age effect depend on sex?
+
+| Item | As implemented below |
+|---|---|
+| Input | `Aggregates_Sol and Insoluble Coomassie_Mesquita.xlsx` (repeated header rows are removed) |
+| Groups | Adult sed and Old sed; Female and Male |
+| Values | Raw values (`use_normalized <- FALSE`); outcomes Soluble, Insoluble and Insol/Sol ratio |
+| Model (each outcome) | `lm(Value ~ Age * Sex)` with sum-to-zero contrasts; Type III ANOVA (`car::Anova`, F tests) for Age, Sex and Age × Sex |
+| Planned contrasts | Old - Adult within each sex (`emmeans`, `revpairwise`), **unadjusted** (`adjust = "none"`); saved to `Bulk_AO_age_within_sex.csv` |
+| Figures | Bars = mean ± SEM by sex and age; points = individual animals; subtitle *P* values are the Type III terms |
+
+The unit of replication is the animal. Figures are saved to `Bulk_AO/` (PNG, 300 dpi) and are also shown in this report right after the chunk that creates them.
+
+> **To run:** keep the input workbook next to this file and knit. This script also contains the `PAPER BRIDGE` / `PAPER FINISH` blocks of your paper workflow; they stop the script unless a `Paper/shared/attach.R` folder is found above the working directory (see CHANGES).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE
+)
+
+options(
+  width = 120
+)
+
+# >>> BEGIN PAPER CACHE OPTIONS >>>
+knitr::opts_chunk$set(cache = FALSE, error = FALSE)
+# <<< END PAPER CACHE OPTIONS <<<
+```
+
+# Packages
+
+All packages must be installed beforehand (the script stops and lists any that are missing; it does not install anything). They are attached in the original order, which decides which functions mask which.
+
+```{r packages}
+pkgs <- c("tidyverse", "readxl", "broom", "emmeans", "car", "ggtext", "patchwork",
+          "scales", "grid")
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Install missing packages first: ", paste(missing_pkgs, collapse = ", "), call. = FALSE)
+}
+invisible(lapply(pkgs[1:9], library, character.only = TRUE))
+```
+
+# Helper functions
+
+```{r helpers}
+darken_col <- function(col, factor = 0.70) {
+
+  rgb_mat <- grDevices::col2rgb(col) / 255
+
+  grDevices::rgb(red = rgb_mat[1, ] * factor, green = rgb_mat[2, ] * factor, blue = rgb_mat[3, ] * factor)
+}
+
+save_png <- function(plot_obj, filename, width, height, dpi = 300) {
+
+  ggplot2::ggsave(
+    filename = filename,
+    plot = plot_obj,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = dpi,
+    bg = "white"
+  )
+}
+
+round_up_to <- function(x, base) {
+  base *
+    ceiling(x / base)
+}
+
+mean_sem <- function(x) {
+
+  n <- sum(!is.na(x))
+
+  m <- mean(x, na.rm = TRUE)
+
+  s <- sd(x, na.rm = TRUE)
+
+  se <- s /
+    sqrt(n)
+
+  tibble(n = n, mean = m, sd = s, sem = se)
+}
+
+fmt_p <- function(p) {
+
+  ifelse(is.na(p), "NA", ifelse(p < 0.001, "<0.001", sprintf("%.3f", p)))
+}
+
+console_print <- function(x) {
+
+  cat(paste(capture.output(print(x)), collapse = "\n"), "\n")
+
+  invisible(x)
+}
+
+theme_bulk <- function(base_size = 18) {
+
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", size = base_size + 4),
+      plot.subtitle = element_text(size = base_size, colour = "#4D4D4D"),
+      axis.title = element_text(face = "bold", size = base_size + 1),
+      axis.text = element_text(face = "bold", colour = "black", size = base_size - 1),
+      legend.title = element_text(face = "bold", size = base_size),
+      legend.text = element_text(size = base_size - 1),
+      axis.line = element_line(linewidth = 1.1),
+      axis.ticks = element_line(linewidth = 1.1),
+      axis.ticks.length = unit(0.18, "cm"),
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.background = element_rect(fill = "white", colour = NA),
+      legend.background = element_rect(fill = "white", colour = NA)
+    )
+}
+```
+
+# User settings
+
+```{r settings}
+# Input file
+in_file <- "Aggregates_Sol and Insoluble Coomassie_Mesquita.xlsx"
+
+# Output directory (kept short to avoid path issues)
+out_dir <- file.path(
+  getwd(),
+  "Bulk_AO"
+)
+
+dir.create(
+  out_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# Choose raw or normalized values
+use_normalized <- FALSE
+
+age_cols <- c(
+  "Adult" = "#3B528B",
+  "Old" = "#59C761"
+)
+
+age_fill_cols <- c(
+  "Adult" = scales::alpha(
+    age_cols[["Adult"]],
+    0.42
+  ),
+  "Old" = scales::alpha(
+    age_cols[["Old"]],
+    0.42
+  )
+)
+
+age_border_cols <- c(
+  "Adult" = darken_col(
+    age_cols[["Adult"]],
+    factor = 0.72
+  ),
+  "Old" = darken_col(
+    age_cols[["Old"]],
+    factor = 0.72
+  )
+)
+
+age_point_cols <- c(
+  "Adult" = darken_col(
+    age_cols[["Adult"]],
+    factor = 0.58
+  ),
+  "Old" = darken_col(
+    age_cols[["Old"]],
+    factor = 0.58
+  )
+)
+
+sex_shapes <- c(
+  "Female" = 21,
+  "Male" = 24
+)
+
+# Figure sizes
+sep_w <- 6.4
+sep_h <- 5.4
+comb_w <- 10.0
+comb_h <- 6.2
+
+# >>> BEGIN PAPER BRIDGE >>>
+.paper_dir <- local({
+  d <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+  repeat {
+    candidates <- unique(c(d, file.path(d, "Paper")))
+    ok <- candidates[file.exists(file.path(candidates, "shared", "attach.R"))]
+    if (length(ok) == 1L) break
+    if (length(ok) > 1L) stop("Ambiguous Paper folders.")
+    up <- dirname(d)
+    if (identical(up, d)) stop("Put Paper directly under Double-checked before running this paper Rmd.")
+    d <- up
+  }
+  ok[[1]]
+})
+source(file.path(.paper_dir, "shared", "attach.R"), local = TRUE)
+paper_attach("Bulk", envir = environment(), paper_dir = .paper_dir)
+# <<< END PAPER BRIDGE <<<
+```
+
+# Import and clean data
+
+```{r import}
+raw_df <- readxl::read_excel(in_file)
+
+# Remove repeated header rows that were embedded in the spreadsheet
+raw_df <- raw_df %>%
+  filter(Group != "Group") %>%
+  mutate(
+    across(c(RawSoluble, RawInsoluble, `RawInsol/Sol`, NormSoluble, NormInsoluble, `NormInsol/Sol`), as.numeric),
+    Sex = str_to_title(as.character(Sex)),
+    Group = str_squish(as.character(Group))
+  )
+
+# Restrict to Adult vs Old sedentary comparison only
+bulk_df <- raw_df %>%
+  filter(Group %in% c("Adult sed", "Old sed"), Sex %in% c("Female", "Male")) %>%
+  mutate(
+    Age = case_when(Group == "Adult sed" ~ "Adult", Group == "Old sed" ~ "Old", TRUE ~ NA_character_),
+    Age = factor(Age, levels = c("Adult", "Old")),
+    Sex = factor(Sex, levels = c("Female", "Male"))
+  )
+
+console_print(bulk_df)
+```
+
+# Build analysis table
+
+```{r long-data}
+measure_map <- if (use_normalized) {
+  c(Soluble = "NormSoluble", Insoluble = "NormInsoluble", Ratio = "NormInsol/Sol")
+} else {
+  c(Soluble = "RawSoluble", Insoluble = "RawInsoluble", Ratio = "RawInsol/Sol")
+}
+
+bulk_long <- bind_rows(
+  bulk_df %>%
+    transmute(ID, Age, Sex, Outcome = "Soluble", Value = .data[[measure_map[["Soluble"]]]]),
+  bulk_df %>%
+    transmute(ID, Age, Sex, Outcome = "Insoluble", Value = .data[[measure_map[["Insoluble"]]]]),
+  bulk_df %>%
+    transmute(ID, Age, Sex, Outcome = "Insol/Sol", Value = .data[[measure_map[["Ratio"]]]])
+) %>%
+  mutate(Outcome = factor(Outcome, levels = c("Soluble", "Insoluble", "Insol/Sol")))
+
+summary_tbl <- bulk_long %>%
+  group_by(Outcome, Sex, Age) %>%
+  summarise(mean_sem(Value), .groups = "drop")
+
+readr::write_csv(summary_tbl, file.path(out_dir, "Bulk_AO_summary.csv"))
+
+console_print(summary_tbl)
+```
+
+# Statistics
+
+```{r stats}
+analyze_outcome <- function(df, outcome_name) {
+
+  sub_df <- df %>%
+    filter(Outcome == outcome_name) %>%
+    droplevels()
+
+  # Type III 2 x 2 factorial ANOVA, matching the other manuscript workflows.
+  contrasts(sub_df$Age) <- contr.sum(nlevels(sub_df$Age))
+
+  contrasts(sub_df$Sex) <- contr.sum(nlevels(sub_df$Sex))
+
+  fit <- lm(Value ~ Age * Sex, data = sub_df)
+
+  a3 <- car::Anova(fit, type = 3)
+
+  p_col <- grep("^Pr\\(", colnames(a3), value = TRUE)[1]
+
+  anova_tbl <- tibble(Outcome = outcome_name, Term = rownames(a3), p_value = as.numeric(a3[, p_col])) %>%
+    filter(Term %in% c("Age", "Sex", "Age:Sex"))
+
+  em_age_within_sex <- emmeans::emmeans(fit, ~ Age | Sex)
+
+  age_contrasts <- emmeans::contrast(em_age_within_sex, method = "revpairwise", adjust = "none") %>%
+    broom::tidy() %>%
+    mutate(Outcome = outcome_name)
+
+  list(fit = fit, anova = anova_tbl, contrasts = age_contrasts)
+}
+
+stat_list <- setNames(
+  lapply(
+    levels(bulk_long$Outcome),
+    function(x) {
+      analyze_outcome(bulk_long, x)
+    }
+  ),
+  levels(bulk_long$Outcome)
+)
+
+anova_all <- bind_rows(lapply(stat_list, `[[`, "anova"))
+
+contrast_all <- bind_rows(lapply(stat_list, `[[`, "contrasts"))
+
+stats_wide <- anova_all %>%
+  select(Outcome, Term, p_value) %>%
+  pivot_wider(names_from = Term, values_from = p_value) %>%
+  mutate(stats_label = paste0("Age=", fmt_p(Age), " | Sex=", fmt_p(Sex), " | Int=", fmt_p(`Age:Sex`)))
+
+get_stats_label <- function(outcome_name) {
+
+  stats_wide %>%
+    filter(Outcome == outcome_name) %>%
+    pull(stats_label)
+}
+
+combined_stats_label <- paste0(
+  "<b>Sol:</b> ",
+  get_stats_label("Soluble"),
+  "<br>",
+  "<b>Insol:</b> ",
+  get_stats_label("Insoluble"),
+  "<br>",
+  "<b>Insol/Sol:</b> ",
+  get_stats_label("Insol/Sol")
+)
+
+readr::write_csv(anova_all, file.path(out_dir, "Bulk_AO_anova_type3.csv"))
+
+readr::write_csv(contrast_all, file.path(out_dir, "Bulk_AO_age_within_sex.csv"))
+
+readr::write_csv(stats_wide, file.path(out_dir, "Bulk_AO_pvalues.csv"))
+
+console_print(anova_all)
+console_print(contrast_all)
+console_print(stats_wide)
+```
+
+# Plot helpers
+
+```{r plot-helpers}
+make_sep_plot <- function(
+  outcome_name,
+  ylab_text,
+  title_text,
+  file_stub,
+  y_labels = label_number(big.mark = ","),
+  expand_mult = c(0, 0.08)
+) {
+
+  sub_points <- bulk_long %>%
+    filter(Outcome == outcome_name)
+
+  sub_sum <- summary_tbl %>%
+    filter(Outcome == outcome_name)
+
+  p <- ggplot(sub_sum, aes(x = Sex, y = mean)) +
+    geom_col(
+      aes(fill = Age, colour = Age),
+      position = position_dodge(width = 0.72),
+      width = 0.62,
+      linewidth = 1.25,
+      alpha = 1
+    ) +
+    geom_errorbar(
+      aes(ymin = mean - sem, ymax = mean + sem, colour = Age),
+      position = position_dodge(width = 0.72),
+      width = 0.13,
+      linewidth = 1.0
+    ) +
+    geom_point(
+      data = sub_points,
+      aes(x = Sex, y = Value, fill = Age, colour = Age, shape = Sex),
+      position = position_jitterdodge(jitter.width = 0.07, dodge.width = 0.72, seed = 1),
+      size = 3.2,
+      stroke = 0.95,
+      alpha = 0.98
+    ) +
+    scale_fill_manual(values = age_fill_cols, name = NULL) +
+    scale_colour_manual(values = age_border_cols, name = NULL) +
+    scale_shape_manual(values = sex_shapes, name = NULL) +
+    scale_y_continuous(labels = y_labels, expand = expansion(mult = expand_mult)) +
+    labs(title = title_text, subtitle = get_stats_label(outcome_name), x = NULL, y = ylab_text) +
+    theme_bulk() +
+    theme(
+      plot.subtitle = element_text(size = 15, colour = "black", margin = margin(b = 5)),
+      legend.position = "right"
+    )
+
+  save_png(p, file.path(out_dir, paste0(file_stub, ".png")), width = sep_w, height = sep_h)
+
+  p
+}
+```
+
+# Figure 1 — Soluble content
+
+```{r fig-soluble, fig.keep='none'}
+p_sol <- make_sep_plot(
+  outcome_name = "Soluble",
+  ylab_text = "Soluble protein content (A.U.)",
+  title_text = "Soluble protein content",
+  file_stub = "Bulk_AO_Soluble",
+  y_labels = label_scientific(digits = 2)
+)
+
+cat("Saved: ", file.path(out_dir, "Bulk_AO_Soluble.png"), "\n", sep = "")
+```
+
+```{r show-sol, echo=FALSE, fig.width=sep_w, fig.height=sep_h, dpi=110, fig.align='center'}
+print(p_sol)
+```
+
+# Figure 2 — Insoluble content
+
+```{r fig-insoluble, fig.keep='none'}
+p_ins <- make_sep_plot(
+  outcome_name = "Insoluble",
+  ylab_text = "Insoluble protein content (A.U.)",
+  title_text = "Insoluble protein content",
+  file_stub = "Bulk_AO_Insoluble",
+  y_labels = label_scientific(digits = 2)
+)
+
+cat("Saved: ", file.path(out_dir, "Bulk_AO_Insoluble.png"), "\n", sep = "")
+```
+
+```{r show-ins, echo=FALSE, fig.width=sep_w, fig.height=sep_h, dpi=110, fig.align='center'}
+print(p_ins)
+```
+
+# Figure 3 — Insoluble / Soluble ratio
+
+```{r fig-ratio, fig.keep='none'}
+p_ratio <- make_sep_plot(
+  outcome_name = "Insol/Sol",
+  ylab_text = "Insoluble / Soluble ratio",
+  title_text = "Insoluble-to-soluble ratio",
+  file_stub = "Bulk_AO_Ratio",
+  y_labels = label_number(accuracy = 0.1)
+)
+
+cat("Saved: ", file.path(out_dir, "Bulk_AO_Ratio.png"), "\n", sep = "")
+```
+
+```{r show-ratio, echo=FALSE, fig.width=sep_w, fig.height=sep_h, dpi=110, fig.align='center'}
+print(p_ratio)
+```
+
+# Figure 4 — Combined figure
+
+```{r fig-combined, fig.keep='none'}
+content_max <- bulk_long %>%
+  filter(Outcome %in% c("Soluble", "Insoluble")) %>%
+  summarise(max_val = max(Value, na.rm = TRUE)) %>%
+  pull(max_val)
+
+left_axis_max <- round_up_to(content_max * 1.20, 1e6)
+
+right_axis_max <- 2.0
+
+ratio_scale <- left_axis_max /
+  right_axis_max
+
+metric_centers <- c("Soluble" = 1, "Insoluble" = 2, "Insol/Sol" = 4)
+
+age_offsets <- c("Adult" = -0.14, "Old" = 0.14)
+
+comb_sum <- summary_tbl %>%
+  mutate(
+    x = metric_centers[as.character(Outcome)] +
+      age_offsets[as.character(Age)],
+    plot_mean = if_else(Outcome == "Insol/Sol", mean * ratio_scale, mean),
+    plot_sem = if_else(Outcome == "Insol/Sol", sem * ratio_scale, sem)
+  )
+
+comb_pts <- bulk_long %>%
+  mutate(
+    x = metric_centers[as.character(Outcome)] +
+      age_offsets[as.character(Age)],
+    plot_value = if_else(Outcome == "Insol/Sol", Value * ratio_scale, Value)
+  )
+
+make_combined_plot <- function(show_stats = FALSE) {
+
+  ggplot() +
+    geom_col(
+      data = comb_sum,
+      aes(x = x, y = plot_mean, fill = Age, colour = Age),
+      width = 0.24,
+      linewidth = 1.25,
+      alpha = 1
+    ) +
+    geom_errorbar(
+      data = comb_sum,
+      aes(x = x, ymin = plot_mean - plot_sem, ymax = plot_mean + plot_sem, colour = Age),
+      width = 0.08,
+      linewidth = 1.0
+    ) +
+    geom_point(
+      data = comb_pts,
+      aes(x = x, y = plot_value, fill = Age, colour = Age, shape = Sex),
+      position = position_jitter(width = 0.035, height = 0, seed = 1),
+      size = 3.05,
+      stroke = 0.95,
+      alpha = 0.98
+    ) +
+    geom_vline(xintercept = 3, linewidth = 1.1, linetype = "longdash", colour = "grey35") +
+    scale_fill_manual(values = age_fill_cols, name = NULL) +
+    scale_colour_manual(values = age_border_cols, name = NULL) +
+    scale_shape_manual(values = sex_shapes, name = NULL) +
+    scale_x_continuous(
+      breaks = c(1, 2, 4),
+      labels = c("Soluble", "Insoluble", "Insol/sol"),
+      limits = c(0.5, 4.6),
+      expand = expansion(mult = c(0.01, 0.02))
+    ) +
+    scale_y_continuous(
+      name = "Protein content (A.U.)",
+      limits = c(0, left_axis_max),
+      breaks = seq(0, left_axis_max, by = left_axis_max / 3),
+      labels = label_scientific(digits = 2),
+      sec.axis = sec_axis(
+        local({ rs <- ratio_scale; ~ . / rs }),
+        name = "Ratio",
+        breaks = seq(0, right_axis_max, by = 0.5)
+      )
+    ) +
+    labs(
+      title = "Soluble and insoluble proteins",
+      subtitle = if (show_stats) {
+        combined_stats_label
+      } else {
+        NULL
+      },
+      x = NULL,
+      y = "Protein content (A.U.)"
+    ) +
+    theme_bulk(base_size = 20) +
+    theme(
+      axis.title.y.right = element_text(face = "bold", angle = 270, vjust = 0.5),
+      axis.text.x = element_text(size = 18),
+      plot.subtitle = if (show_stats) {
+        ggtext::element_markdown(size = 13.5, colour = "black", lineheight = 1.18, margin = margin(b = 8))
+      } else {
+        element_blank()
+      },
+      legend.position = "right"
+    )
+}
+
+# Version 1: clean combined figure
+p_combined <- make_combined_plot(show_stats = FALSE)
+
+save_png(p_combined, file.path(out_dir, "Bulk_AO_Combined.png"), width = comb_w, height = comb_h)
+
+# Version 2: combined figure with factorial p-values
+p_combined_pvals <- make_combined_plot(show_stats = TRUE)
+
+save_png(p_combined_pvals, file.path(out_dir, "Bulk_AO_Combined_pvals.png"), width = comb_w, height = comb_h + 0.7)
+
+cat("Saved: ", file.path(out_dir, "Bulk_AO_Combined.png"), "\n", sep = "")
+cat("Saved: ", file.path(out_dir, "Bulk_AO_Combined_pvals.png"), "\n", sep = "")
+```
+
+```{r show-combined, echo=FALSE, fig.width=comb_w, fig.height=comb_h, dpi=110, fig.align='center'}
+print(p_combined)
+```
+
+```{r show-combined-pvals, echo=FALSE, fig.width=comb_w, fig.height=comb_h + 0.7, dpi=110, fig.align='center'}
+print(p_combined_pvals)
+```
+
+# Optional combined multi-panel version
+
+```{r fig-four-panel, fig.keep='none'}
+p_four <- (p_sol | p_ins | p_ratio) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+save_png(p_four, file.path(out_dir, "Bulk_AO_3panel.png"), width = 15.5, height = 5.0)
+
+cat("Saved: ", file.path(out_dir, "Bulk_AO_3panel.png"), "\n", sep = "")
+```
+
+```{r show-three-panel, echo=FALSE, fig.width=15.5, fig.height=5.0, dpi=110, fig.align='center'}
+print(p_four)
+```
+
+# Session info
+
+```{r session-info}
+cat(
+  paste(
+    capture.output(
+      sessionInfo()
+    ),
+    collapse = "\n"
+  ),
+  "\n"
+)
+
+# >>> BEGIN PAPER FINISH >>>
+paper_finish()
+# <<< END PAPER FINISH <<<
+```
