@@ -1,0 +1,1466 @@
+---
+title: "Protein Turnover — Planned Treatment Contrasts and Nature Metabolism Figures"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  cache = FALSE
+)
+
+options(width = 130)
+```
+
+# Scope and analysis plan {-}
+
+This report independently analyzes the extracted individual observations for three protein fractions:
+
+- Myofibrillar
+- Mitochondrial
+- Cytosolic
+
+For every fraction, it generates **Fraction New**, **Turnover**, and **Synthesis** figures for:
+
+1. Adult versus Old Control
+2. Old Control, Old Exercise, and Old Rapamycin, with two **pre-specified treatment contrasts**: Exercise versus Control and Rapamycin versus Control. No omnibus old-treatment effect and no Exercise-versus-Rapamycin comparison are tested.
+
+The nonlinear model is fitted independently in R to each fraction/group:
+
+\[
+Y(t)=Plateau\left(1-e^{-Kt}\right)
+\]
+
+with `Y0 = 0`, `0 <= Plateau <= 1`, `K > 0`, ordinary unweighted least squares, individual replicate observations, and the observations excluded in Prism omitted. `Plateau` is the Dynamic fraction, `1 - Plateau` is the Resistant fraction, and `K` is the synthesis rate constant.
+
+The Prism fit values are used **only for validation** and are not supplied to the R models. The Adult-versus-Old statistical result is also validated against the existing Prism reference. The old-treatment inference is intentionally updated from the previous Prism one-way ANOVA/Tukey workflow to the two planned contrasts used throughout the current treatment analyses, so those new treatment p-values are calculated directly in R rather than validated against the legacy Prism ANOVA/Tukey table.
+
+> **To run:** put `Turn_raw.csv`, `Turn_prism_fit.csv`, `Turn_prism_stats.csv` and the `R/` folder next to this file, then knit. Packages must be installed beforehand (checked in *Packages*). Figures are written to `TurnAll/` and previews are embedded in the report right after the chunk that creates them.
+
+# Packages {-}
+
+All packages must be installed beforehand (the script stops and lists any that are missing; it does not install anything). They are attached in the original order, which decides which functions mask which.
+
+```{r packages}
+pkgs <- c("ggplot2", "dplyr", "tidyr", "readr", "purrr", "tibble", "minpack.lm", "ragg",
+          "patchwork", "ggpattern", "svglite")
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Install missing packages first: ", paste(missing_pkgs, collapse = ", "), call. = FALSE)
+}
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+# Settings {-}
+
+```{r settings}
+helper_dir <- "R"   # folder holding nm_export_engine_Turnover.R
+
+raw_file <- "Turn_raw.csv"
+prism_fit_file <- "Turn_prism_fit.csv"
+prism_stats_file <- "Turn_prism_stats.csv"
+
+out_dir <- "TurnAll"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+fraction_levels <- c(
+  "Myofibrillar",
+  "Mitochondrial",
+  "Cytosolic"
+)
+
+fraction_codes <- c(
+  "Myofibrillar" = "Myo",
+  "Mitochondrial" = "Mito",
+  "Cytosolic" = "Cyto"
+)
+
+group_levels <- c(
+  "Adult",
+  "Adult Rapamycin",
+  "Old Control",
+  "Old Exercise",
+  "Old Rapamycin"
+)
+
+ao_groups <- c(
+  "Adult",
+  "Old Control"
+)
+
+old_groups <- c(
+  "Old Control",
+  "Old Exercise",
+  "Old Rapamycin"
+)
+
+# Planned old-treatment contrasts. These are the ONLY old-treatment inferential
+# comparisons in this report.
+old_contrasts <- tibble::tribble(
+  ~Contrast,               ~Group_1,       ~Group_2,
+  "Exercise vs Control",   "Old Control",  "Old Exercise",
+  "Rapamycin vs Control",  "Old Control",  "Old Rapamycin"
+)
+
+# The figures use the raw p values from the two pre-specified contrasts by
+# default, matching the contrast-centric treatment analyses elsewhere in the
+# manuscript. A Holm correction across the two contrasts within each
+# Fraction x Metric is also saved in the output table. Change this to
+# "P_adjusted" if you prefer the plotted brackets to show Holm-adjusted values.
+old_plot_p_column <- "P_value"
+stopifnot(old_plot_p_column %in% c("P_value", "P_adjusted"))
+
+group_labels <- c(
+  "Adult" = "Adult",
+  "Adult Rapamycin" = "Adult + Rapamycin",
+  "Old Control" = "Old",
+  "Old Exercise" = "Exercise",
+  "Old Rapamycin" = "Rapamycin"
+)
+
+old_axis_labels <- c(
+  "Old Control" = "Control",
+  "Old Exercise" = "Exercise",
+  "Old Rapamycin" = "Rapamycin"
+)
+
+group_cols <- c(
+  "Adult" = "#3B528B",
+  "Adult Rapamycin" = "#300060",
+  "Old Control" = "#59C761",
+  "Old Exercise" = "#F2D925",
+  "Old Rapamycin" = "#64106E"
+)
+
+group_shapes <- c(
+  "Adult" = 16,
+  "Adult Rapamycin" = 18,
+  "Old Control" = 17,
+  "Old Exercise" = 15,
+  "Old Rapamycin" = 18
+)
+
+darken_col <- function(col, factor = 0.75) {
+  rgb_mat <- grDevices::col2rgb(col) / 255
+  grDevices::rgb(
+    red = rgb_mat[1, ] * factor,
+    green = rgb_mat[2, ] * factor,
+    blue = rgb_mat[3, ] * factor
+  )
+}
+
+fill_alpha <- 0.50
+border_darkness <- 0.75
+
+group_fill_cols <- stats::setNames(
+  grDevices::adjustcolor(unname(group_cols), alpha.f = fill_alpha),
+  names(group_cols)
+)
+
+group_border_cols <- stats::setNames(
+  vapply(
+    unname(group_cols),
+    darken_col,
+    character(1),
+    factor = border_darkness
+  ),
+  names(group_cols)
+)
+
+stopifnot(
+  all(group_levels %in% names(group_fill_cols)),
+  all(group_levels %in% names(group_border_cols)),
+  !anyNA(group_fill_cols[group_levels]),
+  !anyNA(group_border_cols[group_levels])
+)
+```
+
+# Figure export settings {-}
+
+Change **only** `nm_dims` to resize figures (final dimensions in mm; PNG and SVG use the same size). `nm_style` sets fonts and line weights for the final physical panel size.
+
+```{r nm-figure-config}
+# ── Nature Metabolism design system ──────────────────────────────────────────
+# Typography and line weights are specified for the FINAL physical panel size.
+nm_style <- list(
+  font_family  = "Arial",
+  axis_title   = 7.0,
+  axis_text    = 6.5,
+  legend_title = 6.5,
+  legend_text  = 6.0,
+  stat_text    = 6.0,
+  small_text   = 5.7,
+  plot_title   = 8.0,
+  strip_text   = 7.0,
+  axis_line    = 0.18,  # mm ~0.51 pt
+  data_line    = 0.28,  # mm ~0.79 pt
+  bracket_line = 0.22,
+  point_small  = 0.95,
+  point_medium = 1.25
+)
+
+# ── EASY RESIZING: EDIT ONLY THIS BLOCK ──────────────────────────────────────
+# All values are final exported dimensions in millimetres. The individual-panel
+# sizes are based on the manuscript's current quantitative-panel footprints.
+# Both PNG and SVG exports use these exact same dimensions.
+nm_dims <- list(
+  ao_curve    = c(width = 72,  height = 50),
+  ao_turn     = c(width = 50,  height = 50),
+  ao_syn      = c(width = 50,  height = 50),
+  ao_row      = c(width = 176, height = 52),
+  ao_overview = c(width = 176, height = 162),
+
+  ot_curve    = c(width = 72,  height = 52),
+  ot_turn     = c(width = 52,  height = 55),
+  ot_syn      = c(width = 52,  height = 55),
+  ot_row      = c(width = 176, height = 58),
+  ot_overview = c(width = 176, height = 174)
+)
+```
+
+# Figure export functions {-}
+
+```{r nm-export-engine, echo=FALSE}
+engine_file <- file.path(helper_dir, "nm_export_engine_Turnover.R")
+if (!file.exists(engine_file)) {
+  stop("Cannot find the figure-export file '", engine_file, "' (working directory: ", getwd(),
+       "). Copy the 'R' folder from the zip next to this Rmd and the input CSVs, or set helper_dir.",
+       call. = FALSE)
+}
+source(engine_file, local = knitr::knit_global())
+```
+
+```{r nm-inline-figures, echo=FALSE}
+# Show every exported figure in the report, right after the chunk that creates it.
+# Previews are redrawn from the plot objects at screen resolution and embedded in the HTML;
+# the 600-dpi PNG/SVG files in the output folder are unchanged.
+inline_figures <- TRUE   # FALSE = write figure files only, do not embed previews
+inline_dpi     <- 110    # preview resolution (lower = smaller HTML)
+inline_zoom    <- 1.5    # on-screen scale relative to the physical panel size
+inline_registry <- new.env(parent = emptyenv())
+inline_queue    <- character(0)
+inline_dir      <- file.path(tempdir(), "inline_figures")
+dir.create(inline_dir, showWarnings = FALSE, recursive = TRUE)
+
+# save_nm_plot() is wrapped (not edited): it still writes exactly the same files, and
+# additionally records the plot so the hook below can preview it.
+save_nm_plot_original <- save_nm_plot
+save_nm_plot <- function(plot, file_stub, size_key, width_mm = NULL, height_mm = NULL, dpi = 600) {
+  res <- save_nm_plot_original(plot = plot, file_stub = file_stub, size_key = size_key,
+                               width_mm = width_mm, height_mm = height_mm, dpi = dpi)
+  dims <- nm_dims[[size_key]]
+  id <- basename(file_stub)
+  assign(id, list(plot = plot,
+                  width = if (is.null(width_mm)) unname(dims[["width"]]) else width_mm,
+                  height = if (is.null(height_mm)) unname(dims[["height"]]) else height_mm),
+         envir = inline_registry)
+  inline_queue <<- c(inline_queue, id)
+  invisible(res)
+}
+
+nm_inline_html <- function() {
+  ids <- unique(inline_queue)
+  inline_queue <<- character(0)
+  parts <- vapply(ids, function(id) {
+    tryCatch({
+      e <- get(id, envir = inline_registry, inherits = FALSE)
+      f <- file.path(inline_dir, paste0(id, ".png"))
+      ggplot2::ggsave(f, e$plot, width = e$width, height = e$height, units = "mm",
+                      dpi = inline_dpi, bg = "white", device = ragg::agg_png, limitsize = FALSE)
+      paste0("<div style='margin:8px 0 16px 0;'><div style='font-size:80%; font-family:monospace;'>", id,
+             "</div><img alt='", id, "' src='", knitr::image_uri(f),
+             "' style='width:", round(e$width * inline_zoom), "mm; max-width:100%;'/></div>")
+    }, error = function(err) {
+      paste0("<p><em>Preview not available for ", id, ": ", conditionMessage(err), "</em></p>")
+    })
+  }, character(1))
+  paste(parts, collapse = "\n")
+}
+
+knitr::knit_hooks$set(nm_inline = function(before, options, envir) {
+  if (before || !isTRUE(inline_figures)) return(NULL)
+  out <- tryCatch(nm_inline_html(), error = function(e) NULL)
+  if (is.null(out) || !nzchar(out)) NULL else paste0("\n\n", out, "\n\n")
+})
+knitr::opts_chunk$set(nm_inline = TRUE)
+```
+
+# Helper functions {-}
+
+```{r helpers}
+pt_to_geom <- function(pt) {
+  pt / 2.845276
+}
+
+format_p <- function(p, prefix = "p") {
+  if (!is.finite(p)) {
+    return(paste0(prefix, "=NA"))
+  }
+  if (p < 0.001) {
+    return(paste0(prefix, "<0.001"))
+  }
+  paste0(prefix, "=", sprintf("%.3f", p))
+}
+
+theme_nm <- function(
+  legend_position = "right",
+  plot_title = TRUE,
+  plot_subtitle = TRUE
+) {
+  ggplot2::theme_classic(
+    base_family = nm_style$font_family,
+    base_size = nm_style$axis_text
+  ) +
+    ggplot2::theme(
+      axis.title = ggplot2::element_text(
+        family = nm_style$font_family,
+        size = nm_style$axis_title,
+        colour = "black",
+        face = "plain"
+      ),
+      axis.text = ggplot2::element_text(
+        family = nm_style$font_family,
+        size = nm_style$axis_text,
+        colour = "black",
+        face = "plain"
+      ),
+      axis.line = ggplot2::element_line(
+        linewidth = nm_style$axis_line,
+        colour = "black"
+      ),
+      axis.ticks = ggplot2::element_line(
+        linewidth = nm_style$axis_line,
+        colour = "black"
+      ),
+      axis.ticks.length = grid::unit(1.0, "mm"),
+      legend.position = legend_position,
+      legend.title = ggplot2::element_text(
+        family = nm_style$font_family,
+        size = nm_style$legend_title,
+        face = "bold"
+      ),
+      legend.text = ggplot2::element_text(
+        family = nm_style$font_family,
+        size = nm_style$legend_text
+      ),
+      legend.key.height = grid::unit(3.0, "mm"),
+      legend.key.width = grid::unit(3.0, "mm"),
+      plot.title = if (plot_title) {
+        ggplot2::element_text(
+          family = nm_style$font_family,
+          size = nm_style$plot_title,
+          face = "bold",
+          hjust = 0,
+          margin = ggplot2::margin(b = 0.8, unit = "mm")
+        )
+      } else {
+        ggplot2::element_blank()
+      },
+      plot.subtitle = if (plot_subtitle) {
+        ggplot2::element_text(
+          family = nm_style$font_family,
+          size = nm_style$stat_text,
+          colour = "grey35",
+          margin = ggplot2::margin(b = 0.8, unit = "mm")
+        )
+      } else {
+        ggplot2::element_blank()
+      },
+      strip.background = ggplot2::element_rect(
+        fill = "white",
+        colour = "black",
+        linewidth = nm_style$axis_line
+      ),
+      strip.text = ggplot2::element_text(
+        family = nm_style$font_family,
+        size = nm_style$strip_text,
+        face = "bold",
+        colour = "black"
+      ),
+      plot.margin = ggplot2::margin(
+        1.8, 1.8, 1.8, 1.8,
+        unit = "mm"
+      )
+    )
+}
+```
+
+# Load and audit the extracted data
+
+```{r data}
+required_files <- c(raw_file, prism_fit_file, prism_stats_file)
+missing_files <- required_files[!file.exists(required_files)]
+
+if (length(missing_files) > 0) {
+  stop(
+    "Missing required input file(s): ",
+    paste(missing_files, collapse = ", "),
+    ". Keep the three CSV files in the same folder as this Rmd."
+  )
+}
+
+raw_all <- readr::read_csv(
+  raw_file,
+  show_col_types = FALSE,
+  col_types = cols(
+    Fraction = col_character(),
+    Time_days = col_double(),
+    Group = col_character(),
+    Group_Prism = col_character(),
+    Replicate = col_integer(),
+    Value = col_double(),
+    Prism_excluded = col_logical(),
+    Include_in_fit = col_logical(),
+    Source_sheet_uid = col_character(),
+    Source_dataset_uid = col_character()
+  )
+) %>%
+  mutate(
+    Fraction = factor(Fraction, levels = fraction_levels),
+    Group = factor(Group, levels = group_levels)
+  )
+
+stopifnot(
+  nrow(raw_all) == 279,
+  sum(raw_all$Prism_excluded) == 18,
+  all(raw_all$Include_in_fit == !raw_all$Prism_excluded),
+  all(is.finite(raw_all$Time_days)),
+  all(is.finite(raw_all$Value)),
+  !anyNA(raw_all$Fraction),
+  !anyNA(raw_all$Group)
+)
+
+raw_audit <- raw_all %>%
+  group_by(Fraction, Group) %>%
+  summarise(
+    Numeric_values = n(),
+    Included = sum(Include_in_fit),
+    Prism_excluded = sum(Prism_excluded),
+    .groups = "drop"
+  )
+
+excluded_points <- raw_all %>%
+  filter(Prism_excluded) %>%
+  select(Fraction, Time_days, Group, Replicate, Value)
+
+print(raw_audit, n = Inf)
+print(excluded_points, n = Inf)
+
+readr::write_csv(raw_audit, file.path(out_dir, "Raw_audit.csv"))
+readr::write_csv(excluded_points, file.path(out_dir, "Excluded.csv"))
+
+raw_fit <- raw_all %>%
+  filter(Include_in_fit) %>%
+  droplevels()
+```
+
+# Fit the one-phase association model in R
+
+```{r fits}
+fit_one_phase <- function(df) {
+  start_plateau <- min(max(df$Value, na.rm = TRUE) * 1.10, 0.95)
+  if (!is.finite(start_plateau) || start_plateau <= 0) {
+    start_plateau <- 0.8
+  }
+
+  minpack.lm::nlsLM(
+    Value ~ Plateau * (1 - exp(-K * Time_days)),
+    data = df,
+    start = list(Plateau = start_plateau, K = 0.03),
+    lower = c(Plateau = 0, K = 1e-10),
+    upper = c(Plateau = 1, K = Inf),
+    control = minpack.lm::nls.lm.control(
+      maxiter = 1000,
+      ftol = 1e-12,
+      ptol = 1e-12,
+      gtol = 1e-12
+    )
+  )
+}
+
+fit_table <- raw_fit %>%
+  group_by(Fraction, Group) %>%
+  tidyr::nest() %>%
+  ungroup() %>%
+  mutate(
+    Key = paste(as.character(Fraction), as.character(Group), sep = "||"),
+    Fit = purrr::map(data, fit_one_phase)
+  )
+
+fit_lookup <- stats::setNames(fit_table$Fit, fit_table$Key)
+
+extract_fit <- function(fit, fraction, group) {
+  co <- stats::coef(fit)
+  se <- sqrt(diag(stats::vcov(fit)))
+  fitted_values <- stats::fitted(fit)
+  residual_values <- stats::residuals(fit)
+  observed <- fitted_values + residual_values
+  rss <- sum(residual_values^2)
+  tss <- sum((observed - mean(observed))^2)
+
+  tibble(
+    Fraction = as.character(fraction),
+    Group = as.character(group),
+    N = length(observed),
+    Plateau = unname(co["Plateau"]),
+    Plateau_SE = unname(se["Plateau"]),
+    K = unname(co["K"]),
+    K_SE = unname(se["K"]),
+    Half_time_days = log(2) / unname(co["K"]),
+    R2 = 1 - rss / tss,
+    RSS = rss,
+    Dynamic = unname(co["Plateau"]),
+    Resistant = 1 - unname(co["Plateau"])
+  )
+}
+
+fit_results <- purrr::pmap_dfr(
+  list(fit_table$Fit, fit_table$Fraction, fit_table$Group),
+  extract_fit
+) %>%
+  mutate(
+    Fraction = factor(Fraction, levels = fraction_levels),
+    Group = factor(Group, levels = group_levels)
+  ) %>%
+  arrange(Fraction, Group)
+
+stopifnot(
+  nrow(fit_results) == length(fraction_levels) * length(group_levels),
+  all(fit_results$Plateau >= 0 & fit_results$Plateau <= 1),
+  all(fit_results$K > 0),
+  all(abs(fit_results$Dynamic + fit_results$Resistant - 1) < 1e-10)
+)
+
+print(fit_results, n = Inf)
+readr::write_csv(fit_results, file.path(out_dir, "Fit_summary.csv"))
+```
+
+# Validate the R fits against Prism
+
+```{r fit-validation}
+prism_fit <- readr::read_csv(prism_fit_file, show_col_types = FALSE)
+
+fit_validation <- fit_results %>%
+  mutate(
+    Fraction = as.character(Fraction),
+    Group = as.character(Group)
+  ) %>%
+  left_join(prism_fit, by = c("Fraction", "Group")) %>%
+  mutate(
+    N_difference = N - N_Prism,
+    Plateau_difference = Plateau - Plateau_Prism,
+    Plateau_SE_difference = Plateau_SE - Plateau_SE_Prism,
+    K_difference = K - K_Prism,
+    K_SE_difference = K_SE - K_SE_Prism,
+    R2_difference = R2 - R2_Prism,
+    At_upper_plateau_boundary =
+      Plateau_Prism >= 1 - 1e-8 &
+      Plateau >= 1 - 1e-8,
+    K_match =
+      abs(K_difference) < 5e-6 |
+      (At_upper_plateau_boundary & abs(K_difference) < 2e-5),
+    Fit_pass =
+      N_difference == 0 &
+      abs(Plateau_difference) < 5e-6 &
+      K_match &
+      abs(R2_difference) < 5e-6,
+    Fit_note = if_else(
+      At_upper_plateau_boundary,
+      "Plateau reached the imposed upper boundary; K may vary slightly by optimizer",
+      "Interior solution"
+    )
+  )
+
+print(
+  fit_validation %>%
+    select(
+      Fraction,
+      Group,
+      N_difference,
+      Plateau_difference,
+      K_difference,
+      R2_difference,
+      Fit_note,
+      Fit_pass
+    ),
+  n = Inf
+)
+
+stopifnot(all(fit_validation$Fit_pass))
+readr::write_csv(fit_validation, file.path(out_dir, "Fit_validation.csv"))
+```
+
+# Statistical comparisons from fitted parameter summaries
+
+The inferential strategy now mirrors the rest of the old-treatment analyses:
+
+- **Adult versus Old Control:** one two-sided unpaired Student t-test with equal variances.
+- **Old treatments:** two pre-specified treatment contrasts only:
+  1. Exercise versus Control
+  2. Rapamycin versus Control
+- There is **no omnibus treatment test** and no Exercise-versus-Rapamycin comparison.
+
+For each fitted parameter, `SD = SE * sqrt(n)` is used to reconstruct the summary variance. The two old-treatment contrast p-values are retained as raw planned-comparison p-values and are also Holm-adjusted within each Fraction × Metric for reference.
+
+```{r statistics}
+summary_pair_t_test <- function(
+  data,
+  fraction,
+  metric,
+  groups,
+  analysis_set,
+  contrast = NA_character_
+) {
+  se_name <- paste0(metric, "_SE")
+
+  d <- data %>%
+    filter(Fraction == fraction, Group %in% groups) %>%
+    mutate(Group = factor(as.character(Group), levels = groups)) %>%
+    arrange(Group)
+
+  stopifnot(nrow(d) == 2)
+
+  means <- d[[metric]]
+  ses <- d[[se_name]]
+  n <- d$N
+  sds <- ses * sqrt(n)
+  df <- sum(n) - 2
+  pooled_variance <- sum((n - 1) * sds^2) / df
+  se_difference <- sqrt(pooled_variance * sum(1 / n))
+  t_value <- (means[1] - means[2]) / se_difference
+  p_value <- 2 * stats::pt(-abs(t_value), df = df)
+
+  tibble(
+    Analysis_set = analysis_set,
+    Contrast = contrast,
+    Fraction = fraction,
+    Metric = metric,
+    Test = "Planned unpaired Student t test",
+    Group_1 = groups[1],
+    Group_2 = groups[2],
+    Mean_difference = means[1] - means[2],
+    SE_difference = se_difference,
+    Statistic = abs(t_value),
+    DF_numerator = NA_real_,
+    DF_denominator = df,
+    P_value = p_value,
+    P_adjusted = NA_real_
+  )
+}
+
+ao_tests <- tidyr::crossing(
+  Fraction = fraction_levels,
+  Metric = c("Plateau", "K")
+) %>%
+  purrr::pmap_dfr(
+    function(Fraction, Metric) {
+      summary_pair_t_test(
+        data = fit_results,
+        fraction = Fraction,
+        metric = Metric,
+        groups = ao_groups,
+        analysis_set = "Adult vs Old",
+        contrast = "Old vs Adult"
+      )
+    }
+  )
+
+old_tests <- tidyr::crossing(
+  Fraction = fraction_levels,
+  Metric = c("Plateau", "K")
+) %>%
+  purrr::pmap_dfr(
+    function(Fraction, Metric) {
+      purrr::pmap_dfr(
+        old_contrasts,
+        function(Contrast, Group_1, Group_2) {
+          summary_pair_t_test(
+            data = fit_results,
+            fraction = Fraction,
+            metric = Metric,
+            groups = c(Group_1, Group_2),
+            analysis_set = "Old planned contrasts",
+            contrast = Contrast
+          )
+        }
+      )
+    }
+  ) %>%
+  group_by(Fraction, Metric) %>%
+  mutate(
+    P_adjusted = stats::p.adjust(P_value, method = "holm")
+  ) %>%
+  ungroup()
+
+print(ao_tests, n = Inf)
+print(old_tests, n = Inf)
+
+readr::write_csv(ao_tests, file.path(out_dir, "AO_tests.csv"))
+readr::write_csv(old_tests, file.path(out_dir, "Old_planned_tests.csv"))
+```
+
+# Validate the Adult-versus-Old statistic against Prism
+
+The existing Prism statistics file used an omnibus one-way ANOVA with Tukey comparisons for the old-treatment analysis. Because the current manuscript strategy intentionally replaces that workflow with two pre-specified treatment-versus-control contrasts, the legacy old-treatment Prism statistics are **not** used to validate the new treatment p-values. The Adult-versus-Old Plateau test is still validated against Prism.
+
+```{r statistics-validation}
+prism_stats <- readr::read_csv(prism_stats_file, show_col_types = FALSE)
+
+ao_stats_validation <- ao_tests %>%
+  filter(Metric == "Plateau") %>%
+  select(
+    Analysis_set,
+    Fraction,
+    Metric,
+    Group_1,
+    Group_2,
+    Statistic_R = Statistic,
+    DF_R = DF_denominator,
+    P_R = P_value
+  ) %>%
+  left_join(
+    prism_stats %>%
+      filter(Analysis_set == "Adult vs Old") %>%
+      select(
+        Analysis_set,
+        Fraction,
+        Metric,
+        Group_1,
+        Group_2,
+        Statistic_Prism = Statistic,
+        DF_Prism = DF_denominator,
+        P_Prism = P_value
+      ),
+    by = c(
+      "Analysis_set",
+      "Fraction",
+      "Metric",
+      "Group_1",
+      "Group_2"
+    )
+  ) %>%
+  mutate(
+    Statistic_difference = Statistic_R - Statistic_Prism,
+    DF_difference = DF_R - DF_Prism,
+    P_difference = P_R - P_Prism,
+    Stats_pass =
+      abs(DF_difference) < 1e-8 &
+      abs(Statistic_difference) < 5e-4 &
+      abs(P_difference) < 5e-4
+  )
+
+print(ao_stats_validation, n = Inf)
+stopifnot(all(ao_stats_validation$Stats_pass))
+
+readr::write_csv(
+  ao_stats_validation,
+  file.path(out_dir, "AO_stats_validation.csv")
+)
+
+old_validation_note <- tibble::tibble(
+  Analysis = "Old treatments",
+  Current_strategy = "Planned Exercise vs Control and Rapamycin vs Control contrasts",
+  Legacy_Prism_strategy = "Ordinary one-way ANOVA plus Tukey all-pair comparisons",
+  Validation = "Not directly comparable by design"
+)
+
+print(old_validation_note)
+readr::write_csv(
+  old_validation_note,
+  file.path(out_dir, "Old_stats_validation_note.csv")
+)
+```
+
+# Plotting functions
+
+All turnover plots use explicit segment coordinates:
+
+- Resistant is always on the bottom, from 0 to `100 * (1 - Plateau)`.
+- Dynamic is always on top, from the Resistant boundary to 100%.
+- Dynamic uses the transparent group fill.
+- Resistant stays white with the group-colored border and stripe pattern.
+
+Old-treatment bar plots show only the two pre-specified treatment-versus-control comparisons: Exercise versus Control and Rapamycin versus Control. No omnibus treatment p-value and no Exercise-versus-Rapamycin bracket are displayed.
+
+```{r plotting-functions}
+make_curve_plot <- function(fraction, groups, set_code) {
+  d <- raw_fit %>%
+    filter(Fraction == fraction, Group %in% groups) %>%
+    mutate(Group = factor(as.character(Group), levels = groups))
+
+  time_summary <- d %>%
+    group_by(Group, Time_days) %>%
+    summarise(
+      Mean = mean(Value),
+      SD = stats::sd(Value),
+      N = n(),
+      SEM = if_else(N > 1 & is.finite(SD), SD / sqrt(N), NA_real_),
+      .groups = "drop"
+    )
+
+  curve_grid <- purrr::map_dfr(groups, function(group_name) {
+    new_data <- tibble(Time_days = seq(0, 60, length.out = 500))
+    key <- paste(fraction, group_name, sep = "||")
+    tibble(
+      Group = factor(group_name, levels = groups),
+      Time_days = new_data$Time_days,
+      Fitted = as.numeric(
+        stats::predict(fit_lookup[[key]], newdata = new_data)
+      )
+    )
+  })
+
+  plot_labels <- if (set_code == "AO") {
+    unname(group_labels[groups])
+  } else {
+    unname(old_axis_labels[groups])
+  }
+
+  ggplot() +
+    geom_line(
+      data = curve_grid,
+      aes(x = Time_days, y = Fitted, colour = Group),
+      linewidth = nm_style$data_line
+    ) +
+    geom_errorbar(
+      data = time_summary,
+      aes(
+        x = Time_days,
+        ymin = Mean - SEM,
+        ymax = Mean + SEM,
+        colour = Group
+      ),
+      width = 0.8,
+      linewidth = nm_style$data_line,
+      na.rm = TRUE
+    ) +
+    geom_point(
+      data = time_summary,
+      aes(x = Time_days, y = Mean, colour = Group, shape = Group),
+      size = nm_style$point_medium
+    ) +
+    scale_colour_manual(
+      values = group_cols[groups],
+      breaks = groups,
+      labels = plot_labels
+    ) +
+    scale_shape_manual(
+      values = group_shapes[groups],
+      breaks = groups,
+      labels = plot_labels
+    ) +
+    scale_x_continuous(
+      breaks = c(0, 4, 8, 15, 30, 45, 60),
+      limits = c(0, 61.5),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    scale_y_continuous(
+      breaks = seq(0, 1, by = 0.2),
+      limits = c(0, 1),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    labs(
+      title = paste(fraction, "Fraction New"),
+      x = "Time (Days)",
+      y = "Fraction New",
+      colour = NULL,
+      shape = NULL
+    ) +
+    theme_nm() +
+    theme(
+      legend.position = c(0.18, 0.79),
+      legend.background = element_blank()
+    )
+}
+
+make_planned_brackets <- function(groups, statistics, y_start, y_step, tip_size) {
+  pair_order <- c(
+    "Old Control||Old Exercise",
+    "Old Control||Old Rapamycin"
+  )
+
+  statistics %>%
+    mutate(
+      Pair = paste(Group_1, Group_2, sep = "||"),
+      Pair = factor(Pair, levels = pair_order),
+      x1 = match(Group_1, groups),
+      x2 = match(Group_2, groups),
+      Plot_p = .data[[old_plot_p_column]]
+    ) %>%
+    filter(!is.na(Pair)) %>%
+    arrange(Pair) %>%
+    mutate(
+      y = y_start + (row_number() - 1) * y_step,
+      y_tip = y - tip_size,
+      y_text = y + 0.32 * y_step,
+      Label = vapply(
+        Plot_p,
+        format_p,
+        character(1),
+        prefix = if (old_plot_p_column == "P_adjusted") "p_Holm" else "p"
+      )
+    )
+}
+
+add_bracket_layers <- function(plot, brackets, text_size = pt_to_geom(nm_style$stat_text)) {
+  plot +
+    geom_segment(
+      data = brackets,
+      aes(x = x1, xend = x2, y = y, yend = y),
+      inherit.aes = FALSE,
+      linewidth = nm_style$bracket_line
+    ) +
+    geom_segment(
+      data = brackets,
+      aes(x = x1, xend = x1, y = y_tip, yend = y),
+      inherit.aes = FALSE,
+      linewidth = nm_style$bracket_line
+    ) +
+    geom_segment(
+      data = brackets,
+      aes(x = x2, xend = x2, y = y_tip, yend = y),
+      inherit.aes = FALSE,
+      linewidth = nm_style$bracket_line
+    ) +
+    geom_text(
+      data = brackets,
+      aes(x = (x1 + x2) / 2, y = y_text, label = Label),
+      inherit.aes = FALSE,
+      size = text_size
+    )
+}
+
+make_pool_legend_data <- function() {
+  tibble(
+    xmin = c(NA_real_, NA_real_),
+    xmax = c(NA_real_, NA_real_),
+    ymin = c(NA_real_, NA_real_),
+    ymax = c(NA_real_, NA_real_),
+    Pool = factor(
+      c("Dynamic", "Resistant"),
+      levels = c("Dynamic", "Resistant")
+    )
+  )
+}
+
+add_pool_legend_scale <- function(plot) {
+  plot +
+    ggpattern::scale_pattern_manual(
+      values = c("Dynamic" = "none", "Resistant" = "stripe"),
+      limits = c("Dynamic", "Resistant"),
+      breaks = c("Dynamic", "Resistant"),
+      name = NULL,
+      guide = guide_legend(
+        byrow = TRUE,
+        ncol = 1,
+        override.aes = list(
+          fill = c("#77777780", "white"),
+          colour = c("#333333", "#333333"),
+          pattern = c("none", "stripe"),
+          pattern_colour = c("#333333", "#333333"),
+          pattern_fill = c("#333333", "#333333")
+        )
+      )
+    )
+}
+
+make_turnover_plot <- function(fraction, groups, set_code) {
+  display <- fit_results %>%
+    filter(Fraction == fraction, Group %in% groups) %>%
+    mutate(
+      Group = factor(as.character(Group), levels = groups),
+      x = match(as.character(Group), groups),
+      Resistant_pct = 100 * Resistant,
+      Dynamic_pct = 100 * Dynamic,
+      Plateau_SE_pct = 100 * Plateau_SE,
+      fill_col = unname(group_fill_cols[as.character(Group)]),
+      border_col = unname(group_border_cols[as.character(Group)])
+    ) %>%
+    arrange(x)
+
+  stopifnot(
+    nrow(display) == length(groups),
+    !anyNA(display),
+    all(display$Resistant_pct >= 0),
+    all(display$Dynamic_pct >= 0),
+    all(abs(display$Resistant_pct + display$Dynamic_pct - 100) < 1e-8)
+  )
+
+  error_data <- display %>%
+    transmute(
+      x,
+      border_col,
+      ymin = 100 - Plateau_SE_pct,
+      ymax = 100 + Plateau_SE_pct
+    )
+
+  legend_data <- make_pool_legend_data()
+
+  plot <- ggplot() +
+    ggpattern::geom_rect_pattern(
+      data = display,
+      aes(
+        xmin = x - 0.31,
+        xmax = x + 0.31,
+        ymin = 0,
+        ymax = Resistant_pct,
+        colour = border_col,
+        pattern_colour = border_col,
+        pattern_fill = border_col
+      ),
+      inherit.aes = FALSE,
+      fill = "white",
+      pattern = "stripe",
+      pattern_angle = 45,
+      pattern_density = 0.20,
+      pattern_spacing = 0.035,
+      pattern_linewidth = 0.12,
+      linewidth = nm_style$data_line,
+      show.legend = FALSE
+    ) +
+    geom_rect(
+      data = display,
+      aes(
+        xmin = x - 0.31,
+        xmax = x + 0.31,
+        ymin = Resistant_pct,
+        ymax = 100,
+        fill = fill_col,
+        colour = border_col
+      ),
+      inherit.aes = FALSE,
+      linewidth = nm_style$data_line,
+      show.legend = FALSE
+    ) +
+    geom_errorbar(
+      data = error_data,
+      aes(x = x, ymin = ymin, ymax = ymax, colour = border_col),
+      inherit.aes = FALSE,
+      width = 0.20,
+      linewidth = nm_style$data_line,
+      show.legend = FALSE
+    ) +
+    ggpattern::geom_rect_pattern(
+      data = legend_data,
+      aes(
+        xmin = xmin,
+        xmax = xmax,
+        ymin = ymin,
+        ymax = ymax,
+        pattern = Pool
+      ),
+      inherit.aes = FALSE,
+      fill = "white",
+      colour = "#333333",
+      pattern_fill = "#333333",
+      pattern_colour = "#333333",
+      pattern_angle = 45,
+      pattern_density = 0.20,
+      pattern_spacing = 0.035,
+      pattern_linewidth = 0.12,
+      linewidth = nm_style$data_line,
+      show.legend = TRUE,
+      na.rm = TRUE
+    ) +
+    scale_fill_identity(guide = "none") +
+    scale_colour_identity(guide = "none") +
+    ggpattern::scale_pattern_colour_identity(guide = "none") +
+    ggpattern::scale_pattern_fill_identity(guide = "none")
+
+  if (set_code == "AO") {
+    stat_row <- ao_tests %>%
+      filter(Fraction == fraction, Metric == "Plateau")
+    bracket_y <- max(112, max(error_data$ymax) + 7)
+    brackets <- tibble(
+      x1 = 1,
+      x2 = 2,
+      y = bracket_y,
+      y_tip = bracket_y - 3,
+      y_text = bracket_y + 4,
+      Label = format_p(stat_row$P_value)
+    )
+    y_max <- brackets$y_text + 4
+    axis_labels <- unname(group_labels[groups])
+    plot <- add_bracket_layers(plot, brackets)
+  } else {
+    stat_rows <- old_tests %>%
+      filter(Fraction == fraction, Metric == "Plateau")
+    bracket_start <- max(112, max(error_data$ymax) + 7)
+    brackets <- make_planned_brackets(
+      groups,
+      stat_rows,
+      y_start = bracket_start,
+      y_step = 8.0,
+      tip_size = 2.7
+    )
+    y_max <- max(brackets$y_text) + 5
+    axis_labels <- unname(old_axis_labels[groups])
+    plot <- add_bracket_layers(plot, brackets)
+  }
+
+  plot <- plot +
+    scale_x_continuous(
+      breaks = seq_along(groups),
+      labels = axis_labels,
+      limits = c(0.4, length(groups) + 0.7),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    scale_y_continuous(
+      breaks = seq(0, 100, by = 20),
+      limits = c(0, y_max),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    labs(
+      title = paste(fraction, "Turnover"),
+      x = NULL,
+      y = "Turnover (%)"
+    ) +
+    theme_nm() +
+    theme(
+      axis.text.x = element_text(angle = 35, hjust = 1),
+      legend.position = "right",
+      legend.spacing.y = grid::unit(1.0, "mm"),
+      legend.key.height = grid::unit(3.0, "mm"),
+      legend.key.width = grid::unit(3.0, "mm"),
+      legend.text = element_text(size = nm_style$legend_text)
+    )
+
+  if (utils::packageVersion("ggplot2") >= "3.5.0") {
+    plot <- plot + theme(legend.key.spacing.y = grid::unit(1.0, "mm"))
+  }
+
+  add_pool_legend_scale(plot)
+}
+
+make_synthesis_plot <- function(fraction, groups, set_code) {
+  display <- fit_results %>%
+    filter(Fraction == fraction, Group %in% groups) %>%
+    mutate(
+      Group = factor(as.character(Group), levels = groups),
+      x = match(as.character(Group), groups),
+      fill_col = unname(group_fill_cols[as.character(Group)]),
+      border_col = unname(group_border_cols[as.character(Group)])
+    ) %>%
+    arrange(x)
+
+  stopifnot(nrow(display) == length(groups), !anyNA(display), all(display$K > 0))
+
+  data_top <- max(display$K + display$K_SE)
+  plot <- ggplot(display, aes(x = x, y = K)) +
+    geom_col(
+      aes(fill = fill_col, colour = border_col),
+      width = 0.62,
+      linewidth = nm_style$data_line
+    ) +
+    geom_errorbar(
+      aes(ymin = K - K_SE, ymax = K + K_SE, colour = border_col),
+      width = 0.20,
+      linewidth = nm_style$data_line
+    ) +
+    scale_fill_identity(guide = "none") +
+    scale_colour_identity(guide = "none")
+
+  if (set_code == "AO") {
+    stat_row <- ao_tests %>%
+      filter(Fraction == fraction, Metric == "K")
+    bracket_y <- data_top * 1.12
+    step <- data_top * 0.10
+    brackets <- tibble(
+      x1 = 1,
+      x2 = 2,
+      y = bracket_y,
+      y_tip = bracket_y - step * 0.30,
+      y_text = bracket_y + step * 0.40,
+      Label = format_p(stat_row$P_value)
+    )
+    y_max <- brackets$y_text + step * 0.55
+    axis_labels <- unname(group_labels[groups])
+    plot <- add_bracket_layers(plot, brackets)
+  } else {
+    stat_rows <- old_tests %>%
+      filter(Fraction == fraction, Metric == "K")
+    step <- data_top * 0.18
+    brackets <- make_planned_brackets(
+      groups,
+      stat_rows,
+      y_start = data_top * 1.10,
+      y_step = step,
+      tip_size = step * 0.32
+    )
+    y_max <- max(brackets$y_text) + step * 0.55
+    axis_labels <- unname(old_axis_labels[groups])
+    plot <- add_bracket_layers(plot, brackets)
+  }
+
+  plot +
+    scale_x_continuous(
+      breaks = seq_along(groups),
+      labels = axis_labels,
+      limits = c(0.4, length(groups) + 0.4),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    scale_y_continuous(
+      limits = c(0, y_max),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    labs(
+      title = paste(fraction, "Synthesis"),
+      x = NULL,
+      y = expression(k~"(1/day)")
+    ) +
+    theme_nm() +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1))
+}
+```
+
+# Generate Adult-versus-Old figures
+
+All dimensions below come from `nm_dims`. To resize any output, edit the corresponding entry in the **EASY RESIZING** block (chunk `nm-figure-config`) and rerun this section.
+
+```{r adult-old-figures, fig.keep="none"}
+plot_bank <- list()
+
+for (fraction in fraction_levels) {
+  code <- unname(fraction_codes[fraction])
+  p_curve <- make_curve_plot(fraction, ao_groups, "AO")
+  p_turn <- make_turnover_plot(fraction, ao_groups, "AO")
+  p_syn <- make_synthesis_plot(fraction, ao_groups, "AO")
+
+  save_nm_plot(
+    p_curve,
+    file.path(out_dir, paste0("AO_", code, "_Frac")),
+    size_key = "ao_curve"
+  )
+  save_nm_plot(
+    p_turn,
+    file.path(out_dir, paste0("AO_", code, "_Turn")),
+    size_key = "ao_turn"
+  )
+  save_nm_plot(
+    p_syn,
+    file.path(out_dir, paste0("AO_", code, "_Syn")),
+    size_key = "ao_syn"
+  )
+
+  row_plot <- p_curve + p_turn + p_syn +
+    patchwork::plot_layout(widths = c(1.50, 1.0, 1.0), guides = "collect") &
+    theme(legend.position = "right")
+
+  save_nm_plot(
+    row_plot,
+    file.path(out_dir, paste0("AO_", code, "_All")),
+    size_key = "ao_row"
+  )
+
+  plot_bank[[paste("AO", fraction, sep = "||")]] <- row_plot
+}
+
+ao_overview <- patchwork::wrap_plots(
+  purrr::map(
+    fraction_levels,
+    ~ plot_bank[[paste("AO", .x, sep = "||")]]
+  ),
+  ncol = 1,
+  guides = "collect"
+) & theme(legend.position = "right")
+
+save_nm_plot(
+  ao_overview,
+  file.path(out_dir, "AO_All"),
+  size_key = "ao_overview"
+)
+```
+
+# Generate Old-treatment figures
+
+The old-treatment plots contain **only Exercise vs Control and Rapamycin vs Control brackets**. There is no omnibus ANOVA annotation and no Exercise-vs-Rapamycin bracket.
+
+```{r old-treatment-figures, fig.keep="none"}
+for (fraction in fraction_levels) {
+  code <- unname(fraction_codes[fraction])
+  p_curve <- make_curve_plot(fraction, old_groups, "OT")
+  p_turn <- make_turnover_plot(fraction, old_groups, "OT")
+  p_syn <- make_synthesis_plot(fraction, old_groups, "OT")
+
+  save_nm_plot(
+    p_curve,
+    file.path(out_dir, paste0("OT_", code, "_Frac")),
+    size_key = "ot_curve"
+  )
+  save_nm_plot(
+    p_turn,
+    file.path(out_dir, paste0("OT_", code, "_Turn")),
+    size_key = "ot_turn"
+  )
+  save_nm_plot(
+    p_syn,
+    file.path(out_dir, paste0("OT_", code, "_Syn")),
+    size_key = "ot_syn"
+  )
+
+  row_plot <- p_curve + p_turn + p_syn +
+    patchwork::plot_layout(widths = c(1.42, 1.0, 1.0), guides = "collect") &
+    theme(legend.position = "right")
+
+  save_nm_plot(
+    row_plot,
+    file.path(out_dir, paste0("OT_", code, "_All")),
+    size_key = "ot_row"
+  )
+
+  plot_bank[[paste("OT", fraction, sep = "||")]] <- row_plot
+}
+
+old_overview <- patchwork::wrap_plots(
+  purrr::map(
+    fraction_levels,
+    ~ plot_bank[[paste("OT", .x, sep = "||")]]
+  ),
+  ncol = 1,
+  guides = "collect"
+) & theme(legend.position = "right")
+
+save_nm_plot(
+  old_overview,
+  file.path(out_dir, "OT_All"),
+  size_key = "ot_overview"
+)
+```
+
+# Verify plotted geometry and saved outputs
+
+```{r plot-validation}
+expected_stubs <- c(
+  unlist(lapply(c("AO", "OT"), function(set_code) {
+    unlist(lapply(unname(fraction_codes), function(code) {
+      file.path(
+        out_dir,
+        paste0(
+          set_code,
+          "_",
+          code,
+          "_",
+          c("Frac", "Turn", "Syn", "All")
+        )
+      )
+    }))
+  })),
+  file.path(out_dir, c("AO_All", "OT_All"))
+)
+
+expected_pngs <- paste0(expected_stubs, ".png")
+expected_svgs <- paste0(expected_stubs, ".svg")
+
+stopifnot(
+  length(expected_pngs) == 26,
+  length(expected_svgs) == 26,
+  all(file.exists(expected_pngs)),
+  all(file.info(expected_pngs)$size > 1000),
+  all(file.exists(expected_svgs)),
+  all(file.info(expected_svgs)$size > 1000)
+)
+
+# Inspect the actual built coordinates for every turnover panel.
+turnover_geometry <- purrr::map_dfr(
+  list(
+    AO = ao_groups,
+    OT = old_groups
+  ),
+  function(groups) {
+    purrr::map_dfr(fraction_levels, function(fraction) {
+      p <- make_turnover_plot(
+        fraction,
+        groups,
+        if (length(groups) == 2) "AO" else "OT"
+      )
+      built <- ggplot2::ggplot_build(p)$data
+      resistant_layer <- built[[1]]
+      dynamic_layer <- built[[2]]
+
+      stopifnot(
+        all(resistant_layer$ymin == 0),
+        all(dynamic_layer$ymin == resistant_layer$ymax),
+        all(dynamic_layer$ymax == 100),
+        all(resistant_layer$fill == "white"),
+        all(resistant_layer$pattern == "stripe"),
+        identical(resistant_layer$pattern_fill, resistant_layer$colour),
+        identical(resistant_layer$pattern_colour, resistant_layer$colour),
+        !anyNA(dynamic_layer$fill),
+        all(grDevices::col2rgb(dynamic_layer$fill, alpha = TRUE)[4, ] == 128),
+        all(grDevices::col2rgb(dynamic_layer$colour, alpha = TRUE)[4, ] == 255)
+      )
+
+      tibble(
+        Fraction = fraction,
+        Group_index = seq_len(nrow(dynamic_layer)),
+        Resistant_bottom = resistant_layer$ymin,
+        Resistant_top = resistant_layer$ymax,
+        Dynamic_bottom = dynamic_layer$ymin,
+        Dynamic_top = dynamic_layer$ymax,
+        Dynamic_fill = dynamic_layer$fill,
+        Border = dynamic_layer$colour
+      )
+    })
+  },
+  .id = "Analysis_set"
+)
+
+readr::write_csv(
+  turnover_geometry,
+  file.path(out_dir, "Plot_validation.csv")
+)
+
+cat(
+  "PASS: all 26 PNGs and all 26 editable SVGs exist; turnover geometry is valid; old-treatment plots use only the two planned treatment-versus-control contrasts.\n"
+)
+```
+
+# Compact results
+
+```{r summary}
+fit_results %>%
+  filter(Group %in% unique(c(ao_groups, old_groups))) %>%
+  transmute(
+    Fraction,
+    Group,
+    N,
+    `Dynamic (%)` = 100 * Dynamic,
+    `Resistant (%)` = 100 * Resistant,
+    `K (1/day)` = K,
+    `Half-time (days)` = Half_time_days,
+    R2
+  ) %>%
+  print(n = Inf)
+
+ao_tests %>%
+  select(Fraction, Metric, P_value) %>%
+  print(n = Inf)
+
+old_tests %>%
+  select(
+    Fraction,
+    Metric,
+    Contrast,
+    Group_1,
+    Group_2,
+    P_value,
+    P_adjusted
+  ) %>%
+  print(n = Inf)
+```
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
