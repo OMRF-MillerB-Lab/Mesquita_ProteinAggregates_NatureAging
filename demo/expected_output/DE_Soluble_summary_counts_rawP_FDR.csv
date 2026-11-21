@@ -1,0 +1,21 @@
+"Contrast","SigClass","Direction","n"
+"Age × Sex interaction","FDR <= 0.05","Up",3
+"Age × Sex interaction","NS","Down",169
+"Age × Sex interaction","NS","No change",1
+"Age × Sex interaction","NS","Up",276
+"Age × Sex interaction","Raw p <= 0.05","Down",3
+"Age × Sex interaction","Raw p <= 0.05","Up",25
+"Age: Old vs Adult","FDR <= 0.05","Down",20
+"Age: Old vs Adult","FDR <= 0.05","Up",9
+"Age: Old vs Adult","NS","Down",237
+"Age: Old vs Adult","NS","No change",1
+"Age: Old vs Adult","NS","Up",138
+"Age: Old vs Adult","Raw p <= 0.05","Down",55
+"Age: Old vs Adult","Raw p <= 0.05","Up",17
+"Sex: Male vs Female","FDR <= 0.05","Down",8
+"Sex: Male vs Female","FDR <= 0.05","Up",125
+"Sex: Male vs Female","NS","Down",29
+"Sex: Male vs Female","NS","No change",1
+"Sex: Male vs Female","NS","Up",207
+"Sex: Male vs Female","Raw p <= 0.05","Down",3
+"Sex: Male vs Female","Raw p <= 0.05","Up",104
