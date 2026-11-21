@@ -1,0 +1,645 @@
+---
+title: "AT680 amyloid-like aggregate quantification | manuscript-style boxplots"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+params:
+  input_xlsx: "AT680fulldetailedanalysis_clean.xlsx"
+  output_dir: "AT680_Figures"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      error = FALSE, fig.align = "center")
+```
+
+# Overview and statistical unit {-}
+
+This standalone report recreates **six aggregate-quantification endpoints** in the accompanying
+PowerPoint, with manuscript-ready **individual figures**, a **five-panel figure**
+corresponding to the earlier multi-panel slide, and an optional **six-panel summary**.
+
+* **Colored translucent boxplots** = descriptive image-level distributions within each age group. Boxes span the 25th–75th percentiles; the horizontal line is the **image-level median**; whiskers extend to the furthest image within 1.5 × IQR. A short horizontal cap marks each whisker end.
+* **Small translucent points** = individual 3D microscopy images (nested within mice).
+* **Large, black-outlined points** = pooled **mouse-level estimates** (biological units).
+* **Significance line and stars** = two-sided **unpaired Student's t-test** on the six biological replicates (three mice per group), assuming equal variance (`var.equal = TRUE`). Individual images are visualized and summarize descriptive distributions but **never** counted as independent replicates in the statistical test. For exact P values, consult the QC CSV; use `nm_style$stat_label_mode <- "pvalue"` before rebuilding the figures to show numeric P values instead.
+* The descriptive image-level boxplots are intentionally not interpreted as biological replicate confidence intervals. The separate QC table retains mouse-level group means and 95% CIs.
+
+The numerator and denominator are **pooled within each mouse** before calculating
+burden and density, matching the estimators underlying the original slides. For
+shape metrics, per-image means are weighted by the number of objects segmented in
+each image (the original per-object measurements are not part of the workbook).
+Zero-object images are valid zeros for **aggregate density and total-volume burden**,
+but are omitted from **single-object volume and morphology** distributions.
+
+> **PowerPoint caveat:** the manuscript slide (slide 1) contains a large embedded EMF
+> picture that does not render reliably outside PowerPoint. The reproducible
+> endpoint definitions and plotting geometry here have been verified against the
+> fully viewable slides 2 and 3. Check the exact assembly of slide 1 in PowerPoint.
+
+> **To run:** put `AT680fulldetailedanalysis_clean.xlsx` (or set `params$input_xlsx`) and the `R/` folder next to this file, then knit. Packages are checked in the *Packages and source data* section and must be installed beforehand. Figures are written to `AT680_Figures/` and previews are embedded in the report right after the chunk that creates each figure.
+
+# Settings {-}
+
+```{r settings}
+helper_dir <- "R"   # folder holding nm_export_engine_AT680.R
+
+out_dir <- params$output_dir
+for (sub in c("Count", "Volume", "Morphology", "Combined", "Legends", "QC")) {
+  dir.create(file.path(out_dir, sub), recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# Figure export settings (presentation only) {-}
+
+Change **only** the dimensions in `nm_dims_by_class` to resize existing figures. Every registered plot exports to **PNG (600 dpi)** and **SVG (editable)** in its analysis folder. After running the plotting chunk, use `list_panels()`, `set_panel_size("AT_Count", 65, 68)`, `reexport("AT_Count")`, `reexport_family("single")` or `export_all_panels()`.
+
+```{r nm-figure-config}
+nm_style <- list(
+  font_family = "sans",   # same sans/Arial-compatible family as the other Rmds
+  axis_title = 7.0,
+  axis_text  = 6.5,
+  stat_text  = 6.0,
+  plot_title = 8.0,
+  legend_title = 6.5,
+  legend_text = 6.0,
+  axis_line = 0.20,
+  data_line = 0.40,
+  image_size = 1.10,
+  mouse_size = 2.55,
+  box_width = 0.48,
+  box_alpha = 0.28,
+  stat_label_mode = "pvalue"  # "stars" (significant only), "pvalue" (all) or "none"
+)
+
+nm_export <- list(dpi = 600, background = "white")
+
+# Age palette from the previous Adult vs Old aggregation-propensity markdowns.
+age_cols <- c("Adult" = "#3B528B", "Old" = "#5DC863")
+# Age-specific shades: light -> dark for the 3 mice in each group.
+mouse_cols <- c(
+  "M42" = "#ADD4E3", "M47" = "#649FCE", "M48" = "#3B528B",
+  "M50" = "#AFDDB3", "M52" = "#59C761", "M56" = "#2A8C52"
+)
+mouse_order <- c("M42", "M47", "M48", "M50", "M52", "M56")
+
+# Physical sizes in millimeters; the exact basename of every PNG/SVG is its ID.
+nm_dims_by_class <- list(
+  Count = list(
+    AT_Count = c(width = 40, height = 60)
+  ),
+  Volume = list(
+    AT_Burden = c(width = 40, height = 60),
+    AT_MeanVolume = c(width = 40, height = 60)
+  ),
+  Morphology = list(
+    AT_Sphericity = c(width = 40, height = 60),
+    AT_Oblate = c(width = 40, height = 60),
+    AT_Prolate = c(width = 40, height = 60)
+  ),
+  Combined = list(
+    AT_Main5 = c(width = 172, height = 116),
+    AT_Main6 = c(width = 172, height = 116)
+  ),
+  Legends = list(
+    AT_MouseLegend = c(width = 64, height = 33)
+  )
+)
+
+nm_dims <- do.call(c, unname(nm_dims_by_class))
+stopifnot(!anyDuplicated(names(nm_dims)))
+
+figure_families <- c(
+  AT_Count = "single", AT_Burden = "single", AT_MeanVolume = "single",
+  AT_Sphericity = "single", AT_Oblate = "single", AT_Prolate = "single",
+  AT_Main5 = "combined", AT_Main6 = "combined", AT_MouseLegend = "legend"
+)
+```
+
+# Figure export functions {-}
+
+```{r nm-export-engine, echo=FALSE}
+engine_file <- file.path(helper_dir, "nm_export_engine_AT680.R")
+if (!file.exists(engine_file)) {
+  stop("Cannot find the figure-export file '", engine_file, "' (working directory: ", getwd(),
+       "). Copy the 'R' folder from the zip next to this Rmd and the input CSVs, or set helper_dir.",
+       call. = FALSE)
+}
+source(engine_file, local = knitr::knit_global())
+```
+
+```{r nm-inline-figures, echo=FALSE}
+# Show every exported figure in the report, right after the chunk that creates it.
+# Previews are redrawn from the registered plot objects at screen resolution and embedded
+# in the HTML; the 600-dpi PNG/SVG files in the output folders are unchanged.
+inline_figures <- TRUE   # FALSE = write figure files only, do not embed previews
+inline_dpi     <- 110    # preview resolution (lower = smaller HTML)
+inline_zoom    <- 1.5    # on-screen scale relative to the physical panel size
+inline_shown   <- character(0)
+inline_dir     <- file.path(tempdir(), "inline_figures")
+dir.create(inline_dir, showWarnings = FALSE, recursive = TRUE)
+
+inline_img <- function(file, width_mm, alt) {
+  sprintf('<img alt="%s" src="%s" style="width:%smm; max-width:100%%;"/>',
+          alt, knitr::image_uri(file), format(round(width_mm * inline_zoom), trim = TRUE))
+}
+
+nm_inline_html <- function() {
+  ids <- setdiff(intersect(names(nm_dims), ls(nm_registry)), inline_shown)
+  inline_shown <<- c(inline_shown, ids)
+  parts <- vapply(ids, function(id) {
+    tryCatch({
+      info <- panel_info(id)
+      f <- file.path(inline_dir, paste0(id, ".png"))
+      ggplot2::ggsave(f, get(id, envir = nm_registry, inherits = FALSE),
+                      width = info$width_mm / 25.4, height = info$height_mm / 25.4,
+                      units = "in", dpi = inline_dpi, bg = "white",
+                      device = ragg::agg_png, limitsize = FALSE)
+      paste0("<div style='margin:8px 0 16px 0;'><div style='font-size:80%; font-family:monospace;'>",
+             id, "</div>", inline_img(f, info$width_mm, id), "</div>")
+    }, error = function(err) {
+      paste0("<p><em>Preview not available for ", id, ": ", conditionMessage(err), "</em></p>")
+    })
+  }, character(1))
+  paste(parts, collapse = "\n")
+}
+
+knitr::knit_hooks$set(nm_inline = function(before, options, envir) {
+  if (before || !isTRUE(inline_figures)) return(NULL)
+  out <- tryCatch(nm_inline_html(), error = function(e) NULL)
+  if (is.null(out) || !nzchar(out)) NULL else paste0("\n\n", out, "\n\n")
+})
+knitr::opts_chunk$set(nm_inline = TRUE)
+```
+
+# Endpoint labels {-}
+
+```{r endpoint-specs}
+# One source of truth for plot lettering and labels.
+endpoint_specs <- tibble::tribble(
+  ~endpoint,     ~panel_id,         ~y_label,                                      ~short_title,              ~panel_letter,
+  "Count",       "AT_Count",        "Amyloid-like aggregates\nper 100,000 µm³ tissue",   "Aggregate density",       "a",
+  "Burden",      "AT_Burden",       "Aggregate volume per\n100,000 µm³ tissue (µm³)",  "Aggregate-volume burden", "b",
+  "MeanVolume",  "AT_MeanVolume",   "Mean aggregate volume (µm³)",                "Mean aggregate volume",   "c",
+  "Sphericity",  "AT_Sphericity",   "Mean aggregate sphericity",                 "Sphericity",              "d",
+  "Oblate",      "AT_Oblate",       "Mean ellipticity (oblate)",                 "Oblate ellipticity",      "e",
+  "Prolate",     "AT_Prolate",      "Mean ellipticity (prolate)",                "Prolate ellipticity",     "f"
+)
+```
+
+# Packages and source data
+
+Put `AT680fulldetailedanalysis_clean.xlsx` alongside the R Markdown or update
+`params$input_xlsx`. The `per_image` sheet is the analytical source; the
+`column_definitions` sheet documents each column's intended calculation.
+
+```{r load-and-qc}
+needed <- c("readxl", "dplyr", "tidyr", "tibble", "ggplot2", "purrr",
+            "readr", "patchwork", "cowplot", "ragg", "svglite")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) {
+  stop("Missing R packages: ", paste(missing, collapse = ", "),
+       ". Install with install.packages(c(",
+       paste(sprintf('"%s"', missing), collapse = ", "), ")).")
+}
+
+if (!file.exists(params$input_xlsx)) {
+  stop("Cannot find input workbook: ", params$input_xlsx)
+}
+
+raw_excel <- readxl::read_excel(params$input_xlsx, sheet = "per_image",
+                               .name_repair = "minimal")
+required <- c("image_label", "mouse", "group", "segmented_objects",
+              "image_volume_um3", "objects_per_100000_um3",
+              "Sum-based Volume [µm^3]",
+              "Sum-based Volume [µm^3] per image dimensions (per 100000 µm^3)",
+              "Mean Volume [µm^3]", "Sphericity", "Ellipticity (oblate)",
+              "Ellipticity (prolate)")
+if (!all(required %in% names(raw_excel))) {
+  stop("Input workbook is missing columns: ",
+       paste(setdiff(required, names(raw_excel)), collapse = ", "))
+}
+
+images <- raw_excel |>
+  dplyr::transmute(
+    image_label = trimws(as.character(.data$image_label)),
+    mouse = trimws(as.character(.data$mouse)),
+    age = dplyr::case_when(
+      tolower(trimws(as.character(.data$group))) %in% c("young", "young adult", "adult") ~ "Adult",
+      tolower(trimws(as.character(.data$group))) %in% c("aged", "old") ~ "Old",
+      TRUE ~ NA_character_
+    ),
+    objects = as.numeric(.data$segmented_objects),
+    image_volume = as.numeric(.data$image_volume_um3),
+    objects_density = as.numeric(.data$objects_per_100000_um3),
+    sum_object_volume = as.numeric(.data[["Sum-based Volume [µm^3]"]]),
+    volume_burden = as.numeric(.data[["Sum-based Volume [µm^3] per image dimensions (per 100000 µm^3)"]]),
+    object_mean_volume = as.numeric(.data[["Mean Volume [µm^3]"]]),
+    sphericity = as.numeric(.data$Sphericity),
+    oblate = as.numeric(.data[["Ellipticity (oblate)"]]),
+    prolate = as.numeric(.data[["Ellipticity (prolate)"]])
+  ) |>
+  dplyr::filter(!is.na(image_label), nzchar(image_label),
+                !is.na(mouse), nzchar(mouse), !is.na(age)) |>
+  dplyr::mutate(
+    # A zero-object image contains no aggregate volume: use 0 rather than NA.
+    sum_object_volume = dplyr::if_else(objects == 0, 0, sum_object_volume),
+    volume_burden = dplyr::if_else(objects == 0, 0, volume_burden),
+    object_mean_volume = dplyr::if_else(objects == 0, NA_real_, object_mean_volume),
+    sphericity = dplyr::if_else(objects == 0, NA_real_, sphericity),
+    oblate = dplyr::if_else(objects == 0, NA_real_, oblate),
+    prolate = dplyr::if_else(objects == 0, NA_real_, prolate),
+    age = factor(age, levels = c("Adult", "Old")),
+    mouse = factor(mouse, levels = mouse_order)
+  )
+
+if (anyDuplicated(images$image_label)) warning("Repeated image_label values detected.")
+if (any(is.na(images$objects) | !is.finite(images$image_volume) |
+        images$image_volume <= 0)) {
+  stop("Missing counts or nonpositive image volumes in valid image rows.")
+}
+if (any(images$objects > 0 & is.na(images$sum_object_volume))) {
+  stop("Some positive-object images are missing total-object volume.")
+}
+if (!setequal(as.character(unique(images$mouse)), mouse_order)) {
+  stop("The workbook has unexpected or missing mouse IDs; check mouse_order.")
+}
+if (any(images$objects_density < 0, na.rm = TRUE)) stop("Negative density found.")
+
+qc <- images |>
+  dplyr::group_by(age, mouse, .drop = TRUE) |>
+  dplyr::summarise(
+    images = dplyr::n(),
+    zero_object_images = sum(objects == 0, na.rm = TRUE),
+    segmented_objects = sum(objects),
+    total_imaged_volume_um3 = sum(image_volume),
+    .groups = "drop"
+  )
+readr::write_csv(qc, file.path(out_dir, "QC", "AT_image_counts_by_mouse.csv"))
+readr::write_csv(images, file.path(out_dir, "QC", "AT_clean_image_data.csv"))
+print(qc)
+cat("Valid images:", nrow(images), " | mice:", dplyr::n_distinct(images$mouse), "\n")
+```
+
+# Correct pooled mouse-level estimates and t-tests
+
+**Critical**: do **not** compute the mouse burden by averaging the
+`volume_burden` column across images. Image volumes differ; the correct
+estimate is the **sum of total object volume / sum of imaged tissue volume**.
+Similarly, aggregate density is total segmented objects / total imaged volume.
+For morphology, weight image-level object means by each image's object count.
+
+```{r mouse-level-analysis}
+safe_object_weighted <- function(values, object_counts) {
+  good <- is.finite(values) & is.finite(object_counts) & object_counts > 0
+  if (!any(good)) return(NA_real_)
+  sum(values[good] * object_counts[good]) / sum(object_counts[good])
+}
+
+mouse_scores <- images |>
+  dplyr::group_by(age, mouse, .drop = TRUE) |>
+  dplyr::summarise(
+    Count = 1e5 * sum(objects) / sum(image_volume),
+    Burden = 1e5 * sum(sum_object_volume) / sum(image_volume),
+    MeanVolume = sum(sum_object_volume) / sum(objects),
+    Sphericity = safe_object_weighted(sphericity, objects),
+    Oblate = safe_object_weighted(oblate, objects),
+    Prolate = safe_object_weighted(prolate, objects),
+    N_images = dplyr::n(),
+    N_objects = sum(objects),
+    .groups = "drop"
+  )
+
+# Explicit tests on the THREE biological replicates per age group.
+mouse_long <- mouse_scores |>
+  tidyr::pivot_longer(cols = dplyr::all_of(endpoint_specs$endpoint),
+                      names_to = "endpoint", values_to = "score") |>
+  dplyr::mutate(endpoint = factor(endpoint, levels = endpoint_specs$endpoint))
+
+stats_tbl <- mouse_long |>
+  dplyr::group_by(endpoint) |>
+  dplyr::group_modify(function(dat, key) {
+    fit <- stats::t.test(score ~ age, data = dat, var.equal = TRUE,
+                         alternative = "two.sided")
+    tibble::tibble(
+      method = "two-sided unpaired Student t-test, equal variance",
+      n_adult = sum(dat$age == "Adult"),
+      n_old = sum(dat$age == "Old"),
+      t = unname(fit$statistic),
+      df = unname(fit$parameter),
+      p = fit$p.value,
+      mean_adult = mean(dat$score[dat$age == "Adult"]),
+      mean_old = mean(dat$score[dat$age == "Old"])
+    )
+  }) |>
+  dplyr::ungroup()
+
+# 95% confidence intervals for QC: variation among independent mouse estimates.
+# The updated figures intentionally do NOT draw these as gray rectangles.
+group_ci <- mouse_long |>
+  dplyr::group_by(endpoint, age, .drop = TRUE) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    mean = mean(score),
+    sd = stats::sd(score),
+    sem = sd / sqrt(n),
+    ci95_lower = mean - stats::qt(0.975, df = n - 1) * sem,
+    ci95_upper = mean + stats::qt(0.975, df = n - 1) * sem,
+    .groups = "drop"
+  )
+
+# Reference from the two viewable PowerPoint slides; computed stats are NOT replaced.
+reference_slide_p <- tibble::tibble(
+  endpoint = factor(c("Count", "Burden", "MeanVolume", "Sphericity",
+                      "Oblate", "Prolate"), levels = endpoint_specs$endpoint),
+  slide_p = c(0.011, 0.023, 0.943, 0.460, 0.337, 0.317)
+)
+verification <- stats_tbl |>
+  dplyr::left_join(reference_slide_p, by = "endpoint") |>
+  dplyr::mutate(computed_p_3dp = sprintf("%.3f", p),
+                matches_slide = computed_p_3dp == sprintf("%.3f", slide_p))
+
+readr::write_csv(mouse_scores, file.path(out_dir, "QC", "AT_mouse_pooled_scores.csv"))
+readr::write_csv(group_ci, file.path(out_dir, "QC", "AT_group_means_CI95.csv"))
+readr::write_csv(verification, file.path(out_dir, "QC", "AT_t_tests_slide_verification.csv"))
+print(verification[, c("endpoint", "p", "slide_p", "matches_slide")])
+if (any(!verification$matches_slide)) {
+  warning("One or more 3-decimal P values differ from the earlier slide; inspect QC.")
+}
+```
+
+# Manuscript-style boxplot builder
+
+This section reproduces the visual grammar of the supplied manuscript screenshot:
+**translucent, age-colored Tukey boxplots with whisker caps**, lightly jittered
+image points, and larger black-outlined mouse estimates. The x-axis is **Adult**
+versus **Old**. Colors remain blue (`#3B528B`) and green (`#5DC863`), in
+keeping with the Adult-versus-Old proteomics figures. No gray CI rectangle is
+plotted. A short horizontal comparison line and asterisk(s) are shown only when
+the mouse-level Student t-test is significant (P < 0.05); change the helper's
+`stat_label_mode` to `"pvalue"` and rerun this chunk plus `build-and-export` to
+show exact P values above every panel instead.
+
+```{r superplot-functions}
+# Position 3 mice within each age group; prevents overlap of the six large dots.
+mouse_x <- tibble::tibble(
+  mouse = factor(mouse_order, levels = mouse_order),
+  x = c(0.84, 1.00, 1.16, 1.84, 2.00, 2.16)
+)
+age_x <- tibble::tibble(
+  age = factor(c("Adult", "Old"), levels = levels(images$age)),
+  x = c(1, 2), xmin = c(0.71, 1.71), xmax = c(1.29, 2.29)
+)
+
+image_long <- images |>
+  tidyr::pivot_longer(cols = c(objects_density, volume_burden,
+                              object_mean_volume, sphericity, oblate, prolate),
+                      names_to = "column", values_to = "score") |>
+  dplyr::mutate(endpoint = dplyr::recode(column,
+    objects_density = "Count", volume_burden = "Burden",
+    object_mean_volume = "MeanVolume", sphericity = "Sphericity",
+    oblate = "Oblate", prolate = "Prolate")) |>
+  dplyr::left_join(mouse_x, by = "mouse") |>
+  dplyr::filter(is.finite(score))
+
+mouse_long <- mouse_long |>
+  dplyr::left_join(mouse_x, by = "mouse")
+group_ci <- group_ci |>
+  dplyr::left_join(age_x, by = "age")
+
+nm_theme <- function() {
+  ggplot2::theme_classic(base_family = nm_style$font_family,
+                         base_size = nm_style$axis_text) +
+    ggplot2::theme(
+      text = ggplot2::element_text(family = nm_style$font_family,
+                                   colour = "black"),
+      axis.title.y = ggplot2::element_text(size = nm_style$axis_title,
+                                          margin = ggplot2::margin(r = 6)),
+      axis.title.x = ggplot2::element_blank(),
+      axis.text = ggplot2::element_text(size = nm_style$axis_text,
+                                       colour = "black"),
+      axis.line = ggplot2::element_line(linewidth = nm_style$axis_line),
+      axis.ticks = ggplot2::element_line(linewidth = nm_style$axis_line),
+      axis.ticks.x = ggplot2::element_blank(),
+      plot.title = ggplot2::element_text(size = nm_style$plot_title,
+                                        face = "bold", hjust = 0),
+      plot.margin = ggplot2::margin(7, 6, 7, 7),
+      legend.position = "none"
+    )
+}
+
+make_superplot <- function(endpoint, show_title = FALSE,
+                           show_bracket = TRUE, image_seed = 41) {
+  spec <- endpoint_specs[endpoint_specs$endpoint == endpoint, , drop = FALSE]
+  if (nrow(spec) != 1L) stop("Unknown endpoint: ", endpoint)
+  im <- image_long |> dplyr::filter(.data$endpoint == .env$endpoint)
+  ms <- mouse_long |> dplyr::filter(as.character(.data$endpoint) == .env$endpoint)
+  p_value <- stats_tbl$p[as.character(stats_tbl$endpoint) == endpoint]
+
+  # Independent mouse-level t-test determines the annotation; images determine
+  # ONLY the descriptive boxplot quantiles and whiskers.
+  stopifnot(length(p_value) == 1L, is.finite(p_value))
+  mode <- nm_style$stat_label_mode
+  if (!mode %in% c("stars", "pvalue", "none")) {
+    stop("nm_style$stat_label_mode must be 'stars', 'pvalue' or 'none'.")
+  }
+  show_annotation <- isTRUE(show_bracket) && (
+    identical(mode, "pvalue") || (identical(mode, "stars") && p_value < 0.05)
+  )
+  label <- if (identical(mode, "pvalue")) {
+    paste0("P = ", sprintf("%.3f", p_value))
+  } else if (p_value < 0.001) {
+    "***"
+  } else if (p_value < 0.01) {
+    "**"
+  } else {
+    "*"
+  }
+
+  ymax_data <- max(c(im$score, ms$score), na.rm = TRUE)
+  ymin_data <- min(c(0, im$score, ms$score), na.rm = TRUE)
+  yrange <- max(0.15, ymax_data - ymin_data)
+  is_shape <- endpoint %in% c("Sphericity", "Oblate", "Prolate")
+  line_y <- ymax_data + 0.075 * yrange
+  text_y <- line_y + 0.045 * yrange
+  plot_top <- if (is_shape && !show_annotation) 1 else {
+    max(if (is_shape) 1 else 0, ymax_data +
+          if (show_annotation) 0.19 * yrange else 0.06 * yrange)
+  }
+
+  p <- ggplot2::ggplot() +
+    # Tukey whisker caps and age-colored 25th–75th percentile boxes.
+    # These describe *images*, not six independent animals.
+    ggplot2::stat_boxplot(
+      data = im,
+      ggplot2::aes(x = as.numeric(age), y = score, group = age),
+      geom = "errorbar", width = 0.24, coef = 1.5,
+      colour = "black", linewidth = nm_style$data_line,
+      inherit.aes = FALSE
+    ) +
+    ggplot2::geom_boxplot(
+      data = im,
+      ggplot2::aes(x = as.numeric(age), y = score, group = age, fill = age),
+      width = nm_style$box_width, coef = 1.5,
+      alpha = nm_style$box_alpha, outlier.shape = NA,
+      colour = "black", linewidth = nm_style$data_line,
+      inherit.aes = FALSE
+    ) +
+    ggplot2::geom_point(
+      data = im,
+      ggplot2::aes(x = x, y = score, colour = mouse),
+      position = ggplot2::position_jitter(width = 0.065, height = 0,
+                                         seed = image_seed),
+      size = nm_style$image_size, alpha = 0.43, stroke = 0
+    ) +
+    ggplot2::geom_point(
+      data = ms,
+      ggplot2::aes(x = x, y = score, fill = mouse),
+      shape = 21, size = nm_style$mouse_size, colour = "black",
+      stroke = 0.45, show.legend = FALSE
+    ) +
+    ggplot2::scale_colour_manual(values = mouse_cols, drop = FALSE) +
+    # A single fill scale covers both the age-colored boxes and mouse points.
+    ggplot2::scale_fill_manual(values = c(age_cols, mouse_cols), drop = FALSE) +
+    ggplot2::scale_x_continuous(breaks = c(1, 2),
+      labels = c("Adult", "Old"), limits = c(0.55, 2.45),
+      expand = ggplot2::expansion(mult = 0)) +
+    ggplot2::coord_cartesian(ylim = c(0, plot_top), clip = "off") +
+    ggplot2::labs(y = spec$y_label,
+                  title = if (show_title) spec$short_title else NULL) +
+    nm_theme()
+
+  if (show_annotation) {
+    # Short horizontal significance line, in the supplied figure's style.
+    p <- p +
+      ggplot2::annotate("segment", x = 0.95, xend = 2.05,
+                        y = line_y, yend = line_y,
+                        linewidth = nm_style$data_line, colour = "black") +
+      ggplot2::annotate("text", x = 1.5, y = text_y, label = label,
+                        fontface = "bold", family = nm_style$font_family,
+                        size = nm_style$stat_text / ggplot2::.pt)
+  }
+  p
+}
+```
+
+# Generate individual and combined figures
+
+The older five-panel slide is matched by `AT_Main5` (burden, mean object volume,
+sphericity, oblate, prolate). `AT_Count` matches the separate density slide.
+`AT_Main6` is an additional optional two-row, six-panel summary. Panel lettering
+is generated by patchwork and is **not** baked into the individual figures.
+
+```{r build-and-export}
+individual <- stats::setNames(
+  lapply(endpoint_specs$endpoint,
+         function(x) make_superplot(x, show_title = FALSE)),
+  endpoint_specs$endpoint
+)
+
+for (i in seq_len(nrow(endpoint_specs))) {
+  register_panel(endpoint_specs$panel_id[[i]], individual[[endpoint_specs$endpoint[[i]]]])
+}
+
+main5_names <- c("Burden", "MeanVolume", "Sphericity", "Oblate", "Prolate")
+main5 <- patchwork::wrap_plots(
+  c(unname(individual[main5_names]), list(patchwork::plot_spacer())),
+  ncol = 3, nrow = 2
+) + patchwork::plot_annotation(tag_levels = "a") &
+  ggplot2::theme(plot.tag = ggplot2::element_text(
+    face = "bold", size = nm_style$plot_title,
+    family = nm_style$font_family))
+register_panel("AT_Main5", main5)
+
+main6 <- patchwork::wrap_plots(unname(individual[
+  c("Count", "Burden", "MeanVolume", "Sphericity", "Oblate", "Prolate")
+]), ncol = 3, nrow = 2) + patchwork::plot_annotation(tag_levels = "a") &
+  ggplot2::theme(plot.tag = ggplot2::element_text(
+    face = "bold", size = nm_style$plot_title,
+    family = nm_style$font_family))
+register_panel("AT_Main6", main6)
+
+# Standalone legend, intentionally omitted from individual data plots.
+legend_source <- tibble::tibble(
+  mouse = factor(mouse_order, levels = mouse_order),
+  x = seq_along(mouse_order), y = 1
+)
+legend_gg <- ggplot2::ggplot(legend_source, ggplot2::aes(x, y, fill = mouse)) +
+  ggplot2::geom_point(shape = 21, colour = "black", size = 2.6,
+                      show.legend = TRUE, stroke = 0.45) +
+  ggplot2::scale_fill_manual(values = mouse_cols, name = "Biological replicate",
+                             drop = FALSE) +
+  ggplot2::guides(fill = ggplot2::guide_legend(
+    nrow = 2, byrow = TRUE, override.aes = list(size = 2.7))) +
+  ggplot2::theme_void(base_family = nm_style$font_family,
+                      base_size = nm_style$legend_text) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    legend.title = ggplot2::element_text(size = nm_style$legend_title),
+    legend.text = ggplot2::element_text(size = nm_style$legend_text)
+  )
+lg <- cowplot::get_legend(legend_gg)
+register_panel("AT_MouseLegend", cowplot::ggdraw(lg))
+
+export_all_panels()
+readr::write_csv(list_configured_panels(),
+                 file.path(out_dir, "QC", "AT_figure_sizes_and_IDs.csv"))
+cat("Exported", length(ls(nm_registry)), "figures (600-dpi PNG + editable SVG).\n")
+```
+
+# Quality-control tables and instructions
+
+This section makes it easy to check estimates, group-level variability, the
+exact t-tests, and the registered figure sizes without searching multiple
+sections of the report.
+
+```{r reporting}
+print(mouse_scores)
+print(group_ci)
+print(stats_tbl)
+print(list_panels())
+
+cat("\nRe-export examples:\n")
+cat('  set_panel_size("AT_Main5", 172, 120)\n')
+cat('  reexport("AT_Main5")\n')
+cat('  set_family_size("single", 55, 62)\n')
+cat('  reexport_family("single")\n')
+cat('  export_all_panels()\n')
+cat('  # To show exact P values in every panel, set nm_style$stat_label_mode <- "pvalue"\n')
+cat('  # and rerun the superplot-functions and build-and-export chunks.\n')
+```
+
+## Output folder structure
+
+```text
+AT680_Figures/
+  Count/       AT_Count.png/.svg
+  Volume/      AT_Burden.png/.svg, AT_MeanVolume.png/.svg
+  Morphology/  AT_Sphericity.png/.svg, AT_Oblate.png/.svg,
+               AT_Prolate.png/.svg
+  Combined/    AT_Main5.png/.svg, AT_Main6.png/.svg
+  Legends/     AT_MouseLegend.png/.svg
+  QC/          AT_clean_image_data.csv
+               AT_image_counts_by_mouse.csv
+               AT_mouse_pooled_scores.csv
+               AT_group_means_CI95.csv
+               AT_t_tests_slide_verification.csv
+               AT_figure_sizes_and_IDs.csv
+```
+
+## Notes for figure legends / reproducibility
+
+The unit of statistical replication is **mouse**, not microscopy image.
+`AT_Main5` and `AT_Count` can be assembled into a manuscript figure using the
+individually exported SVG panels. As in the earlier PowerPoint, mice are
+identified by colored symbols. The boxplots show descriptive *image-level*
+quartiles and 1.5×IQR whiskers; they are not inferential confidence intervals.
+Mouse-level means and 95% confidence intervals are still available in the QC CSV. Note that the Welch t-test (`var.equal = FALSE`)
+does **not** reproduce all the reported PowerPoint P-values. The equal-variance
+Student t-test is therefore specified explicitly and recorded in the QC CSV.
+Rounding occurs **only when displaying P-values**, not when calculating them.
