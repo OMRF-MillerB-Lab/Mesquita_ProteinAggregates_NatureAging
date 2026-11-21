@@ -1,0 +1,2343 @@
+---
+title: "FN: Soluble and Insoluble (v13)"
+author: "Michael Taylor"
+date: "2026-09-23"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+---
+
+# Overview {-}
+
+**Question.** How quickly are proteins turned over in the soluble and insoluble fractions of skeletal muscle (D2O labelling, "fraction new", FN), does turnover differ between Adult and Old mice, and do Old exercise and rapamycin treatments change it?
+
+**What is calculated.**
+
+| Step | What is done |
+|---|---|
+| Input | Skyline peptide exports for the soluble and insoluble fractions (`soluble_skyline_export.csv`, `skyline_Export_insol.csv`), body-water enrichment and group table (`d2o.csv`), `NEH.csv` |
+| Fraction new | For each peptide/charge: M0/(M0+M1) is compared with the theoretical unlabelled value and the theoretical minimum after D2O labelling, FN = (M0 unlabelled - M0 timepoint) / (M0 unlabelled - M0 theoretical minimum). Small excursions beyond 0 or 1 (within 10%) are set to 0 or 1; larger ones become missing |
+| Presence filter | A peptide must be present in **100% of the samples of each fraction** (`min_presence = 1`; this is across all samples, not within groups, and stricter than the usual 50% within-group proteomics filter) |
+| Retained peptides | Only peptides observed at all three timepoints (30, 45, 60 d) within a group and fraction |
+| Unit of analysis | Animal-level mean FN per animal, timepoint and fraction (peptides are averaged within animal) |
+| Adult vs Old | Separate model at each timepoint: `Mean_FN ~ Age * Fraction + (1 | ID)` (`lmerTest`), Type III tests |
+| Old treatments | Separate model at each timepoint: `Mean_FN ~ Treatment * Fraction + (1 | ID)`; planned contrasts from `emmeans` (Satterthwaite df): overall Treatment vs Control, Treatment vs Control within each fraction, and Treatment × Fraction (difference in differences). Holm adjustment within each family of planned comparisons; unadjusted *P* values are exported alongside |
+
+Sex is shown in the figures (point shape) but is not a term in these models.
+
+**Outputs** (written to `fn_out/`): five figures as 600-dpi PNG plus editable SVG with separate legends (`fn_ao`, `fn_ot`, `fn_ot_pw`, and the unadjusted-*P* versions `fn_ot_raw`, `fn_ot_pw_raw`) and short CSV tables (`qc_grp.csv`, `qc_pep.csv`, `st_ao.csv`, `st_ot.csv`, `st_ot_raw.csv`, `audit.csv`, `means.csv`).
+
+> **To run:** keep the input files listed above, `Proteostasis_Soluble_NoNorm_report.parquet` (only for the DIA-NN preparation section) and the `R/` folder next to this file, then knit. Run the sections in order; soluble and insoluble calculations use separate object names. With RStudio **chunk output in Console** (set in the header) the long-Dropbox-path notebook problem is avoided.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Packages
+
+All packages must be installed beforehand (the script stops and lists any that are missing; it does not install anything). The first nine are attached in the original order, which decides which functions mask which.
+
+```{r packages}
+pkgs <- c("dplyr", "tidyr", "ggplot2", "ggridges", "patchwork", "purrr", "lmerTest", "emmeans",
+          "minpack.lm", "arrow", "readr", "ragg", "svglite", "cowplot", "htmltools", "DT", "knitr")
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Install missing packages first: ", paste(missing_pkgs, collapse = ", "), call. = FALSE)
+}
+invisible(lapply(pkgs[1:9], library, character.only = TRUE))
+```
+
+# Figure export settings
+
+**All five panel dimensions** (mm) and the central font (pt), line, point, fraction-label and margin settings are in the chunk below. Typography is in **pt**; strokes and point sizes are in **mm**. After editing and running this chunk, run `reexport("fn_ao")` (or another panel ID) to rebuild that figure from the already prepared tables and statistics, without refitting any model.
+
+```{r NATURE_FIGURE_HELPER_EDIT_HERE}
+# Named final-size panels: widths/heights in millimeters.
+nm_dims <- list(
+  fn_ao        = c(width = 150, height = 60),
+  fn_ot        = c(width = 150, height = 60),
+  fn_ot_pw     = c(width = 150, height = 60),
+  fn_ot_raw    = c(width = 150, height = 60),
+  fn_ot_pw_raw = c(width = 150, height = 60)
+)
+# Standalone legend footprints (mm); legends do not shrink the data panel.
+nm_legend_dims <- list(
+  fn_ao        = c(width = 42, height = 29),
+  fn_ot        = c(width = 51, height = 35),
+  fn_ot_pw     = c(width = 51, height = 35),
+  fn_ot_raw    = c(width = 51, height = 35),
+  fn_ot_pw_raw = c(width = 51, height = 35)
+)
+
+# Text sizes are typographic points (pt).
+# Line widths, point sizes, and point strokes are in millimeters (mm).
+nm_style <- list(
+  font_family = "sans",        # maps to Arial only in the SVG device
+  plot_title = 8.0,
+  plot_subtitle = 6.5,
+  axis_title = 7.0,
+  axis_text = 6.5,
+  x_group_text = 6.3,
+  strip_text = 7.0,
+  legend_title = 6.5,
+  legend_text = 6.0,
+  stat_text = 6.1,
+  pairwise_stat_text = 6.1,
+  fraction_label = 6.6,
+  # Fraction labels BELOW Adult/Old (or Ctl/Ex/Rapa) x-axis tick labels.
+  # Negative locations are drawn OUTSIDE the 0–1 fraction-new data panel.
+  fraction_guide_y = -0.145,
+  fraction_text_y = -0.225,
+  axis_line = 0.18,
+  strip_line = 0.18,
+  violin_line = 0.24,
+  violin_alpha = 0.22,
+  box_line = 0.22,
+  fraction_guide_line = 0.18,
+  point_size = 1.65,
+  point_stroke = 0.27,
+  plot_margin_mm = 1.8,      # left, right, top
+  bottom_margin_mm = 11.0,    # only the space needed for below-axis fraction labels
+  panel_spacing_lines = 0.60
+)
+# ggplot2 geom_text() uses mm, whereas font settings above are points.
+nm_text_mm <- function(pt) pt / (72.27 / 25.4)
+```
+
+# Settings and shared metadata
+
+```{r paths}
+helper_dir <- "R"   # folder holding nm_export_engine_FN.R
+
+# Rebuilt directly from the user-provided Adult/Old propensity SVG workflow.
+out_dir <- "fn_out"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r settings}
+# Existing presence thresholds, applied across all samples in each fraction.
+# A nonmissing FN of zero counts as present. These are not within-group filters.
+min_presence_sol   <- 1  # 100% of soluble samples
+min_presence_insol <- 1  # 100% of insoluble samples
+
+peptide_key <- c("Protein", "Peptide.Modified.Sequence", "Precursor.Charge")
+frac_one_tol <- frac_zero_tol <- 1e-12
+
+normalize_id <- function(x) {
+  x <- trimws(as.character(x))
+  x <- sub("^X", "", x)
+  sub("_[SI]\\.Area$", "", x, ignore.case = TRUE)
+}
+
+stopifnot(
+  min_presence_sol >= 0, min_presence_sol <= 1,
+  min_presence_insol >= 0, min_presence_insol <= 1
+)
+```
+
+```{r metadata}
+NEH <- read.csv("NEH.csv", check.names = TRUE)
+bwe <- read.csv("d2o.csv", check.names = TRUE)
+bwe$ID <- normalize_id(bwe$ID)
+```
+
+# Figure export functions
+
+```{r nm-export-engine, echo=FALSE}
+engine_file <- file.path(helper_dir, "nm_export_engine_FN.R")
+if (!file.exists(engine_file)) {
+  stop("Cannot find the figure-export file '", engine_file, "' (working directory: ", getwd(),
+       "). Copy the 'R' folder from the zip next to this Rmd and the input CSVs, or set helper_dir.",
+       call. = FALSE)
+}
+source(engine_file, local = knitr::knit_global())
+```
+
+# Skyline input preparation
+
+Original DIA-NN quality filtering and peptide/peak-boundary preparation. The FN sections below read the existing Skyline CSV exports.
+
+```{r diann-import}
+## Single forward slash to make file path work
+report=arrow::read_parquet("Proteostasis_Soluble_NoNorm_report.parquet")
+```
+
+```{r diann-quality-filter}
+## Only keep rows where 0.5*Mass.Evidence + Ms1.Profile.Corr >= 1
+report_clean <- report %>%
+  dplyr::filter(Mass.Evidence*0.5 + Ms1.Profile.Corr > 1)
+
+## Only keep rows where Quantity.Quality >0.9 (and other quality filters)
+report_cleanest <- report_clean[
+  report_clean$Quantity.Quality > 0.9 &
+    report_clean$PG.MaxLFQ.Quality > 0.7 &
+    report_clean$Empirical.Quality > 0.8,
+]
+
+## Only keep rows where iRT is within 10% of predicted
+report_final_clean <- report_cleanest[
+  (report_cleanest$iRT - report_cleanest$Predicted.iRT) / report_cleanest$Predicted.iRT < 0.1,
+]
+
+## Output old vs new data frame sizes (rows + columns)
+df_sizes <- data.frame(
+  DataFrame = c("report (old)", "report (new)"),
+  Rows      = c(nrow(report), nrow(report_final_clean)),
+  Columns   = c(ncol(report), ncol(report_final_clean))
+)
+```
+
+```{r diann-qc, echo=FALSE}
+knitr::kable(df_sizes, row.names = FALSE)
+```
+
+```{r skyline-peptide-list}
+pep_list <- unique(report_final_clean[, c("Modified.Sequence", "Protein.Names")])
+colnames(pep_list) <- c("Peptide", "Protein")
+```
+
+```{r skyline-peak-boundaries}
+peak_boundaries = unique(report_final_clean[,c("Run", "Modified.Sequence", "RT.Start", "RT.Stop")])
+colnames(peak_boundaries)=c("File Name", "Peptide Modified Sequence", "Min Start Time", "Max End Time")
+```
+
+# Soluble FN calculation
+
+Outputs: `fn_wide_sol` and `fn_wide_filtered_sol`. All fraction-specific calculation intermediates end in `_sol`.
+
+## Import
+
+```{r sol-import}
+## Add NA's
+data_sol=utils::read.csv("soluble_skyline_export.csv")
+```
+
+## Raw table
+
+```{r sol-raw-table, echo=FALSE}
+if (knitr::is_html_output()) {
+  library(DT)
+  library(htmltools)
+
+  htmltools::tags$details(
+    htmltools::tags$summary("Click to expand full table"),
+    DT::datatable(
+      data_sol,
+      rownames = FALSE,
+      options = list(
+        pageLength = 25,
+        lengthMenu = c(10, 25, 50, 100),
+        scrollX = TRUE
+      )
+    )
+  )
+}
+```
+
+## Missing values
+
+```{r sol-missing-values}
+data_sol[data_sol== "#N/A"] = NA
+```
+
+## Clean table
+
+```{r sol-clean-table, echo=FALSE}
+if (knitr::is_html_output()) {
+  library(DT)
+  library(htmltools)
+
+  htmltools::tags$details(
+    htmltools::tags$summary("Click to expand full table"),
+    DT::datatable(
+      data_sol,
+      rownames = FALSE,
+      options = list(
+        pageLength = 25,
+        lengthMenu = c(10, 25, 50, 100),
+        scrollX = TRUE
+      )
+    )
+  )
+}
+```
+
+## Isotope fractions
+
+```{r sol-isotope-fractions}
+# Tolerances
+# Normalize across Product.Mz rows within each peptide
+area_cols_sol <- grep(
+  "_S\\.Area$",
+  names(data_sol),
+  value = TRUE
+)
+
+if (!length(area_cols_sol)) {
+  stop("No columns ending in '_S.Area' were found.")
+}
+
+# Coerce area columns to numeric
+df_frac_sol <- data_sol
+df_frac_sol[area_cols_sol] <- lapply(
+  df_frac_sol[area_cols_sol],
+  function(x) suppressWarnings(as.numeric(as.character(x)))
+)
+
+# Calculate fractional abundance within peptide/charge groups
+df_frac_sol <- df_frac_sol %>%
+  dplyr::group_by(
+    dplyr::across(dplyr::all_of(peptide_key))
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::all_of(area_cols_sol),
+      ~ {
+        s <- sum(.x, na.rm = TRUE)
+
+        if (!is.finite(s) || s == 0) {
+          rep(NA_real_, dplyr::n())
+        } else {
+          .x / s
+        }
+      }
+    )
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::all_of(area_cols_sol),
+      ~ dplyr::if_else(
+        !is.na(.x) &
+          (
+            dplyr::near(.x, 1, tol = frac_one_tol) |
+            dplyr::near(.x, 0, tol = frac_zero_tol)
+          ),
+        NA_real_,
+        .x
+      )
+    )
+  ) %>%
+  dplyr::ungroup()
+```
+
+## M0 observed
+
+```{r sol-m0-observed}
+# ==== Tunables ================================================================
+# ==============================================================================
+
+stopifnot(all(c(peptide_key, "Product.Mz") %in% names(df_frac_sol)))
+
+# Fraction/sample columns
+frac_cols_sol <- grep(
+  "_S\\.Area$",
+  names(df_frac_sol),
+  value = TRUE
+)
+
+if (!length(frac_cols_sol)) {
+  stop("No fraction columns ending in '_S.Area' were found.")
+}
+
+# Coerce to numeric
+df_iso_sol <- df_frac_sol
+
+df_iso_sol[frac_cols_sol] <- lapply(
+  df_iso_sol[frac_cols_sol],
+  function(x) suppressWarnings(as.numeric(as.character(x)))
+)
+
+df_iso_sol[["Product.Mz"]] <- suppressWarnings(
+  as.numeric(as.character(df_iso_sol[["Product.Mz"]]))
+)
+
+# Select the lowest-m/z row within each peptide/charge group
+m0_frac_wide_sol <- df_iso_sol %>%
+  dplyr::filter(!is.na(.data[["Product.Mz"]])) %>%
+  dplyr::group_by(!!!rlang::syms(peptide_key)) %>%
+  dplyr::slice_min(
+    order_by = .data[["Product.Mz"]],
+    n = 1L,
+    with_ties = FALSE
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(
+    dplyr::all_of(peptide_key),
+    dplyr::all_of(frac_cols_sol)
+  )
+```
+
+## NEH total
+
+```{r sol-neh-total}
+# ── Chunk: add NEH_total to m0_frac_wide (run after M0-fraction step) ─────────
+stopifnot(exists("NEH"),
+          all(c("Amino.Acid","NEH") %in% names(NEH)),
+          exists("m0_frac_wide_sol"),
+          "Peptide.Modified.Sequence" %in% names(m0_frac_wide_sol))
+
+# build lookup from NEH table
+NEH_map_sol <- NEH %>%
+  dplyr::transmute(AA = toupper(Amino.Acid), NEH = as.numeric(NEH)) %>%
+  dplyr::distinct(AA, .keep_all = TRUE)
+neh_lookup_sol <- stats::setNames(NEH_map_sol$NEH, NEH_map_sol$AA)
+
+# helpers
+sanitize_pep_sol <- function(s) {
+  s <- toupper(s)
+  s <- gsub("\\(.*?\\)|\\[.*?\\]|\\{.*?\\}", "", s)
+  gsub("[^A-Z]", "", s)
+}
+calc_pep_NEH_sol <- function(peps, lookup = neh_lookup_sol) {
+  vapply(peps, function(p) {
+    s <- sanitize_pep_sol(p)
+    if (s == "") return(NA_real_)
+    aa <- strsplit(s, "", fixed = TRUE)[[1]]
+    known <- aa %in% names(lookup)
+    if (!any(known)) return(NA_real_)
+    sum(lookup[aa[known]], na.rm = TRUE)
+  }, numeric(1))
+}
+
+# append NEH_total
+m0_frac_wide_sol <- m0_frac_wide_sol %>%
+  dplyr::mutate(NEH_total = calc_pep_NEH_sol(Peptide.Modified.Sequence))
+```
+
+## M0 theoretical
+
+```{r sol-m0-theoretical}
+# ---- Theoretical natural-abundance M0/M1 + D2O labeling ----
+
+if (!"NEH_total" %in% names(m0_frac_wide_sol)) {
+  stop("m0_frac_wide must contain NEH_total.")
+}
+
+seq_col_sol <- "Peptide.Modified.Sequence"
+
+if (!seq_col_sol %in% names(m0_frac_wide_sol)) {
+  stop("m0_frac_wide must contain Peptide.Modified.Sequence.")
+}
+
+sample_cols_sol <- setdiff(
+  names(m0_frac_wide_sol),
+  c(peptide_key, "NEH_total")
+)
+
+# Amino-acid residue elemental compositions
+aa_comp_sol <- data.frame(
+  C = c(3,6,4,4,3,5,5,2,6,6,6,6,5,9,5,3,4,11,9,5),
+  H = c(5,12,6,5,5,7,8,3,7,11,11,12,9,9,7,5,7,10,9,9),
+  N = c(1,4,2,1,1,1,2,1,3,1,1,2,1,1,1,1,1,2,1,1),
+  O = c(1,1,2,3,1,3,2,1,1,1,1,1,1,1,1,2,2,1,2,1),
+  S = c(0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0),
+  row.names = c(
+    "A","R","N","D","C","E","Q","G","H","I",
+    "L","K","M","F","P","S","T","W","Y","V"
+  )
+)
+
+# Natural isotope abundances
+iso_sol <- data.frame(
+  p0 = c(
+    C = 0.9893,
+    H = 0.999885,
+    N = 0.99636,
+    O = 0.99757,
+    S = 0.9499
+  ),
+  p1 = c(
+    C = 0.0107,   # 13C
+    H = 0.000115, # 2H
+    N = 0.00364,  # 15N
+    O = 0.00038,  # 17O
+    S = 0.0075    # 33S
+  )
+)
+
+# Strip modification annotations
+strip_mods_sol <- function(seq) {
+  seq <- gsub("\\[[^]]*\\]", "", seq)
+  seq <- gsub("\\([^)]*\\)", "", seq)
+  seq <- gsub("[^A-Za-z]", "", seq)
+  toupper(seq)
+}
+
+# Calculate elemental formula of unmodified peptide
+get_formula_sol <- function(seq) {
+
+  seq <- strip_mods_sol(seq)
+
+  aa <- strsplit(
+    seq,
+    "",
+    fixed = TRUE
+  )[[1]]
+
+  if (
+    !length(aa) ||
+    any(!aa %in% rownames(aa_comp_sol))
+  ) {
+    stop("Invalid peptide sequence after stripping modifications: ", seq)
+  }
+
+  f <- colSums(
+    aa_comp_sol[aa, , drop = FALSE]
+  )
+
+  # Add terminal H2O
+  f["H"] <- f["H"] + 2
+  f["O"] <- f["O"] + 1
+
+  f
+}
+
+# Theoretical natural-abundance M0 and M1
+get_natural_m01_sol <- function(seq) {
+
+  f <- get_formula_sol(seq)
+
+  p0 <- iso_sol[names(f), "p0"]
+  p1 <- iso_sol[names(f), "p1"]
+
+  M0 <- exp(
+    sum(f * log(p0))
+  )
+
+  M1 <- M0 * sum(
+    f * p1 / p0
+  )
+
+  c(
+    M0 = M0,
+    M1 = M1
+  )
+}
+
+nat_sol <- t(
+  vapply(
+    m0_frac_wide_sol[[seq_col_sol]],
+    get_natural_m01_sol,
+    numeric(2)
+  )
+)
+
+base_M0_sol <- nat_sol[, "M0"]
+base_M1_sol <- nat_sol[, "M1"]
+
+# ---- Match BWE to samples ----
+
+bwe_values_sol <- suppressWarnings(
+  as.numeric(as.character(bwe$BWE))
+)
+
+# Convert percentage to atom fraction
+bwe_values_sol[bwe_values_sol > 1] <-
+  bwe_values_sol[bwe_values_sol > 1] / 100
+
+bwe_values_sol[!is.finite(bwe_values_sol)] <-
+  NA_real_
+
+bw_map_sol <- stats::setNames(
+  bwe_values_sol,
+  normalize_id(bwe$ID)
+)
+
+sample_bwe_sol <- unname(
+  bw_map_sol[normalize_id(sample_cols_sol)]
+)
+
+if (anyNA(sample_bwe_sol)) {
+  stop(
+    "BWE missing for: ",
+    paste(
+      sample_cols_sol[is.na(sample_bwe_sol)],
+      collapse = ", "
+    )
+  )
+}
+
+sample_bwe_sol <- pmin(
+  pmax(sample_bwe_sol, 0),
+  1 - 1e-12
+)
+
+# ---- Apply D2O labeling ----
+
+neh_vec_sol <- suppressWarnings(
+  as.numeric(m0_frac_wide_sol$NEH_total)
+)
+
+if (anyNA(neh_vec_sol)) {
+  stop("NEH_total contains missing or non-numeric values.")
+}
+
+log_1mp_sol <- log1p(-sample_bwe_sol)
+
+# Probability of zero incorporated D atoms
+p0_label_sol <- exp(
+  outer(
+    neh_vec_sol,
+    log_1mp_sol,
+    `*`
+  )
+)
+
+# Probability of exactly one incorporated D atom
+p1_label_sol <- outer(
+  neh_vec_sol,
+  sample_bwe_sol,
+  `*`
+) * exp(
+  outer(
+    neh_vec_sol - 1,
+    log_1mp_sol,
+    `*`
+  )
+)
+
+# Natural isotope envelope convolved with D2O labeling
+M0_lab_sol <- base_M0_sol * p0_label_sol
+
+M1_lab_sol <-
+  base_M1_sol * p0_label_sol +
+  base_M0_sol * p1_label_sol
+
+# Expected M0 / (M0 + M1)
+min_mat_sol <- M0_lab_sol / (
+  M0_lab_sol + M1_lab_sol
+)
+
+min_mat_sol[!is.finite(min_mat_sol)] <-
+  NA_real_
+
+colnames(min_mat_sol) <- sample_cols_sol
+
+# ---- Final theoretical minimum M0 ratios ----
+
+m0_min_wide_sol <- dplyr::bind_cols(
+  m0_frac_wide_sol[
+    ,
+    peptide_key,
+    drop = FALSE
+  ],
+  tibble::as_tibble(min_mat_sol)
+)
+```
+
+## Fraction new
+
+```{r sol-fraction-new}
+# --- Fraction New -------------------------------------------------------------
+# FN = (M0_unlabeled - M0_timepoint) /
+#      (M0_unlabeled - M0_theoretical_min)
+#
+# All M0 values are expressed as M0 / (M0 + M1)
+
+meta_cols_sol <- c(peptide_key, "NEH_total")
+
+sample_cols_sol <- setdiff(
+  names(m0_frac_wide_sol),
+  meta_cols_sol
+)
+
+keep_samples_sol <- sample_cols_sol[
+  !grepl("^c0", sample_cols_sol, ignore.case = TRUE)
+]
+
+keep_samples_sol <- intersect(
+  keep_samples_sol,
+  setdiff(names(m0_min_wide_sol), peptide_key)
+)
+
+# Observed M0 and theoretical minimum
+obs_mat_sol <- as.matrix(
+  m0_frac_wide_sol[, keep_samples_sol, drop = FALSE]
+)
+
+tmin_mat_sol <- as.matrix(
+  m0_min_wide_sol[, keep_samples_sol, drop = FALSE]
+)
+
+storage.mode(obs_mat_sol) <- "numeric"
+storage.mode(tmin_mat_sol) <- "numeric"
+
+# Theoretical unlabeled M0 normalized to the M0 + M1 universe
+base_vec_sol <- as.numeric(
+  base_M0_sol / (base_M0_sol + base_M1_sol)
+)
+
+# Broadcast baseline across samples
+base_mat_sol <- matrix(
+  base_vec_sol,
+  nrow = nrow(obs_mat_sol),
+  ncol = ncol(obs_mat_sol),
+  byrow = FALSE
+)
+
+# Fraction new
+denom_sol <- base_mat_sol - tmin_mat_sol
+
+fn_mat_sol <- (
+  base_mat_sol - obs_mat_sol
+) / denom_sol
+
+# Invalid values -> NA
+fn_mat_sol[
+  !is.finite(fn_mat_sol) |
+    !is.finite(denom_sol) |
+    denom_sol <= 0
+] <- NA_real_
+
+# Small negative excursions (within 10%) -> 0
+fn_mat_sol[
+  fn_mat_sol < 0 &
+    fn_mat_sol >= -0.10
+] <- 0
+
+# More than 10% below theoretical minimum -> NA
+fn_mat_sol[
+  fn_mat_sol < -0.10
+] <- NA_real_
+
+# Small excursions above theoretical maximum (within 10%) -> 1
+fn_mat_sol[
+  fn_mat_sol > 1 &
+    fn_mat_sol <= 1.10
+] <- 1
+
+# More than 10% above theoretical maximum -> NA
+fn_mat_sol[
+  fn_mat_sol > 1.10
+] <- NA_real_
+
+colnames(fn_mat_sol) <- keep_samples_sol
+
+# Wide FN output
+fn_wide_sol <- dplyr::bind_cols(
+  m0_frac_wide_sol[, peptide_key, drop = FALSE],
+  tibble::as_tibble(fn_mat_sol)
+)
+```
+
+## Presence filter
+
+```{r sol-presence-filter}
+fn_sample_cols_sol <- setdiff(
+  names(fn_wide_sol),
+  peptide_key
+)
+
+fn_wide_filtered_sol <- fn_wide_sol |>
+  dplyr::filter(
+    rowMeans(
+      !is.na(dplyr::pick(dplyr::all_of(fn_sample_cols_sol)))
+    ) >= min_presence_sol
+  )
+
+cat(
+  "Before:", nrow(fn_wide_sol), "\n",
+  "After:", nrow(fn_wide_filtered_sol), "\n"
+)
+```
+
+# Insoluble FN calculation
+
+Outputs: `fn_wide_insol` and `fn_wide_filtered_insol`. All fraction-specific calculation intermediates end in `_insol`.
+
+## Import
+
+```{r insol-import}
+## Add NA's
+data_insol=read.csv("skyline_Export_insol.csv")
+```
+
+## Raw table
+
+```{r insol-raw-table, echo=FALSE}
+if (knitr::is_html_output()) {
+  library(DT)
+  library(htmltools)
+
+  htmltools::tags$details(
+    htmltools::tags$summary("Click to expand full table"),
+    DT::datatable(
+      data_insol,
+      rownames = FALSE,
+      options = list(
+        pageLength = 25,
+        lengthMenu = c(10, 25, 50, 100),
+        scrollX = TRUE
+      )
+    )
+  )
+}
+```
+
+## Missing values
+
+```{r insol-missing-values}
+data_insol[data_insol== "#N/A"] = NA
+```
+
+## Clean table
+
+```{r insol-clean-table, echo=FALSE}
+if (knitr::is_html_output()) {
+  library(DT)
+  library(htmltools)
+
+  htmltools::tags$details(
+    htmltools::tags$summary("Click to expand full table"),
+    DT::datatable(
+      data_insol,
+      rownames = FALSE,
+      options = list(
+        pageLength = 25,
+        lengthMenu = c(10, 25, 50, 100),
+        scrollX = TRUE
+      )
+    )
+  )
+}
+```
+
+## Isotope fractions
+
+```{r insol-isotope-fractions}
+# Tolerances
+# Normalize across Product.Mz rows within each peptide
+area_cols_insol <- grep(
+  "_I\\.Area$",
+  names(data_insol),
+  value = TRUE
+)
+
+if (!length(area_cols_insol)) {
+  stop("No columns ending in '_I.Area' were found.")
+}
+
+# Coerce area columns to numeric
+df_frac_insol <- data_insol
+df_frac_insol[area_cols_insol] <- lapply(
+  df_frac_insol[area_cols_insol],
+  function(x) suppressWarnings(as.numeric(as.character(x)))
+)
+
+# Calculate fractional abundance within peptide/charge groups
+df_frac_insol <- df_frac_insol %>%
+  dplyr::group_by(
+    dplyr::across(dplyr::all_of(peptide_key))
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::all_of(area_cols_insol),
+      ~ {
+        s <- sum(.x, na.rm = TRUE)
+
+        if (!is.finite(s) || s == 0) {
+          rep(NA_real_, dplyr::n())
+        } else {
+          .x / s
+        }
+      }
+    )
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::all_of(area_cols_insol),
+      ~ dplyr::if_else(
+        !is.na(.x) &
+          (
+            dplyr::near(.x, 1, tol = frac_one_tol) |
+            dplyr::near(.x, 0, tol = frac_zero_tol)
+          ),
+        NA_real_,
+        .x
+      )
+    )
+  ) %>%
+  dplyr::ungroup()
+```
+
+## M0 observed
+
+```{r insol-m0-observed}
+# ==== Tunables ================================================================
+# ==============================================================================
+
+stopifnot(all(c(peptide_key, "Product.Mz") %in% names(df_frac_insol)))
+
+# Fraction/sample columns
+frac_cols_insol <- grep(
+  "_I\\.Area$",
+  names(df_frac_insol),
+  value = TRUE
+)
+
+# Coerce to numeric
+df_iso_insol <- df_frac_insol
+
+df_iso_insol[frac_cols_insol] <- lapply(
+  df_iso_insol[frac_cols_insol],
+  function(x) suppressWarnings(as.numeric(as.character(x)))
+)
+
+df_iso_insol[["Product.Mz"]] <- suppressWarnings(
+  as.numeric(as.character(df_iso_insol[["Product.Mz"]]))
+)
+
+# Select the lowest-m/z row within each peptide/charge group
+m0_frac_wide_insol <- df_iso_insol %>%
+  dplyr::filter(!is.na(.data[["Product.Mz"]])) %>%
+  dplyr::group_by(!!!rlang::syms(peptide_key)) %>%
+  dplyr::slice_min(
+    order_by = .data[["Product.Mz"]],
+    n = 1L,
+    with_ties = FALSE
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(
+    dplyr::all_of(peptide_key),
+    dplyr::all_of(frac_cols_insol)
+  )
+```
+
+## NEH total
+
+```{r insol-neh-total}
+# ── Chunk: add NEH_total to m0_frac_wide (run after M0-fraction step) ─────────
+stopifnot(exists("NEH"),
+          all(c("Amino.Acid","NEH") %in% names(NEH)),
+          exists("m0_frac_wide_insol"),
+          "Peptide.Modified.Sequence" %in% names(m0_frac_wide_insol))
+
+# build lookup from NEH table
+NEH_map_insol <- NEH %>%
+  dplyr::transmute(AA = toupper(Amino.Acid), NEH = as.numeric(NEH)) %>%
+  dplyr::distinct(AA, .keep_all = TRUE)
+neh_lookup_insol <- stats::setNames(NEH_map_insol$NEH, NEH_map_insol$AA)
+
+# helpers
+sanitize_pep_insol <- function(s) {
+  s <- toupper(s)
+  s <- gsub("\\(.*?\\)|\\[.*?\\]|\\{.*?\\}", "", s)
+  gsub("[^A-Z]", "", s)
+}
+calc_pep_NEH_insol <- function(peps, lookup = neh_lookup_insol) {
+  vapply(peps, function(p) {
+    s <- sanitize_pep_insol(p)
+    if (s == "") return(NA_real_)
+    aa <- strsplit(s, "", fixed = TRUE)[[1]]
+    known <- aa %in% names(lookup)
+    if (!any(known)) return(NA_real_)
+    sum(lookup[aa[known]], na.rm = TRUE)
+  }, numeric(1))
+}
+
+# append NEH_total
+m0_frac_wide_insol <- m0_frac_wide_insol %>%
+  dplyr::mutate(NEH_total = calc_pep_NEH_insol(Peptide.Modified.Sequence))
+```
+
+## M0 theoretical
+
+```{r insol-m0-theoretical}
+# ---- Theoretical natural-abundance M0/M1 + D2O labeling ----
+
+if (!"NEH_total" %in% names(m0_frac_wide_insol)) {
+  stop("m0_frac_wide must contain NEH_total.")
+}
+
+seq_col_insol <- "Peptide.Modified.Sequence"
+
+if (!seq_col_insol %in% names(m0_frac_wide_insol)) {
+  stop("m0_frac_wide must contain Peptide.Modified.Sequence.")
+}
+
+sample_cols_insol <- setdiff(
+  names(m0_frac_wide_insol),
+  c(peptide_key, "NEH_total")
+)
+
+# Amino-acid residue elemental compositions
+aa_comp_insol <- data.frame(
+  C = c(3,6,4,4,3,5,5,2,6,6,6,6,5,9,5,3,4,11,9,5),
+  H = c(5,12,6,5,5,7,8,3,7,11,11,12,9,9,7,5,7,10,9,9),
+  N = c(1,4,2,1,1,1,2,1,3,1,1,2,1,1,1,1,1,2,1,1),
+  O = c(1,1,2,3,1,3,2,1,1,1,1,1,1,1,1,2,2,1,2,1),
+  S = c(0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0),
+  row.names = c(
+    "A","R","N","D","C","E","Q","G","H","I",
+    "L","K","M","F","P","S","T","W","Y","V"
+  )
+)
+
+# Natural isotope abundances
+iso_insol <- data.frame(
+  p0 = c(
+    C = 0.9893,
+    H = 0.999885,
+    N = 0.99636,
+    O = 0.99757,
+    S = 0.9499
+  ),
+  p1 = c(
+    C = 0.0107,   # 13C
+    H = 0.000115, # 2H
+    N = 0.00364,  # 15N
+    O = 0.00038,  # 17O
+    S = 0.0075    # 33S
+  )
+)
+
+# Strip modification annotations
+strip_mods_insol <- function(seq) {
+  seq <- gsub("\\[[^]]*\\]", "", seq)
+  seq <- gsub("\\([^)]*\\)", "", seq)
+  seq <- gsub("[^A-Za-z]", "", seq)
+  toupper(seq)
+}
+
+# Calculate elemental formula of unmodified peptide
+get_formula_insol <- function(seq) {
+
+  seq <- strip_mods_insol(seq)
+
+  aa <- strsplit(
+    seq,
+    "",
+    fixed = TRUE
+  )[[1]]
+
+  if (
+    !length(aa) ||
+    any(!aa %in% rownames(aa_comp_insol))
+  ) {
+    stop("Invalid peptide sequence after stripping modifications: ", seq)
+  }
+
+  f <- colSums(
+    aa_comp_insol[aa, , drop = FALSE]
+  )
+
+  # Add terminal H2O
+  f["H"] <- f["H"] + 2
+  f["O"] <- f["O"] + 1
+
+  f
+}
+
+# Theoretical natural-abundance M0 and M1
+get_natural_m01_insol <- function(seq) {
+
+  f <- get_formula_insol(seq)
+
+  p0 <- iso_insol[names(f), "p0"]
+  p1 <- iso_insol[names(f), "p1"]
+
+  M0 <- exp(
+    sum(f * log(p0))
+  )
+
+  M1 <- M0 * sum(
+    f * p1 / p0
+  )
+
+  c(
+    M0 = M0,
+    M1 = M1
+  )
+}
+
+nat_insol <- t(
+  vapply(
+    m0_frac_wide_insol[[seq_col_insol]],
+    get_natural_m01_insol,
+    numeric(2)
+  )
+)
+
+base_M0_insol <- nat_insol[, "M0"]
+base_M1_insol <- nat_insol[, "M1"]
+
+# ---- Match BWE to samples ----
+
+bwe_values_insol <- suppressWarnings(
+  as.numeric(as.character(bwe$BWE))
+)
+
+# Convert percentage to atom fraction
+bwe_values_insol[bwe_values_insol > 1] <-
+  bwe_values_insol[bwe_values_insol > 1] / 100
+
+bwe_values_insol[!is.finite(bwe_values_insol)] <-
+  NA_real_
+
+bw_map_insol <- stats::setNames(
+  bwe_values_insol,
+  normalize_id(bwe$ID)
+)
+
+sample_bwe_insol <- unname(
+  bw_map_insol[normalize_id(sample_cols_insol)]
+)
+
+if (anyNA(sample_bwe_insol)) {
+  stop(
+    "BWE missing for: ",
+    paste(
+      sample_cols_insol[is.na(sample_bwe_insol)],
+      collapse = ", "
+    )
+  )
+}
+
+sample_bwe_insol <- pmin(
+  pmax(sample_bwe_insol, 0),
+  1 - 1e-12
+)
+
+# ---- Apply D2O labeling ----
+
+neh_vec_insol <- suppressWarnings(
+  as.numeric(m0_frac_wide_insol$NEH_total)
+)
+
+if (anyNA(neh_vec_insol)) {
+  stop("NEH_total contains missing or non-numeric values.")
+}
+
+log_1mp_insol <- log1p(-sample_bwe_insol)
+
+# Probability of zero incorporated D atoms
+p0_label_insol <- exp(
+  outer(
+    neh_vec_insol,
+    log_1mp_insol,
+    `*`
+  )
+)
+
+# Probability of exactly one incorporated D atom
+p1_label_insol <- outer(
+  neh_vec_insol,
+  sample_bwe_insol,
+  `*`
+) * exp(
+  outer(
+    neh_vec_insol - 1,
+    log_1mp_insol,
+    `*`
+  )
+)
+
+# Natural isotope envelope convolved with D2O labeling
+M0_lab_insol <- base_M0_insol * p0_label_insol
+
+M1_lab_insol <-
+  base_M1_insol * p0_label_insol +
+  base_M0_insol * p1_label_insol
+
+# Expected M0 / (M0 + M1)
+min_mat_insol <- M0_lab_insol / (
+  M0_lab_insol + M1_lab_insol
+)
+
+min_mat_insol[!is.finite(min_mat_insol)] <-
+  NA_real_
+
+colnames(min_mat_insol) <- sample_cols_insol
+
+# ---- Final theoretical minimum M0 ratios ----
+
+m0_min_wide_insol <- dplyr::bind_cols(
+  m0_frac_wide_insol[
+    ,
+    peptide_key,
+    drop = FALSE
+  ],
+  tibble::as_tibble(min_mat_insol)
+)
+```
+
+## Fraction new
+
+```{r insol-fraction-new}
+# --- Fraction New -------------------------------------------------------------
+# FN = (M0_unlabeled - M0_timepoint) /
+#      (M0_unlabeled - M0_theoretical_min)
+#
+# All M0 values are expressed as M0 / (M0 + M1)
+
+meta_cols_insol <- c(peptide_key, "NEH_total")
+
+sample_cols_insol <- setdiff(
+  names(m0_frac_wide_insol),
+  meta_cols_insol
+)
+
+keep_samples_insol <- sample_cols_insol[
+  !grepl("^c0", sample_cols_insol, ignore.case = TRUE)
+]
+
+keep_samples_insol <- intersect(
+  keep_samples_insol,
+  setdiff(names(m0_min_wide_insol), peptide_key)
+)
+
+# Observed M0 and theoretical minimum
+obs_mat_insol <- as.matrix(
+  m0_frac_wide_insol[, keep_samples_insol, drop = FALSE]
+)
+
+tmin_mat_insol <- as.matrix(
+  m0_min_wide_insol[, keep_samples_insol, drop = FALSE]
+)
+
+storage.mode(obs_mat_insol) <- "numeric"
+storage.mode(tmin_mat_insol) <- "numeric"
+
+# Theoretical unlabeled M0 normalized to the M0 + M1 universe
+base_vec_insol <- as.numeric(
+  base_M0_insol / (base_M0_insol + base_M1_insol)
+)
+
+# Broadcast baseline across samples
+base_mat_insol <- matrix(
+  base_vec_insol,
+  nrow = nrow(obs_mat_insol),
+  ncol = ncol(obs_mat_insol),
+  byrow = FALSE
+)
+
+# Fraction new
+denom_insol <- base_mat_insol - tmin_mat_insol
+
+fn_mat_insol <- (
+  base_mat_insol - obs_mat_insol
+) / denom_insol
+
+# Invalid values -> NA
+fn_mat_insol[
+  !is.finite(fn_mat_insol) |
+    !is.finite(denom_insol) |
+    denom_insol <= 0
+] <- NA_real_
+
+# Small negative excursions (within 10%) -> 0
+fn_mat_insol[
+  fn_mat_insol < 0 &
+    fn_mat_insol >= -0.10
+] <- 0
+
+# More than 10% below theoretical minimum -> NA
+fn_mat_insol[
+  fn_mat_insol < -0.10
+] <- NA_real_
+
+# Small excursions above theoretical maximum (within 10%) -> 1
+fn_mat_insol[
+  fn_mat_insol > 1 &
+    fn_mat_insol <= 1.10
+] <- 1
+
+# More than 10% above theoretical maximum -> NA
+fn_mat_insol[
+  fn_mat_insol > 1.10
+] <- NA_real_
+
+colnames(fn_mat_insol) <- keep_samples_insol
+
+# Wide FN output
+fn_wide_insol <- dplyr::bind_cols(
+  m0_frac_wide_insol[, peptide_key, drop = FALSE],
+  tibble::as_tibble(fn_mat_insol)
+)
+```
+
+## Presence filter
+
+```{r insol-presence-filter}
+fn_sample_cols_insol <- setdiff(
+  names(fn_wide_insol),
+  peptide_key
+)
+
+fn_wide_filtered_insol <- fn_wide_insol |>
+  dplyr::filter(
+    rowMeans(
+      !is.na(dplyr::pick(dplyr::all_of(fn_sample_cols_insol)))
+    ) >= min_presence_insol
+  )
+
+cat(
+  "Before:", nrow(fn_wide_insol), "\n",
+  "After:", nrow(fn_wide_filtered_insol), "\n"
+)
+```
+
+# Data for plots and final statistics
+
+This final section replaces the duplicated exploratory plots with a single set of
+final figures using the same overall visual language as the other project
+markdowns. Plots are colored by biological group, grouped on the x-axis by
+fraction, and shown with animal-level statistics.
+
+```{r final-setup}
+# ------------------------------
+# Shared aesthetics and helpers
+# ------------------------------
+
+age_group_levels <- c("Adult sed", "Old sed")
+treatment_group_levels <- c("Old sed", "Old ex", "Old rapa")
+all_group_levels <- c(age_group_levels, treatment_group_levels)
+
+label_levels <- c(30, 45, 60)
+fraction_levels <- c("Soluble", "Insoluble")
+# Export BOTH statistical views in a single run. The original figure filenames
+# always use Holm adjustment; separate *_raw files use unadjusted p-values.
+p_display <- "holm"
+
+# Use project-consistent colors.
+group_cols <- c(
+  "Adult sed" = "#3B528B",
+  "Old sed"   = "#59C761",
+  "Old ex"    = "#F2D925",
+  "Old rapa"  = "#64106E"
+)
+
+darken_col <- function(col, factor = 0.75) {
+  rgb_mat <- grDevices::col2rgb(col) / 255
+  grDevices::rgb(
+    red   = rgb_mat[1, ] * factor,
+    green = rgb_mat[2, ] * factor,
+    blue  = rgb_mat[3, ] * factor
+  )
+}
+
+group_fill_cols <- stats::setNames(
+  grDevices::adjustcolor(unname(group_cols), alpha.f = 0.35),
+  names(group_cols)
+)
+
+group_border_cols <- stats::setNames(
+  vapply(unname(group_cols), darken_col, character(1), factor = 0.75),
+  names(group_cols)
+)
+
+sex_shapes <- c("Female" = 21, "Male" = 24)
+
+fmt_p <- function(p) {
+  # Vectorized for emmeans pairwise contrast tables (several p values).
+  vapply(p, function(x) {
+    if (is.na(x) || !is.finite(x)) return("NA")
+    if (x < 0.001) return("<0.001")
+    sprintf("%.3f", x)
+  }, character(1))
+}
+
+get_p <- function(tab, term) {
+  rn <- rownames(tab)
+  idx <- which(rn == term)
+  if (!length(idx)) return(NA_real_)
+  if ("Pr(>F)" %in% names(tab)) return(as.numeric(tab[idx[1], "Pr(>F)"]))
+  if ("Pr(>Chisq)" %in% names(tab)) return(as.numeric(tab[idx[1], "Pr(>Chisq)"]))
+  NA_real_
+}
+
+theme_lab <- function() {
+  ggplot2::theme_classic(base_size = nm_style$axis_text, base_family = nm_style$font_family) +
+    ggplot2::theme(
+      text = ggplot2::element_text(family = nm_style$font_family),
+      plot.title = ggplot2::element_text(face = "bold", size = nm_style$plot_title, hjust = 0.5),
+      plot.subtitle = ggplot2::element_text(size = nm_style$plot_subtitle, hjust = 0.5),
+      axis.title = ggplot2::element_text(face = "plain", size = nm_style$axis_title),
+      axis.text = ggplot2::element_text(face = "plain", size = nm_style$axis_text, colour = "black"),
+      axis.line = ggplot2::element_line(linewidth = nm_style$axis_line, colour = "black"),
+      axis.ticks = ggplot2::element_line(linewidth = nm_style$axis_line, colour = "black"),
+      axis.ticks.length = grid::unit(1.2, "mm"),
+      strip.background = ggplot2::element_rect(fill = "white", colour = "black", linewidth = nm_style$strip_line),
+      strip.text = ggplot2::element_text(face = "bold", size = nm_style$strip_text),
+      legend.title = ggplot2::element_text(face = "bold", size = nm_style$legend_title),
+      legend.text = ggplot2::element_text(size = nm_style$legend_text),
+      panel.spacing = grid::unit(0.45, "lines"),
+      plot.caption = ggplot2::element_blank(),
+      plot.margin = ggplot2::margin(
+        nm_style$plot_margin_mm, nm_style$plot_margin_mm,
+        nm_style$plot_margin_mm, nm_style$plot_margin_mm, unit = "mm")
+    )
+}
+```
+
+```{r combined-plot-data}
+make_long <- function(dat, fraction) {
+  sample_cols <- setdiff(names(dat), peptide_key)
+
+  dat %>%
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(sample_cols),
+      names_to = "Sample",
+      values_to = "FN"
+    ) %>%
+    dplyr::mutate(
+      ID = normalize_id(Sample),
+      Fraction = fraction
+    ) %>%
+    dplyr::left_join(
+      bwe %>%
+        dplyr::mutate(
+          ID = trimws(as.character(ID)),
+          Group = trimws(as.character(Group)),
+          Sex = dplyr::recode(tolower(trimws(as.character(Sex))),
+                              female = "Female", male = "Male",
+                              .default = trimws(as.character(Sex))),
+          Label = as.numeric(as.character(Label))
+        ) %>%
+        dplyr::select(ID, Group, Sex, Label, BWE),
+      by = "ID"
+    ) %>%
+    dplyr::filter(
+      is.finite(FN),
+      FN >= 0,
+      FN <= 1,
+      !is.na(Group),
+      !is.na(Label)
+    ) %>%
+    dplyr::mutate(
+      Fraction = factor(Fraction, levels = fraction_levels),
+      Group = factor(Group, levels = unique(all_group_levels)),
+      Sex = factor(Sex, levels = c("Female", "Male")),
+      Label = factor(Label, levels = label_levels)
+    )
+}
+
+sol_all <- make_long(fn_wide_filtered_sol, "Soluble")
+insol_all <- make_long(fn_wide_filtered_insol, "Insoluble")
+all_dat <- dplyr::bind_rows(sol_all, insol_all)
+
+shared_peptides <- dplyr::inner_join(
+  fn_wide_filtered_sol %>% dplyr::distinct(dplyr::across(dplyr::all_of(peptide_key))),
+  fn_wide_filtered_insol %>% dplyr::distinct(dplyr::across(dplyr::all_of(peptide_key))),
+  by = peptide_key
+)
+
+shared_dat <- dplyr::bind_rows(
+  fn_wide_filtered_sol %>% dplyr::semi_join(shared_peptides, by = peptide_key) %>% make_long("Soluble"),
+  fn_wide_filtered_insol %>% dplyr::semi_join(shared_peptides, by = peptide_key) %>% make_long("Insoluble")
+)
+
+# Keep only peptides observed at 30, 45 and 60 d within each group/fraction.
+dat_3tp <- all_dat %>%
+  dplyr::filter(Label %in% label_levels) %>%
+  dplyr::group_by(Protein, Peptide.Modified.Sequence, Precursor.Charge, Fraction, Group) %>%
+  dplyr::filter(dplyr::n_distinct(Label) == 3) %>%
+  dplyr::ungroup()
+
+# Animal-level means are used for inference.
+fn_animal <- dat_3tp %>%
+  dplyr::group_by(ID, Sex, Group, Label, Fraction) %>%
+  dplyr::summarise(Mean_FN = mean(FN, na.rm = TRUE), .groups = "drop")
+
+# Quick QC summaries.
+qc_group_counts <- fn_animal %>%
+  dplyr::count(Group, Label, Fraction, name = "n_animals")
+
+qc_peptide_counts <- dat_3tp %>%
+  dplyr::distinct(Protein, Peptide.Modified.Sequence, Precursor.Charge, Group, Fraction) %>%
+  dplyr::count(Group, Fraction, name = "n_peptides")
+
+cat("\nAnimal counts by group, timepoint and fraction:\n")
+cat(paste(capture.output(print(qc_group_counts, n = Inf)), collapse = "\n"), "\n")
+cat("\nRetained peptide counts:\n")
+cat(paste(capture.output(print(qc_peptide_counts, n = Inf)), collapse = "\n"), "\n")
+```
+
+## Audit notes
+
+```{r audit-notes, results='asis'}
+cat(
+  "1. The original markdown used absolute file paths from your collaborator's computer; ",
+  "this version uses local files in the working directory.\n\n",
+  "2. The original markdown repeated the same violin analysis twice (with and without stats); ",
+  "this version keeps only the statistical version.\n\n",
+  "3. The original treatment plot order was inconsistent. This version always uses Old sed, Old ex, Old rapa.\n\n",
+  "4. Sex labels in d2o.csv use mixed capitalization across groups; they are standardized here to Female/Male.\n\n",
+  "5. The original old-treatment model was additive (Group + Fraction + Label) and therefore did not test Group × Fraction interaction or per-timepoint treatment effects. ",
+  "Below, treatment models are run separately at 30, 45, and 60 d and explicitly test Treatment, Fraction, and Treatment × Fraction.\n\n",
+  "6. Presence filtering is currently set to 100% across all samples within each fraction (min_presence = 1). ",
+  "That is stricter than your usual 50% within-group proteomics filter, so interpret the retained peptide set accordingly.\n"
+)
+```
+
+# Final figures with statistics
+
+The treatment statistics below are all derived from the same per-timepoint mixed model:
+`Mean_FN ~ Treatment * Fraction + (1 | ID)`. Planned contrasts are then obtained with
+`emmeans`, which keeps the overall treatment contrasts, treatment-by-fraction contrasts,
+and within-fraction contrasts from the same fitted model. Holm correction
+is applied separately within each family of two planned comparisons.
+The short files `fn_out/audit.csv` and `fn_out/means.csv` expose unadjusted
+p-values, adjusted p-values, effect estimates, standard errors and n per cell.
+**Identical adjusted p-values do not imply identical treatment effects.**
+
+```{r model-helpers}
+make_age_stats <- function(dat) {
+  labs <- levels(dat$Label)
+
+  purrr::map_dfr(labs, function(lbl) {
+    subdat <- dat %>%
+      dplyr::filter(Label == lbl, Group %in% age_group_levels) %>%
+      dplyr::mutate(
+        Age = factor(
+          ifelse(Group == "Adult sed", "Adult", "Old"),
+          levels = c("Adult", "Old")
+        ),
+        Fraction = factor(Fraction, levels = fraction_levels)
+      )
+
+    fit <- lmerTest::lmer(
+      Mean_FN ~ Age * Fraction + (1 | ID),
+      data = subdat
+    )
+
+    tab <- as.data.frame(stats::anova(fit, type = 3))
+
+    dplyr::tibble(
+      Label = factor(lbl, levels = label_levels),
+      Age_p = get_p(tab, "Age"),
+      Fraction_p = get_p(tab, "Fraction"),
+      Interaction_p = get_p(tab, "Age:Fraction"),
+      label_text = paste0(
+        "Age p=", fmt_p(get_p(tab, "Age")),
+        " | Fraction p=", fmt_p(get_p(tab, "Fraction")),
+        " | Int p=", fmt_p(get_p(tab, "Age:Fraction"))
+      ),
+      x = 1.50,
+      y = 1.135
+    )
+  })
+}
+
+make_trt_stats <- function(dat) {
+  # Both raw (unadjusted) and Holm-adjusted p-values are retained in an audit table.
+  # The figure uses p_display, controlled in the final-setup chunk.
+  labs <- levels(dat$Label)
+
+  results <- purrr::map(labs, function(lbl) {
+    subdat <- dat %>%
+      dplyr::filter(Label == lbl, Group %in% treatment_group_levels) %>%
+      dplyr::mutate(
+        Group = factor(Group, levels = treatment_group_levels),
+        Fraction = factor(Fraction, levels = fraction_levels),
+        Treatment = factor(
+          dplyr::recode(as.character(Group),
+                        "Old sed" = "Control",
+                        "Old ex" = "Exercise",
+                        "Old rapa" = "Rapamycin"),
+          levels = c("Control", "Exercise", "Rapamycin")
+        )
+      )
+
+    # A mouse with both fractions is one experimental unit; the random
+    # intercept accounts for its two paired observations.
+    fit <- lmerTest::lmer(
+      Mean_FN ~ Treatment * Fraction + (1 | ID),
+      data = subdat
+    )
+
+    # Collect the estimate, uncertainty, UNADJUSTED p, and Holm p for
+    # each preplanned contrast. Never infer a p-value from the violin shape.
+    contrast_audit <- function(obj, family, contrast_names) {
+      raw <- as.data.frame(
+        summary(obj, infer = c(TRUE, TRUE), adjust = "none")
+      )
+      holm <- as.data.frame(summary(obj, adjust = "holm"))
+      stopifnot(nrow(raw) == nrow(holm))
+
+      if (!identical(as.character(raw$contrast), as.character(holm$contrast))) {
+        stop("Contrast ordering mismatch: ", family, ", ", lbl)
+      }
+
+      # IMPORTANT: Freeze function arguments and conditioning labels BEFORE
+      # mutate(). In v12 `family = family` created a family COLUMN; on the
+      # next line `identical(family, "Within fraction")` compared that
+      # *column* with a string, returned FALSE and labelled all four simple
+      # contrasts as "Both", so the downstream lookup failed.
+      family_name <- as.character(family)
+      is_conditional <- identical(family_name, "Within fraction")
+      n <- nrow(raw)
+      if (is_conditional) {
+        if (!"Fraction" %in% names(raw) || !"Fraction" %in% names(holm)) {
+          stop("Missing Fraction conditioning column in within-fraction emmeans ",
+               "summary at ", lbl, " d. Raw columns: ",
+               paste(names(raw), collapse = ", "))
+        }
+        frac_tag <- as.character(raw[["Fraction"]])
+        if (!identical(frac_tag, as.character(holm[["Fraction"]]))) {
+          stop("Within-fraction conditioning labels differ between raw ",
+               "and Holm summaries at ", lbl, " d")
+        }
+        if (anyNA(frac_tag) ||
+            !setequal(frac_tag, c("Soluble", "Insoluble")) ||
+            any(table(frac_tag) != 2L)) {
+          stop("Expected exactly two planned contrasts in each fraction at ",
+               lbl, " d; got: ", paste(frac_tag, collapse = ", "))
+        }
+      } else {
+        # Only a conditional emmeans grid should carry Soluble/Insoluble tags.
+        frac_tag <- rep("Both", n)
+      }
+
+      # These standalone vectors cannot be shadowed by incoming emmeans
+      # columns or columns created earlier in mutate().
+      cmp_label <- as.character(raw[["contrast"]])
+      raw_p <- as.numeric(raw[["p.value"]])
+      holm_p <- as.numeric(holm[["p.value"]])
+      day_val <- as.numeric(as.character(lbl))
+
+      out <- raw %>%
+        dplyr::mutate(
+          Label = .env$day_val,
+          family = .env$family_name,
+          comparison = .env$cmp_label,
+          Fraction = .env$frac_tag,
+          p_raw = .env$raw_p,
+          p_holm = .env$holm_p
+        ) %>%
+        dplyr::select(
+          Label, family, Fraction, comparison,
+          estimate, SE, df,
+          dplyr::any_of(c("lower.CL", "upper.CL")),
+          p_raw, p_holm
+        )
+
+      if (is_conditional) {
+        check <- out %>%
+          dplyr::count(.data$Fraction, .data$comparison)
+        expected <- expand.grid(
+          Fraction = c("Soluble", "Insoluble"),
+          comparison = c("Exercise - Control", "Rapamycin - Control"),
+          stringsAsFactors = FALSE
+        )
+        if (nrow(out) != 4L || any(check$n != 1L) ||
+            !setequal(paste(out$Fraction, out$comparison),
+                      paste(expected$Fraction, expected$comparison))) {
+          stop("Within-fraction contrast audit invalid at ", lbl,
+               " d; got: ",
+               paste(paste(out$comparison, "[", out$Fraction, "]"),
+                     collapse = "; "))
+        }
+      }
+      out
+    }
+
+    # Avoid relying on emmeans' implicit factor ordering or the
+    # package-specific label assigned by method = "pairwise".
+    # An explicitly named (+1, -1) contrast also guarantees that
+    # the same quantity is used for both Holm and raw displays.
+    fraction_emm <- emmeans::emmeans(
+      fit, ~ Fraction, lmer.df = "satterthwaite"
+    )
+    fraction_grid <- as.data.frame(fraction_emm)
+    fraction_order <- as.character(fraction_grid$Fraction)
+    if (!setequal(fraction_order, c("Soluble", "Insoluble")) ||
+        length(fraction_order) != 2L) {
+      stop(
+        "Expected exactly two fraction levels (Soluble/Insoluble) at ",
+        lbl, " d. Found: ", paste(fraction_order, collapse = ", ")
+      )
+    }
+    fraction_weights <- ifelse(fraction_order == "Soluble", 1, -1)
+    frac_obj <- emmeans::contrast(
+      fraction_emm,
+      method = list("Soluble - Insoluble" = fraction_weights)
+    )
+    frac_audit <- contrast_audit(frac_obj, "Fraction", "Fraction")
+    if (nrow(frac_audit) != 1L ||
+        frac_audit$comparison[[1]] != "Soluble - Insoluble" ||
+        frac_audit$Fraction[[1]] != "Both") {
+      stop("Fraction contrast audit validation failed at ", lbl, " d")
+    }
+
+    trt_obj <- emmeans::contrast(
+      emmeans::emmeans(fit, ~ Treatment, lmer.df = "satterthwaite"),
+      method = "trt.vs.ctrl", ref = "Control"
+    )
+    trt_audit <- contrast_audit(trt_obj, "Overall treatment", "Treatment")
+
+    simple_obj <- emmeans::contrast(
+      emmeans::emmeans(fit, ~ Treatment | Fraction, lmer.df = "satterthwaite"),
+      method = "trt.vs.ctrl", ref = "Control"
+    )
+    simple_audit <- contrast_audit(simple_obj, "Within fraction", "Treatment")
+
+    cell_all <- emmeans::emmeans(
+      fit, ~ Treatment * Fraction, lmer.df = "satterthwaite"
+    )
+    cell_grid <- as.data.frame(cell_all)
+
+    # Difference-in-differences:
+    # (Treatment - Control)_Insoluble - (Treatment - Control)_Soluble
+    int_weights <- function(trt) {
+      w <- rep(0, nrow(cell_grid))
+      w[cell_grid$Treatment == trt & cell_grid$Fraction == "Insoluble"] <-  1
+      w[cell_grid$Treatment == "Control" & cell_grid$Fraction == "Insoluble"] <- -1
+      w[cell_grid$Treatment == trt & cell_grid$Fraction == "Soluble"] <- -1
+      w[cell_grid$Treatment == "Control" & cell_grid$Fraction == "Soluble"] <-  1
+      if (!identical(sort(w[w != 0]), c(-1, -1, 1, 1))) {
+        stop("Interaction weights could not be verified for: ", trt)
+      }
+      w
+    }
+    int_obj <- emmeans::contrast(
+      cell_all,
+      method = list(
+        "Exercise x Fraction" = int_weights("Exercise"),
+        "Rapamycin x Fraction" = int_weights("Rapamycin")
+      )
+    )
+    int_audit <- contrast_audit(int_obj, "Interaction", "Treatment x Fraction")
+
+    audit <- dplyr::bind_rows(frac_audit, trt_audit, simple_audit, int_audit)
+
+    get_stat <- function(family, comparison, frac = "Both", col = "p_holm") {
+      # Explicitly distinguish audit DATA columns from FUNCTION arguments.
+      # Without .env, `family == family` and `comparison == comparison`
+      # can compare each column to itself and select multiple contrasts.
+      hits <- audit %>%
+        dplyr::filter(
+          .data$family == .env$family,
+          .data$comparison == .env$comparison,
+          .data$Fraction == .env$frac
+        )
+      if (nrow(hits) != 1L) {
+        available <- audit %>%
+          dplyr::filter(.data$family == .env$family) %>%
+          dplyr::transmute(
+            key = paste0(.data$comparison, " [", .data$Fraction, "]")
+          ) %>%
+          dplyr::pull(.data$key)
+        stop(
+          "Missing or duplicate contrast: ", family, " / ", comparison,
+          " / ", frac, " / ", lbl, ". Available in family: ",
+          paste(available, collapse = "; ")
+        )
+      }
+      value <- hits[[col]][[1]]
+      if (!is.finite(value)) {
+        warning("Nonfinite ", col, " for ", family, " / ", comparison,
+                " / ", frac, " / ", lbl)
+      }
+      value
+    }
+    pcol <- if (identical(p_display, "raw")) "p_raw" else "p_holm"
+    frac_p <- get_stat("Fraction", "Soluble - Insoluble", col = "p_raw")
+    ex_p <- get_stat("Overall treatment", "Exercise - Control", col = pcol)
+    ra_p <- get_stat("Overall treatment", "Rapamycin - Control", col = pcol)
+    ex_int <- get_stat("Interaction", "Exercise x Fraction", col = pcol)
+    ra_int <- get_stat("Interaction", "Rapamycin x Fraction", col = pcol)
+    sex_p <- function(fr, trt) get_stat("Within fraction", paste0(trt, " - Control"), fr, pcol)
+    sol_ex <- sex_p("Soluble", "Exercise")
+    sol_ra <- sex_p("Soluble", "Rapamycin")
+    ins_ex <- sex_p("Insoluble", "Exercise")
+    ins_ra <- sex_p("Insoluble", "Rapamycin")
+
+    descriptives <- subdat %>%
+      dplyr::group_by(Treatment, Fraction) %>%
+      dplyr::summarise(
+        n_animals = dplyr::n_distinct(ID),
+        mean_FN = mean(Mean_FN),
+        sd_FN = stats::sd(Mean_FN),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(Label = as.numeric(as.character(lbl))) %>%
+      dplyr::select(Label, Treatment, Fraction, n_animals, mean_FN, sd_FN)
+
+    if (abs(get_stat("Overall treatment", "Exercise - Control", col = "p_holm") -
+            get_stat("Overall treatment", "Rapamycin - Control", col = "p_holm")) < 0.0005) {
+      message("At ", lbl, " d, Exercise and Rapamycin have (nearly) equal Holm p-values. ",
+              "Consult fn_out/audit.csv for their distinct raw p-values, ",
+              "effect estimates, SE, and animal counts.")
+    }
+
+    list(
+      stats = dplyr::tibble(
+        Label = factor(lbl, levels = label_levels),
+        Fraction_p = frac_p,
+        Ex_p = ex_p, Rapa_p = ra_p,
+        ExFrac_p = ex_int, RapaFrac_p = ra_int,
+        Sol_Ex_p = sol_ex, Sol_Rapa_p = sol_ra,
+        Ins_Ex_p = ins_ex, Ins_Rapa_p = ins_ra,
+        label_text = paste0(
+          "Fraction p=", fmt_p(frac_p),
+          "\nEx p=", fmt_p(ex_p), " | Rapa p=", fmt_p(ra_p),
+          "\nEx × Fraction p=", fmt_p(ex_int),
+          " | Rapa × Fraction p=", fmt_p(ra_int)
+        ),
+        fraction_text = paste0("Fraction p=", fmt_p(frac_p)),
+        sol_text = paste0("Ex p=", fmt_p(sol_ex), "\nRapa p=", fmt_p(sol_ra)),
+        ins_text = paste0("Ex p=", fmt_p(ins_ex), "\nRapa p=", fmt_p(ins_ra)),
+        x = 1.50,
+        y = 1.235,
+        x_sol = 1.00, x_ins = 2.00,
+        y_fraction = 1.235,
+        y_pair = 1.198
+      ),
+      audit = audit,
+      descriptives = descriptives
+    )
+  })
+
+  ans <- dplyr::bind_rows(purrr::map(results, "stats"))
+  attr(ans, "contrast_audit") <- dplyr::bind_rows(purrr::map(results, "audit"))
+  attr(ans, "descriptives") <- dplyr::bind_rows(purrr::map(results, "descriptives"))
+  ans
+}
+
+age_stats_by_time <- make_age_stats(fn_animal)
+trt_stats_by_time <- make_trt_stats(fn_animal)
+trt_audit <- attr(trt_stats_by_time, "contrast_audit")
+trt_desc <- attr(trt_stats_by_time, "descriptives")
+
+cat("\nAge comparison, each timepoint:\n")
+cat(
+  paste(capture.output(print(age_stats_by_time, n = Inf)), collapse = "\n"),
+  "\n"
+)
+
+cat("\nOld-treatment comparison, each timepoint:\n")
+cat(
+  paste(capture.output(print(trt_stats_by_time, n = Inf)), collapse = "\n"),
+  "\n"
+)
+```
+
+**If an error interrupts `make_trt_stats()`**, enter `Q` at the `Browse[1]>` prompt before troubleshooting.
+The `trt_stats_by_time` object is assigned only after every timepoint finishes,
+so it cannot be inspected following a failed call.
+
+## Statistical display views: Holm and unadjusted
+
+Both figure sets use **the same fitted models, estimates and peptide/animal data**.
+Only the displayed p-value column differs. The age comparison has no
+corresponding two-treatment contrast family and is unchanged.
+
+```{r pvalue-views}
+make_pvalue_view <- function(stats, audit, p_column = c("p_holm", "p_raw")) {
+  p_column <- match.arg(p_column)
+  out <- stats
+
+  one_p <- function(day, family_name, comparison_name, fraction_name = "Both") {
+    hit <- audit %>%
+      dplyr::filter(
+        .data$Label == day,
+        .data$family == family_name,
+        .data$comparison == comparison_name,
+        .data$Fraction == fraction_name
+      )
+
+    if (nrow(hit) != 1L) {
+      stop(
+        "Expected exactly one contrast for ", day, " d / ",
+        family_name, " / ", comparison_name, " / ", fraction_name,
+        "; found ", nrow(hit)
+      )
+    }
+
+    as.numeric(hit[[p_column]][[1]])
+  }
+
+  for (i in seq_len(nrow(out))) {
+    day <- as.numeric(as.character(out$Label[[i]]))
+
+    fr <- one_p(day, "Fraction", "Soluble - Insoluble")
+    ex <- one_p(day, "Overall treatment", "Exercise - Control")
+    ra <- one_p(day, "Overall treatment", "Rapamycin - Control")
+    ex_int <- one_p(day, "Interaction", "Exercise x Fraction")
+    ra_int <- one_p(day, "Interaction", "Rapamycin x Fraction")
+
+    sx <- one_p(day, "Within fraction", "Exercise - Control", "Soluble")
+    sr <- one_p(day, "Within fraction", "Rapamycin - Control", "Soluble")
+    ix <- one_p(day, "Within fraction", "Exercise - Control", "Insoluble")
+    ir <- one_p(day, "Within fraction", "Rapamycin - Control", "Insoluble")
+
+    out$Fraction_p[[i]] <- fr
+    out$Ex_p[[i]] <- ex
+    out$Rapa_p[[i]] <- ra
+    out$ExFrac_p[[i]] <- ex_int
+    out$RapaFrac_p[[i]] <- ra_int
+    out$Sol_Ex_p[[i]] <- sx
+    out$Sol_Rapa_p[[i]] <- sr
+    out$Ins_Ex_p[[i]] <- ix
+    out$Ins_Rapa_p[[i]] <- ir
+
+    out$label_text[[i]] <- paste0(
+      "Fraction p=", fmt_p(fr),
+      "\nEx p=", fmt_p(ex), " | Rapa p=", fmt_p(ra),
+      "\nEx × Fraction p=", fmt_p(ex_int),
+      " | Rapa × Fraction p=", fmt_p(ra_int)
+    )
+    out$fraction_text[[i]] <- paste0("Fraction p=", fmt_p(fr))
+    out$sol_text[[i]] <- paste0(
+      "Ex p=", fmt_p(sx), "\nRapa p=", fmt_p(sr)
+    )
+    out$ins_text[[i]] <- paste0(
+      "Ex p=", fmt_p(ix), "\nRapa p=", fmt_p(ir)
+    )
+  }
+
+  out
+}
+
+trt_stats_holm <- make_pvalue_view(trt_stats_by_time, trt_audit, "p_holm")
+trt_stats_raw  <- make_pvalue_view(trt_stats_by_time, trt_audit, "p_raw")
+```
+
+```{r plotting-helpers}
+make_x_layout <- function(groups) {
+  if (length(groups) == 2) {
+    dplyr::tibble(
+      Fraction = rep(fraction_levels, each = 2),
+      Group = rep(groups, times = 2),
+      x = c(0.84, 1.16, 1.84, 2.16),
+      tick = c("Adult", "Old", "Adult", "Old")
+    )
+  } else if (length(groups) == 3) {
+    dplyr::tibble(
+      Fraction = rep(fraction_levels, each = 3),
+      Group = rep(groups, times = 2),
+      x = c(0.72, 1.00, 1.28, 1.72, 2.00, 2.28),
+      tick = c("Ctl", "Ex", "Rapa", "Ctl", "Ex", "Rapa")
+    )
+  } else {
+    stop("Only 2-group and 3-group layouts are currently supported.")
+  }
+}
+
+make_frac_guides <- function(groups) {
+  if (length(groups) == 2) {
+    dplyr::tibble(
+      Fraction = fraction_levels,
+      x1 = c(0.76, 1.76),
+      x2 = c(1.24, 2.24),
+      xmid = c(1.00, 2.00),
+      y_line = nm_style$fraction_guide_y,
+      y_lab = nm_style$fraction_text_y
+    )
+  } else {
+    dplyr::tibble(
+      Fraction = fraction_levels,
+      x1 = c(0.62, 1.62),
+      x2 = c(1.38, 2.38),
+      xmid = c(1.00, 2.00),
+      y_line = nm_style$fraction_guide_y,
+      y_lab = nm_style$fraction_text_y
+    )
+  }
+}
+
+base_fraction_plot <- function(raw_dat, animal_dat, groups, title, subtitle = NULL) {
+  layout_df <- make_x_layout(groups)
+  frac_guides <- make_frac_guides(groups)
+  sex_offsets <- c("Female" = -0.034, "Male" = 0.034)
+
+  d <- raw_dat %>%
+    dplyr::filter(Group %in% groups) %>%
+    dplyr::mutate(
+      Group = factor(Group, levels = groups),
+      Fraction = factor(Fraction, levels = fraction_levels)
+    ) %>%
+    dplyr::left_join(layout_df, by = c("Fraction", "Group"))
+
+  a <- animal_dat %>%
+    dplyr::filter(Group %in% groups) %>%
+    dplyr::mutate(
+      Group = factor(Group, levels = groups),
+      Fraction = factor(Fraction, levels = fraction_levels),
+      Sex = factor(Sex, levels = c("Female", "Male"))
+    ) %>%
+    dplyr::left_join(layout_df, by = c("Fraction", "Group")) %>%
+    dplyr::mutate(
+      x_point = x + unname(sex_offsets[as.character(Sex)])
+    )
+
+  group_labels <- if (length(groups) == 2) {
+    c("Adult sed" = "Adult", "Old sed" = "Old")
+  } else {
+    c("Old sed" = "Control", "Old ex" = "Exercise", "Old rapa" = "Rapamycin")
+  }
+
+  ggplot2::ggplot() +
+    ggplot2::geom_violin(
+      data = d,
+      ggplot2::aes(
+        x = x,
+        y = FN,
+        group = interaction(Fraction, Group),
+        fill = Group,
+        color = Group
+      ),
+      alpha = nm_style$violin_alpha,
+      width = if (length(groups) == 2) 0.27 else 0.21,
+      trim = TRUE,
+      scale = "width",
+      linewidth = nm_style$violin_line
+    ) +
+    ggplot2::geom_boxplot(
+      data = d,
+      ggplot2::aes(
+        x = x,
+        y = FN,
+        group = interaction(Fraction, Group)
+      ),
+      width = if (length(groups) == 2) 0.065 else 0.050,
+      outlier.shape = NA,
+      fill = "white",
+      color = "grey35",
+      alpha = 0.95,
+      linewidth = nm_style$box_line
+    ) +
+    ggplot2::geom_point(
+      data = a,
+      ggplot2::aes(
+        x = x_point,
+        y = Mean_FN,
+        shape = Sex,
+        fill = Group,
+        color = Group
+      ),
+      size = nm_style$point_size,
+      stroke = nm_style$point_stroke
+    ) +
+    # Fraction group headings are rendered BELOW the x-axis tick labels,
+    # outside the data panel (coord_cartesian clip='off').
+    ggplot2::geom_segment(
+      data = frac_guides,
+      ggplot2::aes(
+        x = x1,
+        xend = x2,
+        y = y_line,
+        yend = y_line
+      ),
+      inherit.aes = FALSE,
+      linewidth = nm_style$fraction_guide_line,
+      color = "black"
+    ) +
+    ggplot2::geom_text(
+      data = frac_guides,
+      ggplot2::aes(
+        x = xmid,
+        y = y_lab,
+        label = Fraction
+      ),
+      inherit.aes = FALSE,
+      size = nm_text_mm(nm_style$fraction_label)
+    ) +
+    ggplot2::facet_grid(
+      . ~ Label,
+      labeller = ggplot2::labeller(
+        Label = function(x) paste0(x, " d")
+      )
+    ) +
+    ggplot2::scale_fill_manual(
+      values = group_fill_cols[groups],
+      breaks = groups,
+      labels = group_labels[groups],
+      drop = FALSE
+    ) +
+    ggplot2::scale_color_manual(
+      values = group_border_cols[groups],
+      breaks = groups,
+      labels = group_labels[groups],
+      drop = FALSE
+    ) +
+    ggplot2::scale_shape_manual(
+      values = sex_shapes,
+      breaks = c("Female", "Male"),
+      drop = FALSE
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = layout_df$x,
+      labels = layout_df$tick,
+      limits = c(min(layout_df$x) - 0.34, max(layout_df$x) + 0.34),
+      expand = c(0, 0)
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = seq(0, 1, 0.25)
+    ) +
+    # Baseline at y = 0: fraction guides and labels now sit BELOW the
+    # Adult/Old (or Ctl/Ex/Rapa) axis labels, not inside the data panel.
+    # clip='off' allows the below-axis annotation to remain fully editable.
+    ggplot2::coord_cartesian(
+      ylim = c(0, if (length(groups) == 2) 1.14 else 1.30),
+      expand = FALSE,
+      clip = "off"
+    ) +
+    ggplot2::labs(
+      title = title,
+      subtitle = subtitle,
+      x = NULL,
+      y = "Fraction New",
+      fill = "Group",
+      color = "Group",
+      shape = "Sex"
+    ) +
+    theme_lab() +
+    ggplot2::theme(
+      legend.position = "right",
+      legend.box = "vertical",
+      axis.text.x = ggplot2::element_text(size = nm_style$x_group_text, margin = ggplot2::margin(t = 1.5)),
+      axis.ticks.x = ggplot2::element_line(linewidth = nm_style$axis_line, color = "black"),
+      axis.line.x = ggplot2::element_line(linewidth = nm_style$axis_line, color = "black"),
+      strip.background = ggplot2::element_rect(
+        fill = "white",
+        colour = "black",
+        linewidth = nm_style$strip_line
+      ),
+      panel.spacing = grid::unit(nm_style$panel_spacing_lines, "lines"),
+      # Bottom margin accommodates labels drawn below the x-axis.
+      # Unlike earlier versions, no extra negative-y panel region is reserved.
+      plot.margin = ggplot2::margin(
+        nm_style$plot_margin_mm, nm_style$plot_margin_mm,
+        nm_style$bottom_margin_mm, nm_style$plot_margin_mm, unit = "mm")
+    ) +
+    ggplot2::guides(
+      color = "none",
+      fill = ggplot2::guide_legend(
+        order = 1,
+        override.aes = list(shape = 22, size = nm_style$point_size + 0.5, alpha = 0.35)
+      ),
+      shape = ggplot2::guide_legend(
+        order = 2,
+        override.aes = list(fill = "white", color = "black", size = nm_style$point_size + 0.3)
+      )
+    )
+}
+
+plot_fraction_new_global <- function(
+  raw_dat,
+  animal_dat,
+  groups,
+  stats_df,
+  title,
+  subtitle = NULL
+) {
+  base_fraction_plot(raw_dat, animal_dat, groups, title, subtitle) +
+    ggplot2::geom_text(
+      data = stats_df,
+      ggplot2::aes(x = x, y = y, label = label_text),
+      inherit.aes = FALSE,
+      size = nm_text_mm(nm_style$stat_text),
+      fontface = "plain",
+      lineheight = 0.88,
+      vjust = 1.00
+    )
+}
+
+plot_fraction_new_pairwise <- function(
+  raw_dat,
+  animal_dat,
+  groups,
+  stats_df,
+  title,
+  subtitle = NULL
+) {
+  base_fraction_plot(raw_dat, animal_dat, groups, title, subtitle) +
+    ggplot2::geom_text(
+      data = stats_df,
+      ggplot2::aes(
+        x = x,
+        y = y_fraction,
+        label = fraction_text
+      ),
+      inherit.aes = FALSE,
+      size = nm_text_mm(nm_style$pairwise_stat_text),
+      fontface = "plain",
+      vjust = 1.00
+    ) +
+    ggplot2::geom_text(
+      data = stats_df,
+      ggplot2::aes(
+        x = x_sol,
+        y = y_pair,
+        label = sol_text
+      ),
+      inherit.aes = FALSE,
+      size = nm_text_mm(nm_style$stat_text),
+      fontface = "plain",
+      lineheight = 0.88,
+      vjust = 1.00
+    ) +
+    ggplot2::geom_text(
+      data = stats_df,
+      ggplot2::aes(
+        x = x_ins,
+        y = y_pair,
+        label = ins_text
+      ),
+      inherit.aes = FALSE,
+      size = nm_text_mm(nm_style$stat_text),
+      fontface = "plain",
+      lineheight = 0.88,
+      vjust = 1.00
+    )
+}
+```
+
+## Adult vs Old
+
+```{r final-age-figure}
+p_fn_age <- plot_fraction_new_global(
+  raw_dat = dat_3tp,
+  animal_dat = fn_animal,
+  groups = age_group_levels,
+  stats_df = age_stats_by_time,
+  title = "Fraction New: Adult vs Old"
+)
+
+print(p_fn_age)
+```
+
+## Old sed vs Old ex vs Old rapa: overall model summary
+
+```{r final-treatment-figure}
+p_fn_treatment <- plot_fraction_new_global(
+  raw_dat = dat_3tp,
+  animal_dat = fn_animal,
+  groups = treatment_group_levels,
+  stats_df = trt_stats_holm,
+  title = "Fraction New: Old control, exercise, and rapamycin"
+)
+
+print(p_fn_treatment)
+```
+
+## Old sed vs Old ex vs Old rapa: within-fraction treatment-vs-control comparisons
+
+```{r final-treatment-pairwise-figure}
+p_fn_treatment_pair <- plot_fraction_new_pairwise(
+  raw_dat = dat_3tp,
+  animal_dat = fn_animal,
+  groups = treatment_group_levels,
+  stats_df = trt_stats_holm,
+  title = "Fraction New: Treatment-vs-control comparisons within each fraction"
+)
+
+print(p_fn_treatment_pair)
+```
+
+## Additional old-treatment figures with unadjusted p-values
+
+These supplementary outputs use unadjusted planned-contrast p-values from
+`audit.csv`. The existing `fn_ot` and `fn_ot_pw` figures remain Holm-adjusted.
+
+```{r raw-treatment-figures}
+p_fn_treatment_raw <- plot_fraction_new_global(
+  raw_dat = dat_3tp,
+  animal_dat = fn_animal,
+  groups = treatment_group_levels,
+  stats_df = trt_stats_raw,
+  title = "Fraction New: Old control, exercise, and rapamycin (raw p)"
+)
+
+p_fn_treatment_pair_raw <- plot_fraction_new_pairwise(
+  raw_dat = dat_3tp,
+  animal_dat = fn_animal,
+  groups = treatment_group_levels,
+  stats_df = trt_stats_raw,
+  title = "Fraction New: Treatment-vs-control within each fraction (raw p)"
+)
+
+# Save below; no need to render either plot inline on the long Dropbox path.
+cat("Created raw-p plot objects: p_fn_treatment_raw, p_fn_treatment_pair_raw\n")
+```
+
+## Treatment contrast table by timepoint
+
+```{r final-treatment-pairwise-table}
+pairwise_table <- trt_stats_by_time %>%
+  dplyr::select(
+    Label,
+    Fraction_p,
+    Ex_p,
+    Rapa_p,
+    ExFrac_p,
+    RapaFrac_p,
+    Sol_Ex_p,
+    Sol_Rapa_p,
+    Ins_Ex_p,
+    Ins_Rapa_p
+  )
+
+cat(
+  paste(capture.output(print(pairwise_table, n = Inf)), collapse = "\n"),
+  "\n"
+)
+```
+
+# Export short-name PNG/SVG outputs
+
+# Export short-name PNG/SVG outputs
+
+```{r export-tables}
+readr::write_csv(qc_group_counts, file.path(out_dir, "qc_grp.csv"))
+readr::write_csv(qc_peptide_counts, file.path(out_dir, "qc_pep.csv"))
+readr::write_csv(age_stats_by_time, file.path(out_dir, "st_ao.csv"))
+readr::write_csv(trt_stats_holm, file.path(out_dir, "st_ot.csv"))
+readr::write_csv(trt_stats_raw,  file.path(out_dir, "st_ot_raw.csv"))
+readr::write_csv(trt_audit, file.path(out_dir, "audit.csv"))
+readr::write_csv(trt_desc, file.path(out_dir, "means.csv"))
+```
+
+```{r export-figures}
+save_nm(p_fn_age, "fn_ao")
+save_nm(p_fn_treatment, "fn_ot")
+save_nm(p_fn_treatment_pair, "fn_ot_pw")
+```
+
+```{r export-raw-figures}
+# Separate short names: never overwrite the existing Holm-adjusted figures.
+save_nm(p_fn_treatment_raw,      "fn_ot_raw")
+save_nm(p_fn_treatment_pair_raw, "fn_ot_pw_raw")
+```
+
+## Re-export figures without rerunning the analyses
+
+Run the Markdown through its original plot/export chunks **once**. Afterward,
+edit the `NATURE_FIGURE_HELPER_EDIT_HERE` chunk and rerun **that chunk only**, then use:
+
+```r
+list_panels()                         # 5 registered plots
+panel_info("fn_ao")
+set_panel_size("fn_ao", 183, 78)       # dimension change in mm
+nm_style$axis_text <- 7.0             # optional typography change in pt
+nm_style$violin_line <- 0.22          # optional outline width in mm
+reexport("fn_ao")                     # rebuild plot geometry, export PNG/SVG/legend
+reexport("fn_ot_pw", save_legend = FALSE) # export without optional legend
+set_legend_size("fn_ao", 42, 29)      # separate legend dimensions in mm
+figure_export_manifest()             # export panel-size list
+```
+
+**Technical notes.** SVGs are written to temporary local files, cleaned and
+published into `fn_out` using the aggregation-propensity workflow. Full-page
+SVG background rectangles are removed, and the class-scoped outer `svglite`
+wrapper is removed to avoid losing styles on ungrouping. Internal clipping
+groups remain; do not delete clip-path definitions when manually restructuring
+a plot in Inkscape. No Inkscape subprocesses, automatic SVG cropping, or
+full-figure legend extraction are used. Standalone legends are generated from
+a tiny dummy plot and exported *after* the main PNG and SVG.
+
+The larger blank margin formerly required for fraction labels is eliminated
+by drawing those labels within the plotting coordinates. Actual page size
+remains the registered physical figure size, with compact plot margins.
