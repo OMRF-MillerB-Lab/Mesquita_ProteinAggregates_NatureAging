@@ -1,0 +1,2716 @@
+---
+title: "Old Treatments — Old-Control Insoluble Aggregation Propensity and Treatment Fate (v22)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    self_contained: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  error = FALSE,
+  fig.align = "center"
+)
+```
+
+# Analysis overview {-}
+
+This standalone report updates the old-treatment aggregation-propensity analysis to use the **Old Control insoluble proteome** as the biologically relevant baseline universe. The central question is whether proteins that are intrinsically aggregation-prone and already represented in the aged insoluble proteome are preferentially shifted toward greater relative solubility by intervention.
+
+The two treatment comparisons are fitted directly and independently:
+
+- **Exercise vs Old Control**
+- **Rapamycin vs Old Control**
+
+No three-group omnibus Treatment test is used as a gateway to post hoc testing. Wherever treatment-group distributions are compared, Exercise vs Control and Rapamycin vs Control are fitted as separate planned two-group factorial analyses retaining Sex and the Treatment × Sex interaction.
+
+The **baseline biological universe** is defined from the Old-Control insoluble fraction **independently of sex**. A protein group enters when it is detected in at least **2 Old-Control insoluble samples total across females and males**; for example, 1 Female + 1 Male qualifies. This pooled baseline is used because AGGRESCAN, TANGO, and WALTZ are sequence-derived protein properties, and the initial protein-level propensity landscape is therefore not sex-specific. Sex is introduced only downstream when direct treatment effects are estimated.
+
+The primary treatment-fate endpoint is the treatment-associated change in **volume-corrected log2(Insoluble/Soluble)**. Because this endpoint requires measurable abundance in both biochemical fractions, the correlation analysis is restricted to proteins from the fixed Old-Control-insoluble starting pool for which valid paired soluble/insoluble ratios can be estimated in the relevant sex-specific comparison. The complementary endpoint is the change in **insoluble protein abundance**. For both endpoints, a sex-specific Exercise-vs-Control or Rapamycin-vs-Control effect requires at least 2 valid Control and 2 valid treatment measurements within that sex. Treatment-group measurements never determine entry into the baseline starting pool.
+
+The report includes:
+
+1. Old-Control insoluble propensity rankings, top-10 protein plots, and a consensus high-propensity heatmap;
+2. a treatment-fate heatmap showing Exercise- and Rapamycin-associated changes in log2(Insoluble/Soluble) for the high-propensity Old-Control insoluble set;
+3. direct Exercise-vs-Control and Rapamycin-vs-Control propensity-versus-Ins/Sol correlations, separately by sex;
+4. cellular-component-adjusted models;
+5. reverse-angle analyses of the strongest treatment-induced shifts toward solubility;
+6. complementary propensity-versus-insoluble-abundance correlations;
+7. cellular-component-specific correlations; and
+8. overall insoluble-proteome propensity distributions and abundance-weighted propensity as Extended-Data-style analyses.
+
+Cellular-component order and palette generation mirror the Adult-vs-Old analysis so proteins retain the same compartment identity and visual coding throughout the manuscript. Every manuscript figure is exported as a 600-dpi PNG and a fully editable, Inkscape-safe SVG using centralized Nature Metabolism dimensions and typography. ggplot legends are exported separately when present.
+
+## Statistical approach (in brief)
+
+| Question | Test (as implemented below) |
+|---|---|
+| Does intrinsic propensity track the treatment-associated change in log2(Ins/Sol) or insoluble abundance? | Pearson correlation (`cor.test`, two-sided) of the propensity score with the sex-specific treatment log2FC, per metric, treatment and sex; BH-adjusted (`q_BH`) |
+| Is the association component-dependent? | Linear model with and without a propensity × component term (`anova` comparison); BH-adjusted across components |
+| Are propensity distributions different between treatment groups? | Separate planned two-group factorial models (Treatment, Sex, Treatment × Sex): Type III, HC3-robust `lm` for Na4vSS and aligned-rank-transform (ARTool) models for TANGO and WALTZ; Holm-adjusted across the two comparisons within each metric. **No three-group omnibus test** |
+| Are proteins that lose insoluble detection enriched for high propensity? | One-sided Wilcoxon, one-sided Fisher (top propensity quartile) and a component-stratified permutation test (seeded), BH-adjusted across the three metrics within sex |
+
+Protein-level *P* values describe differences among detected proteins and their sequence-derived scores; they are not mouse-level replication.
+
+> **To run:** keep the input CSV files (see *Settings*), the three detection tables used in the last analysis section (`Detect_SharedLoss_bySex.csv`, `Detect_ExSpecific_bySex.csv`, `Detect_RapaSpecific_bySex.csv`, copied from the Old-treatment composition output, `Comp_OldTrt/SexSplit/Detection/`) and the `R/` folder next to this file, then knit. Code is folded by default.
+
+# Setup {-}
+
+Expected inputs in the working directory:
+
+- `Aggregates_SampleList_Mesquita.csv`
+- `Aggregates_Soluble_raw.csv`
+- `Aggregates_Insoluble_raw.csv`
+- `Protein_Aggregation_Master.tsv`
+
+The alternative file names that the original script accepted (e.g. `Aggregates_SampleList_Mesquita(6).csv`) are still recognized by `find_input()`.
+
+## Packages
+
+All packages must be installed beforehand (the script stops and lists any that are missing; it no longer installs anything itself). Packages are attached in the same order as in the original analysis, because the order determines which functions mask which.
+
+```{r packages}
+pkgs <- c("tidyverse", "ragg", "viridisLite", "patchwork", "ggtext", "ggrepel",
+          "svglite", "cowplot", "car", "ARTool", "AnnotationDbi", "org.Mm.eg.db",
+          "GO.db", "knitr", "scales")
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Install missing packages first: ", paste(missing_pkgs, collapse = ", "), call. = FALSE)
+}
+invisible(lapply(pkgs[1:13], library, character.only = TRUE))
+select <- dplyr::select   # AnnotationDbi masks dplyr::select
+```
+
+## Settings
+
+```{r settings}
+find_input <- function(candidates) {
+  hit <- candidates[file.exists(candidates)]
+  if (length(hit) == 0L) {
+    stop(
+      "Could not find input file. Expected one of:\n",
+      paste(candidates, collapse = "\n")
+    )
+  }
+  hit[[1]]
+}
+
+sample_index_file <- find_input(c(
+  "Aggregates_SampleList_Mesquita.csv",
+  "Aggregates_SampleList_Mesquita(6).csv"
+))
+
+soluble_raw_file <- find_input(c(
+  "Aggregates_Soluble_raw.csv",
+  "Aggregates_Soluble_raw(2).csv"
+))
+
+insoluble_raw_file <- find_input(c(
+  "Aggregates_Insoluble_raw.csv",
+  "Aggregates_Insoluble_raw(3).csv"
+))
+
+aggregation_master_file <- find_input(c(
+  "Protein_Aggregation_Master.tsv",
+  "Protein_Aggregation_Master.csv"
+))
+
+helper_dir <- "R"   # folder holding nm_export_engine_OT_Prop.R
+
+out_dir <- "OT_Prop_v17_OldInsoluble"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+min_detected <- 2
+min_component_n <- 5
+min_component_plot_n <- 5
+
+top_n_csv <- 25
+top_n_plot <- 10
+top_n_shift_label <- 5
+top_n_consensus <- 15
+top_n_shifter <- 10
+
+# Volume correction: 5 uL LC aliquot after 1:1 loading-buffer dilution
+# represents 2.5 uL of the original fraction.
+sol_fraction_volume_ul <- 150
+ins_fraction_volume_ul <- 100
+loading_buffer_dilution <- 2
+lc_volume_ul <- 5
+original_fraction_ul_in_lc <- lc_volume_ul / loading_buffer_dilution
+sol_scale_factor <- sol_fraction_volume_ul / original_fraction_ul_in_lc
+ins_scale_factor <- ins_fraction_volume_ul / original_fraction_ul_in_lc
+log2_volume_offset <- log2(ins_scale_factor / sol_scale_factor)
+
+cat(
+  sprintf(
+    "Volume correction: soluble x%.1f; insoluble x%.1f; log2 offset %.6f\n",
+    sol_scale_factor, ins_scale_factor, log2_volume_offset
+  )
+)
+
+age_cols <- c("Adult" = "#3B528B", "Old" = "#59C761")
+treatment_cols <- c(
+  "Control" = "#59C761",
+  "Exercise" = "#F2D925",
+  "Rapamycin" = "#64106E"
+)
+sex_cols <- c("Female" = "#CC78BC", "Male" = "#029E73")
+sex_shapes <- c("Female" = 16, "Male" = 17)
+
+metric_levels <- c("Na4vSS", "TANGO", "WALTZ %")
+metric_titles <- c("Na4vSS" = "Na4vSS", "TANGO" = "TANGO", "WALTZ %" = "WALTZ %")
+metric_axis_short <- c(
+  "Na4vSS" = "Na4vSS",
+  "TANGO" = "TANGO / sequence length",
+  "WALTZ %" = "WALTZ residues (%)"
+)
+
+bin_roots <- list(
+  "ECM" = "GO:0031012",
+  "Extracellular" = "GO:0005576",
+  "Sarcomere/Myofibril" = c("GO:0030017", "GO:0030016", "GO:0043292"),
+  "Cytoskeleton" = "GO:0005856",
+  "Mitochondrion" = "GO:0005739",
+  "Nucleus" = "GO:0005634",
+  "Ribosome" = "GO:0005840",
+  "ER" = "GO:0005783",
+  "Golgi" = "GO:0005794",
+  "Plasma membrane" = "GO:0005886",
+  "Endosome/Lysosome" = c("GO:0005768", "GO:0005764"),
+  "Proteasome" = "GO:0000502",
+  "Cytosol" = "GO:0005829"
+)
+
+bin_priority <- names(bin_roots)
+display_bins <- c(
+  "Sarcomere/Myofibril", "Cytoskeleton", "Extracellular", "ECM",
+  "Nucleus", "Mitochondrion", "Plasma membrane", "Cytosol"
+)
+
+fmt_p3 <- function(p) {
+  ifelse(
+    is.na(p), "NA",
+    ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+  )
+}
+
+metric_tag <- function(metric) {
+  dplyr::recode(metric, "Na4vSS" = "Na4vSS", "TANGO" = "TANGO", "WALTZ %" = "WALTZ")
+}
+```
+
+## Figure export settings (presentation only)
+
+Fonts, line and point sizes, and panel sizes in millimetres used for the exported 600-dpi PNG and editable SVG files. Editing them changes only how figures are drawn and saved, never the data or statistics. Edit a named entry in `nm_dims`, run only that chunk, and call `reexport("Panel_ID")`; `list_panels()` and `panel_info("Panel_ID")` show each figure ID, its plotting chunk and its current size. Figures are registered when their analysis chunk runs, so re-exporting does not rerun any analysis. Size families (`nm_svg_dims`) are defaults for panels that have no entry of their own.
+
+```{r nm-figure-config}
+# Use generic sans inside ggplot/grid so Windows/PostScript devices do not try
+# to look up Arial directly. During SVG export, map sans explicitly to Arial.
+nm_style <- list(
+  font_family = "sans",
+  axis_title = 7.0,
+  axis_text = 6.5,
+  legend_title = 6.5,
+  legend_text = 6.0,
+  stat_text = 6.0,
+  small_text = 5.7,
+  plot_title = 8.0,
+  strip_text = 7.0,
+  axis_line = 0.18,
+  data_line = 0.28,
+  point_small = 0.85,
+  point_medium = 1.05,
+  point_rank = 1.30
+)
+
+svg_font_family <- "Arial"
+
+nm_export <- list(
+  dpi = 600,
+  background = "white",
+  separate_legends = TRUE,
+  legend_suffix = "_legend"
+)
+
+# Final physical dimensions (mm). These dimensions are for the DATA PANELS,
+# not panel + legend. Change only this block to resize figure families.
+nm_svg_dims <- list(
+  corr_six = c(width = 142, height = 77.5),
+  corr_both = c(width = 142, height = 157),
+  shift_sex = c(width = 172, height = 50),
+  shift_both = c(width = 172, height = 100),
+  cc_single = c(width = 52, height = 50),
+  cc_grid = c(width = 90, height = 70),
+  global_single = c(width = 50, height = 40),
+  global_three = c(width = 172, height = 62),
+  weighted_single = c(width = 72, height = 62),
+  weighted_three = c(width = 172, height = 62),
+  top_single = c(width = 55, height = 62),
+  top_three = c(width = 140, height = 50),
+  consensus = c(width = 72, height = 90),
+  fate_heat = c(width = 155, height = 90)
+)
+
+# Legends are exported independently so they never compress the plotting area.
+# Adjust these without changing the corresponding data-panel dimensions.
+nm_legend_dims <- list(
+  corr_six = c(width = 52, height = 58),
+  corr_both = c(width = 52, height = 58),
+  shift_sex = c(width = 58, height = 42),
+  shift_both = c(width = 58, height = 42),
+  cc_single = c(width = 52, height = 44),
+  cc_grid = c(width = 52, height = 44),
+  global_single = c(width = 46, height = 34),
+  global_three = c(width = 46, height = 34),
+  weighted_single = c(width = 46, height = 34),
+  weighted_three = c(width = 46, height = 34),
+  top_single = c(width = 52, height = 38),
+  top_three = c(width = 52, height = 38),
+  consensus = c(width = 42, height = 30),
+  fate_heat = c(width = 48, height = 30),
+  generic = c(width = 50, height = 36)
+)
+```
+
+```{r nm-figure-dimensions}
+# All dimensions are millimeters. These are EXPORTED PANEL IDs (filenames).
+# Editing the registry and rerunning only this chunk preserves existing plots.
+# The original family defaults in nm_svg_dims are used for other panels.
+nm_dims <- list(
+  OldCtl_Insoluble_Top_Na4vSS = c(width = 55, height = 62),
+  OldCtl_Insoluble_Top_TANGO = c(width = 55, height = 62),
+  OldCtl_Insoluble_Top_WALTZ = c(width = 55, height = 62),
+  OldCtl_Insoluble_Top_3metric = c(width = 140, height = 50),
+  OldCtl_Insoluble_Consensus_Heatmap = c(width = 72, height = NA_real_),
+  OldCtl_Insoluble_Consensus_Fate_Heatmap = c(width = 155, height = NA_real_),
+  Ex_Propensity_vs_InsSol = c(width = 142, height = 77.5),
+  Rapa_Propensity_vs_InsSol = c(width = 142, height = 77.5),
+  Ex_Rapa_Propensity_vs_InsSol = c(width = 142, height = 157),
+  Ex_Propensity_vs_Insoluble = c(width = 142, height = 77.5),
+  Rapa_Propensity_vs_Insoluble = c(width = 142, height = 77.5),
+  Ex_Top_InsSol = c(width = 172, height = 100),
+  Rapa_Top_InsSol = c(width = 172, height = 100),
+  Ex_Top_Insoluble = c(width = 172, height = 100),
+  Rapa_Top_Insoluble = c(width = 172, height = 100),
+  Global_InsProp_3metric = c(width = 172, height = 62),
+  Weighted_InsProp_3metric = c(width = 172, height = 62),
+  # Detection propensity — all original detection candidates vs nominally significant
+  OT_Detect_Propensity = c(width = 178, height = 120),
+  OT_Detect_Propensity_Sig = c(width = 178, height = 120),
+  OT_Detect_Prop_Shared = c(width = 118, height = 94),
+  OT_Detect_Prop_Exercise = c(width = 118, height = 94),
+  OT_Detect_Prop_Rapa = c(width = 118, height = 94),
+  OT_Detect_Prop_Shared_Sig = c(width = 118, height = 94),
+  OT_Detect_Prop_Exercise_Sig = c(width = 118, height = 94),
+  OT_Detect_Prop_Rapa_Sig = c(width = 118, height = 94),
+  OT_Detect_Shared_Female = c(width = 60, height = 80),
+  OT_Detect_Shared_Male = c(width = 60, height = 45),
+  OT_Detect_Exercise_Female = c(width = 60, height = 45),
+  OT_Detect_Exercise_Male = c(width = 60, height = 45),
+  OT_Detect_Rapa_Female = c(width = 60, height = 35),
+  OT_Detect_Rapa_Male = c(width = 60, height = 30),
+  OT_Detect_Shared_Female_Sig = c(width = 92, height = 47),
+  OT_Detect_Shared_Male_Sig = c(width = 92, height = 38),
+  OT_Detect_Exercise_Female_Sig = c(width = 92, height = 38),
+  OT_Detect_Exercise_Male_Sig = c(width = 92, height = 38),
+  OT_Detect_Rapa_Female_Sig = c(width = 92, height = 38),
+  OT_Detect_Rapa_Male_Sig = c(width = 92, height = 46)
+)
+```
+
+## Figure export functions
+
+```{r nm-export-engine, echo=FALSE}
+engine_file <- file.path(helper_dir, "nm_export_engine_OT_Prop.R")
+if (!file.exists(engine_file)) {
+  stop("Cannot find the figure-export file '", engine_file, "' (working directory: ", getwd(),
+       "). Copy the 'R' folder from the zip next to this Rmd and the input CSVs, or set helper_dir.",
+       call. = FALSE)
+}
+source(engine_file, local = knitr::knit_global())
+```
+
+```{r nm-inline-figures, echo=FALSE}
+# Show every exported figure in the report, right after the chunk that creates it.
+# Previews are redrawn from the registered plot objects at screen resolution and embedded
+# in the HTML; the 600-dpi PNG/SVG files in the output folders are unchanged.
+inline_figures <- TRUE   # FALSE = write figure files only, do not embed previews
+inline_dpi     <- 110    # preview resolution (lower = smaller HTML)
+inline_zoom    <- 1.5    # on-screen scale relative to the physical panel size
+inline_shown   <- character(0)
+inline_dir     <- file.path(tempdir(), "inline_figures")
+dir.create(inline_dir, showWarnings = FALSE, recursive = TRUE)
+
+inline_img <- function(file, width_mm, alt) {
+  sprintf('<img alt="%s" src="%s" style="width:%smm; max-width:100%%;"/>',
+          alt, knitr::image_uri(file), format(round(width_mm * inline_zoom), trim = TRUE))
+}
+
+nm_inline_html <- function() {
+  ids <- setdiff(sort(ls(panel_registry)), inline_shown)
+  inline_shown <<- c(inline_shown, ids)
+  png_fun <- if (exists("save_nm_panel_png")) save_nm_panel_png else save_plot_png
+  parts <- vapply(ids, function(id) {
+    tryCatch({
+      e <- get(id, envir = panel_registry, inherits = FALSE)
+      d <- nm_resolve_dims(e$paths[[1]], e$size_key, e$original_width, e$original_height)
+      w <- unname(d[["width"]]); h <- unname(d[["height"]])
+      leg <- if (isTRUE(e$save_legend)) nm_extract_legend(e$plot) else NULL
+      p <- if (!is.null(leg)) nm_set_legend_position(e$plot, "none") else e$plot
+      p <- nm_apply_nature_theme(p)
+      f <- file.path(inline_dir, paste0(id, ".png"))
+      png_fun(p, f, w, h, dpi = inline_dpi)
+      html <- paste0("<div style='margin:8px 0 16px 0;'><div style='font-size:80%; font-family:monospace;'>",
+                     id, "</div>", inline_img(f, w, id))
+      if (!is.null(leg)) {
+        ld <- nm_legend_dims[[e$size_key]]
+        if (is.null(ld)) ld <- nm_legend_dims[["generic"]]
+        fl <- file.path(inline_dir, paste0(id, "_legend.png"))
+        save_grob_png(leg, fl, unname(ld[["width"]]), unname(ld[["height"]]), dpi = inline_dpi)
+        html <- paste0(html, "<br/>", inline_img(fl, unname(ld[["width"]]), paste(id, "legend")))
+      }
+      paste0(html, "</div>")
+    }, error = function(err) {
+      paste0("<p><em>Preview not available for ", id, ": ", conditionMessage(err), "</em></p>")
+    })
+  }, character(1))
+  paste(parts, collapse = "\n")
+}
+
+knitr::knit_hooks$set(nm_inline = function(before, options, envir) {
+  if (before || !isTRUE(inline_figures)) return(NULL)
+  out <- tryCatch(nm_inline_html(), error = function(e) NULL)
+  if (is.null(out) || !nzchar(out)) NULL else paste0("\n\n", out, "\n\n")
+})
+knitr::opts_chunk$set(nm_inline = TRUE)
+```
+
+## Helper functions
+
+```{r general-helpers}
+clean_id <- function(x) {
+  x <- stringr::str_trim(as.character(x))
+  x <- stringr::str_remove(x, "^>")
+  x <- dplyr::if_else(stringr::str_detect(x, "\\|"), stringr::str_split_fixed(x, "\\|", 3)[, 2], x)
+  x <- stringr::str_remove(x, ";.*$")
+  stringr::str_remove(x, "-\\d+$")
+}
+
+clean_treatment <- function(x) {
+  x <- stringr::str_to_lower(stringr::str_trim(as.character(x)))
+  dplyr::case_when(
+    stringr::str_detect(x, "rapa") ~ "Rapamycin",
+    stringr::str_detect(x, "exer|^ex$") ~ "Exercise",
+    TRUE ~ "Control"
+  )
+}
+
+read_metric_master <- function(file) {
+  if (grepl("\\.csv$", file, ignore.case = TRUE)) {
+    read.csv(file, check.names = FALSE, stringsAsFactors = FALSE)
+  } else {
+    readr::read_tsv(file, show_col_types = FALSE)
+  }
+}
+
+safe_cor_stats <- function(data) {
+  n <- dplyr::n_distinct(data$Protein_ID)
+  sx <- stats::sd(data$log2FC, na.rm = TRUE)
+  sy <- stats::sd(data$Metric_Score, na.rm = TRUE)
+
+  if (n < 3 || !is.finite(sx) || !is.finite(sy) || sx == 0 || sy == 0) {
+    return(tibble::tibble(n = n, r = NA_real_, p = NA_real_))
+  }
+
+  z <- stats::cor.test(data$log2FC, data$Metric_Score, method = "pearson")
+  tibble::tibble(n = n, r = unname(z$estimate), p = z$p.value)
+}
+
+safe_treatment_p <- function(data, value_col, trt_name) {
+  value_col <- rlang::ensym(value_col)
+  dd <- data %>%
+    dplyr::filter(Treatment %in% c("Control", trt_name), is.finite(!!value_col))
+
+  x <- dd %>% dplyr::filter(Treatment == trt_name) %>% dplyr::pull(!!value_col)
+  y <- dd %>% dplyr::filter(Treatment == "Control") %>% dplyr::pull(!!value_col)
+
+  if (length(x) < 2L || length(y) < 2L) return(NA_real_)
+
+  tryCatch(stats::t.test(x = x, y = y, var.equal = FALSE)$p.value, error = function(e) NA_real_)
+}
+
+# Separate planned two-group factorial analyses. There is no three-treatment omnibus test.
+type3_hc3 <- function(data, response, factor1 = "Treatment") {
+  dd <- droplevels(data)
+  if (nlevels(dd[[factor1]]) < 2 || nlevels(dd$Sex) < 2) {
+    return(c(Main = NA_real_, Sex = NA_real_, Interaction = NA_real_))
+  }
+
+  contrasts(dd[[factor1]]) <- stats::contr.sum(nlevels(dd[[factor1]]))
+  contrasts(dd$Sex) <- stats::contr.sum(nlevels(dd$Sex))
+
+  fit <- stats::lm(stats::as.formula(paste0(response, " ~ ", factor1, " * Sex")), data = dd)
+  a <- car::Anova(fit, type = 3, white.adjust = "hc3")
+  pcol <- grep("^Pr\\(", colnames(a), value = TRUE)[1]
+  int_term <- paste0(factor1, ":Sex")
+
+  c(
+    Main = as.numeric(a[factor1, pcol]),
+    Sex = as.numeric(a["Sex", pcol]),
+    Interaction = as.numeric(a[int_term, pcol])
+  )
+}
+
+art_factorial <- function(data, response, factor1 = "Treatment") {
+  dd <- droplevels(data)
+  if (nlevels(dd[[factor1]]) < 2 || nlevels(dd$Sex) < 2) {
+    return(c(Main = NA_real_, Sex = NA_real_, Interaction = NA_real_))
+  }
+
+  fit <- ARTool::art(stats::as.formula(paste0(response, " ~ ", factor1, " * Sex")), data = dd)
+  a <- stats::anova(fit)
+
+  get_p <- function(term) {
+    idx <- match(term, rownames(a))
+    if (is.na(idx)) return(NA_real_)
+    as.numeric(a[idx, "Pr(>F)"])
+  }
+
+  c(Main = get_p(factor1), Sex = get_p("Sex"), Interaction = get_p(paste0(factor1, ":Sex")))
+}
+
+run_factorial_metric <- function(data, metric) {
+  dd <- data %>% dplyr::filter(Metric == metric)
+  if (nrow(dd) < 4) return(c(Main = NA_real_, Sex = NA_real_, Interaction = NA_real_))
+  if (metric == "Na4vSS") {
+    type3_hc3(dd, "Metric_Score", "Treatment")
+  } else {
+    art_factorial(dd, "Metric_Score", "Treatment")
+  }
+}
+
+run_planned_treatment_stats <- function(data) {
+  out <- purrr::map_dfr(metric_levels, function(metric) {
+    purrr::map_dfr(c("Exercise", "Rapamycin"), function(trt_name) {
+      dd <- data %>%
+        dplyr::filter(Metric == metric, Treatment %in% c("Control", trt_name)) %>%
+        dplyr::mutate(
+          Treatment = factor(as.character(Treatment), levels = c("Control", trt_name)),
+          Sex = factor(as.character(Sex), levels = c("Female", "Male"))
+        )
+      z <- run_factorial_metric(dd, metric)
+      tibble::tibble(
+        Metric = metric,
+        Comparison = paste0(trt_name, " vs Control"),
+        Treatment = trt_name,
+        p_Treatment = unname(z["Main"]),
+        p_Sex = unname(z["Sex"]),
+        p_Interaction = unname(z["Interaction"])
+      )
+    })
+  })
+
+  out %>%
+    dplyr::group_by(Metric) %>%
+    dplyr::mutate(
+      p_Treatment_Holm = stats::p.adjust(p_Treatment, method = "holm"),
+      p_Interaction_Holm = stats::p.adjust(p_Interaction, method = "holm")
+    ) %>%
+    dplyr::ungroup()
+}
+```
+
+# Load data, assign GO cellular components, and define the Old-Control insoluble starting pool
+
+```{r load-data-and-starting-pool}
+sample_index <- read.csv(sample_index_file, check.names = FALSE, stringsAsFactors = FALSE)
+sol_raw <- read.csv(soluble_raw_file, check.names = FALSE, stringsAsFactors = FALSE)
+ins_raw <- read.csv(insoluble_raw_file, check.names = FALSE, stringsAsFactors = FALSE)
+aggregation_master <- read_metric_master(aggregation_master_file)
+
+required_metric <- c("Protein_ID", "Na4vSS", "Sequence_Length", "TANGO_Mean_Aggregation", "WALTZ_Amyloid_Percent")
+missing_metric <- setdiff(required_metric, colnames(aggregation_master))
+if (length(missing_metric) > 0L) {
+  stop("Missing aggregation-master columns: ", paste(missing_metric, collapse = ", "))
+}
+
+all_raw_cols <- union(colnames(sol_raw), colnames(ins_raw))
+meta <- sample_index %>%
+  dplyr::mutate(
+    ID = as.character(ID),
+    Sample = dplyr::case_when(
+      ID %in% all_raw_cols ~ ID,
+      paste0("X", ID) %in% all_raw_cols ~ paste0("X", ID),
+      TRUE ~ ID
+    ),
+    Age = stringr::str_to_title(stringr::str_trim(as.character(Age))),
+    Sex = stringr::str_to_title(stringr::str_trim(as.character(Sex))),
+    Treatment = clean_treatment(Treatment)
+  ) %>%
+  dplyr::filter(Sample %in% all_raw_cols)
+
+make_fraction_long <- function(dat, fraction_name) {
+  sample_cols <- intersect(meta$Sample, colnames(dat))
+  if (length(sample_cols) == 0L) stop("No sample columns matched for ", fraction_name)
+
+  dat %>%
+    dplyr::select(Protein.Group, Genes, dplyr::all_of(sample_cols)) %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(sample_cols), names_to = "Sample", values_to = "Abundance") %>%
+    dplyr::left_join(meta %>% dplyr::select(Sample, Age, Sex, Treatment), by = "Sample") %>%
+    dplyr::mutate(
+      Abundance = suppressWarnings(as.numeric(Abundance)),
+      Detected = is.finite(Abundance) & Abundance > 0,
+      Gene1 = stringr::str_trim(stringr::str_extract(as.character(Genes), "^[^;]+")),
+      Fraction = fraction_name
+    ) %>%
+    dplyr::filter(!is.na(Age), !is.na(Sex), !is.na(Treatment))
+}
+
+sol_long <- make_fraction_long(sol_raw, "Soluble")
+ins_long <- make_fraction_long(ins_raw, "Insoluble")
+
+# GO-CC mapping is generated from the union of genes represented in both fractions.
+all_genes <- sort(unique(na.omit(c(sol_long$Gene1, ins_long$Gene1))))
+go_cc_offspring <- AnnotationDbi::as.list(GO.db::GOCCOFFSPRING)
+get_offspring <- function(go_id) unique(c(go_id, go_cc_offspring[[go_id]]))
+bin_terms <- lapply(bin_roots, function(ids) unique(unlist(lapply(ids, get_offspring), use.names = FALSE)))
+
+assign_bin <- function(go_vec) {
+  go_vec <- unique(go_vec[!is.na(go_vec)])
+  if (length(go_vec) == 0L) return("Other/Unassigned")
+  for (b in bin_priority) if (any(go_vec %in% bin_terms[[b]])) return(b)
+  "Other/Unassigned"
+}
+
+gene2entrez <- suppressMessages(
+  AnnotationDbi::select(org.Mm.eg.db, keys = all_genes, keytype = "SYMBOL", columns = c("SYMBOL", "ENTREZID"))
+) %>%
+  dplyr::distinct(SYMBOL, ENTREZID) %>%
+  dplyr::filter(!is.na(ENTREZID))
+
+entrez2go <- suppressMessages(
+  AnnotationDbi::select(
+    org.Mm.eg.db,
+    keys = sort(unique(gene2entrez$ENTREZID)),
+    keytype = "ENTREZID",
+    columns = c("ENTREZID", "GO", "ONTOLOGY")
+  )
+) %>%
+  dplyr::filter(ONTOLOGY == "CC", !is.na(GO)) %>%
+  dplyr::distinct(ENTREZID, GO)
+
+gene_bin <- gene2entrez %>%
+  dplyr::left_join(entrez2go, by = "ENTREZID") %>%
+  dplyr::group_by(SYMBOL) %>%
+  dplyr::summarise(GO_CC = list(unique(GO)), .groups = "drop") %>%
+  dplyr::mutate(Bin = vapply(GO_CC, assign_bin, character(1)))
+
+add_bins <- function(dat) {
+  dat %>%
+    dplyr::left_join(gene_bin %>% dplyr::select(SYMBOL, Bin), by = c("Gene1" = "SYMBOL")) %>%
+    dplyr::mutate(Bin = dplyr::if_else(is.na(Bin), "Other/Unassigned", Bin))
+}
+
+sol_long <- add_bins(sol_long)
+ins_long <- add_bins(ins_long)
+
+readr::write_csv(
+  dplyr::bind_rows(sol_long, ins_long) %>%
+    dplyr::distinct(Protein.Group, Gene1, Bin) %>%
+    dplyr::arrange(Gene1),
+  file.path(out_dir, "GO_bin_map.csv")
+)
+
+metrics_wide <- aggregation_master %>%
+  dplyr::transmute(
+    Protein_ID = clean_id(Protein_ID),
+    Na4vSS = as.numeric(Na4vSS),
+    TANGO = as.numeric(TANGO_Mean_Aggregation) / as.numeric(Sequence_Length),
+    `WALTZ %` = as.numeric(WALTZ_Amyloid_Percent)
+  ) %>%
+  dplyr::distinct(Protein_ID, .keep_all = TRUE)
+
+metrics_long <- metrics_wide %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(metric_levels), names_to = "Metric", values_to = "Metric_Score") %>%
+  dplyr::filter(is.finite(Metric_Score)) %>%
+  dplyr::mutate(Metric = factor(Metric, levels = metric_levels))
+
+# Define one fixed Old-Control INSOLUBLE baseline universe.
+# IMPORTANT: eligibility is intentionally independent of sex because the
+# aggregation-propensity scores and the initial protein-level landscape are
+# sequence-derived, not sex-specific. A protein group enters when it is detected
+# in >= 2 Old-Control insoluble samples TOTAL across females and males. Thus,
+# 1 Female + 1 Male qualifies. Sex is introduced only later when treatment
+# outcomes are estimated.
+old_ctl_ins_pool_counts <- ins_long %>%
+  dplyr::filter(Age == "Old", Treatment == "Control", Bin %in% display_bins) %>%
+  dplyr::group_by(Protein.Group, Gene1, Bin) %>%
+  dplyr::summarise(
+    N_detected_OldCtlIns = sum(Detected, na.rm = TRUE),
+    N_detected_Female = sum(Detected & Sex == "Female", na.rm = TRUE),
+    N_detected_Male = sum(Detected & Sex == "Male", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Audit the exact pooled-sex detection gate used to define the starting pool.
+readr::write_csv(old_ctl_ins_pool_counts, file.path(out_dir, "OldCtlIns_pool_detection_audit.csv"))
+
+old_control_insoluble_ids <- old_ctl_ins_pool_counts %>%
+  dplyr::filter(N_detected_OldCtlIns >= min_detected) %>%
+  tidyr::separate_longer_delim(Protein.Group, delim = ";") %>%
+  dplyr::mutate(Protein_ID = clean_id(Protein.Group), Gene1 = stringr::str_trim(as.character(Gene1))) %>%
+  dplyr::filter(
+    Protein_ID != "",
+    !stringr::str_detect(Protein_ID, stringr::regex("^cRAP-", ignore_case = TRUE))
+  ) %>%
+  dplyr::distinct(Protein_ID, Gene1, Bin, N_detected_OldCtlIns, N_detected_Female, N_detected_Male) %>%
+  dplyr::group_by(Protein_ID) %>%
+  dplyr::summarise(
+    Gene = {
+      z <- Gene1[!is.na(Gene1) & Gene1 != ""]
+      if (length(z) > 0L) z[[1]] else Protein_ID[[1]]
+    },
+    Bin = {
+      z <- as.character(Bin)[!is.na(Bin)]
+      if (length(z) > 0L) z[[1]] else "Other/Unassigned"
+    },
+    N_detected_OldCtlIns = max(N_detected_OldCtlIns, na.rm = TRUE),
+    N_detected_Female = max(N_detected_Female, na.rm = TRUE),
+    N_detected_Male = max(N_detected_Male, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(Bin %in% display_bins) %>%
+  dplyr::mutate(Bin = factor(as.character(Bin), levels = display_bins))
+
+old_ctl_ins_propensity <- old_control_insoluble_ids %>%
+  dplyr::inner_join(metrics_wide, by = "Protein_ID") %>%
+  dplyr::mutate(
+    Na4vSS_rank = dplyr::dense_rank(dplyr::desc(Na4vSS)),
+    TANGO_rank = dplyr::dense_rank(dplyr::desc(TANGO)),
+    WALTZ_rank = dplyr::dense_rank(dplyr::desc(`WALTZ %`)),
+    Na4vSS_percentile = dplyr::percent_rank(Na4vSS),
+    TANGO_percentile = dplyr::percent_rank(TANGO),
+    WALTZ_percentile = dplyr::percent_rank(`WALTZ %`)
+  ) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    Consensus_percentile = mean(c(Na4vSS_percentile, TANGO_percentile, WALTZ_percentile), na.rm = TRUE)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    Consensus_percentile = dplyr::if_else(is.nan(Consensus_percentile), NA_real_, Consensus_percentile)
+  ) %>%
+  dplyr::add_count(Gene, name = "Gene_n") %>%
+  dplyr::mutate(
+    Protein_Label = dplyr::case_when(
+      is.na(Gene) | Gene == "" ~ Protein_ID,
+      Gene_n > 1 ~ paste0(Gene, " | ", Protein_ID),
+      TRUE ~ Gene
+    )
+  )
+
+# Use the exact palette-generation logic used in the Adult-vs-Old aggregation
+# analysis. This prevents the same component from receiving a different color
+# merely because a shorter set of bins was supplied to viridis().
+all_bins_palette <- sort(unique(as.character(sol_long$Bin[sol_long$Bin != "Other/Unassigned"])))
+
+component_pal_all <- setNames(
+  viridisLite::viridis(length(all_bins_palette), option = "D", end = 0.95),
+  all_bins_palette
+)
+
+component_cols <- component_pal_all[display_bins]
+
+consensus_ids <- unique(c(
+  old_ctl_ins_propensity %>%
+    dplyr::slice_max(Na4vSS, n = top_n_consensus, with_ties = FALSE) %>%
+    dplyr::pull(Protein_ID),
+  old_ctl_ins_propensity %>%
+    dplyr::slice_max(TANGO, n = top_n_consensus, with_ties = FALSE) %>%
+    dplyr::pull(Protein_ID),
+  old_ctl_ins_propensity %>%
+    dplyr::slice_max(`WALTZ %`, n = top_n_consensus, with_ties = FALSE) %>%
+    dplyr::pull(Protein_ID)
+))
+
+old_ctl_ins_consensus <- old_ctl_ins_propensity %>%
+  dplyr::filter(Protein_ID %in% consensus_ids) %>%
+  dplyr::filter(is.finite(Na4vSS_percentile), is.finite(TANGO_percentile), is.finite(WALTZ_percentile)) %>%
+  dplyr::arrange(dplyr::desc(Consensus_percentile))
+
+readr::write_csv(
+  old_ctl_ins_propensity %>% dplyr::arrange(dplyr::desc(Consensus_percentile)),
+  file.path(out_dir, "OldCtl_Insoluble_Propensity_Ranks.csv")
+)
+
+readr::write_csv(old_ctl_ins_consensus, file.path(out_dir, "OldCtl_Insoluble_Consensus_Propensity.csv"))
+
+old_top_csv <- old_ctl_ins_propensity %>%
+  dplyr::select(Protein_ID, Gene, Protein_Label, Bin, dplyr::all_of(metric_levels)) %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(metric_levels), names_to = "Metric", values_to = "Metric_Score") %>%
+  dplyr::filter(is.finite(Metric_Score)) %>%
+  dplyr::mutate(Metric = factor(Metric, levels = metric_levels)) %>%
+  dplyr::group_by(Metric) %>%
+  dplyr::slice_max(Metric_Score, n = top_n_csv, with_ties = FALSE) %>%
+  dplyr::arrange(Metric, dplyr::desc(Metric_Score)) %>%
+  dplyr::ungroup()
+
+readr::write_csv(old_top_csv, file.path(out_dir, "OldCtl_Insoluble_Top_Propensity_Long.csv"))
+
+old_top_plot <- old_top_csv %>%
+  dplyr::group_by(Metric) %>%
+  dplyr::slice_head(n = top_n_plot) %>%
+  dplyr::ungroup()
+
+readr::write_csv(
+  old_top_plot,
+  file.path(out_dir, paste0("OldCtl_Insoluble_Top_Propensity_Top", top_n_plot, ".csv"))
+)
+
+make_oldctl_top_plot <- function(metric) {
+  dd <- old_top_plot %>%
+    dplyr::filter(as.character(Metric) == metric) %>%
+    dplyr::arrange(Metric_Score) %>%
+    dplyr::mutate(
+      Protein_Label = factor(Protein_Label, levels = unique(Protein_Label)),
+      Bin = factor(as.character(Bin), levels = display_bins)
+    )
+
+  p <- ggplot2::ggplot(dd, ggplot2::aes(x = Metric_Score, y = Protein_Label, colour = Bin))
+
+  if (metric == "Na4vSS") {
+    p <- p + ggplot2::geom_vline(
+      xintercept = 0,
+      linetype = "dashed",
+      linewidth = nm_style$axis_line,
+      colour = "grey65"
+    )
+  }
+
+  p +
+    ggplot2::geom_point(shape = 18, size = nm_style$point_rank + 1, alpha = 0.90) +
+    ggplot2::scale_colour_manual(
+      values = component_cols,
+      limits = names(component_cols),
+      breaks = names(component_cols),
+      drop = FALSE,
+      name = "Cellular component"
+    ) +
+    ggplot2::labs(x = unname(metric_axis_short[[metric]]), y = NULL) +
+    theme_nm(legend_position = "right", plot_title = FALSE, plot_subtitle = FALSE) +
+    ggplot2::theme(
+      axis.text.y = ggplot2::element_text(
+        family = nm_style$font_family,
+        size = nm_style$small_text,
+        colour = "black"
+      )
+    )
+}
+
+old_top_plots <- lapply(metric_levels, make_oldctl_top_plot)
+names(old_top_plots) <- metric_levels
+
+for (metric in metric_levels) {
+  save_nm_both(
+    old_top_plots[[metric]],
+    file.path(out_dir, paste0("OldCtl_Insoluble_Top_", metric_tag(metric))),
+    "top_single"
+  )
+}
+
+p_old_top_3metric <- patchwork::wrap_plots(
+  old_top_plots,
+  nrow = 1,
+  guides = "collect"
+) & ggplot2::theme(legend.position = "right")
+
+save_nm_both(p_old_top_3metric, file.path(out_dir, "OldCtl_Insoluble_Top_3metric"), "top_three")
+
+consensus_order <- old_ctl_ins_consensus$Protein_Label
+
+old_ctl_ins_consensus_long <- old_ctl_ins_consensus %>%
+  dplyr::select(Protein_ID, Protein_Label, Bin, Na4vSS_percentile, TANGO_percentile, WALTZ_percentile) %>%
+  tidyr::pivot_longer(
+    cols = c(Na4vSS_percentile, TANGO_percentile, WALTZ_percentile),
+    names_to = "Metric",
+    values_to = "Percentile"
+  ) %>%
+  dplyr::mutate(
+    Metric = dplyr::recode(
+      Metric,
+      "Na4vSS_percentile" = "Na4vSS",
+      "TANGO_percentile" = "TANGO",
+      "WALTZ_percentile" = "WALTZ %"
+    ),
+    Metric = factor(Metric, levels = metric_levels),
+    Protein_Label = factor(Protein_Label, levels = rev(consensus_order))
+  )
+
+p_old_ctl_ins_consensus <- ggplot2::ggplot(
+  old_ctl_ins_consensus_long,
+  ggplot2::aes(x = Metric, y = Protein_Label, fill = Percentile)
+) +
+  ggplot2::geom_tile(colour = "white", linewidth = nm_style$axis_line) +
+  ggplot2::geom_text(
+    ggplot2::aes(label = sprintf("%.2f", Percentile), colour = Percentile < 0.45),
+    size = nm_style$small_text / 2.845276,
+    family = nm_style$font_family
+  ) +
+  ggplot2::scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "black"), guide = "none") +
+  ggplot2::scale_fill_viridis_c(option = "D", direction = 1, limits = c(0, 1), name = "Percentile rank") +
+  ggplot2::labs(x = NULL, y = NULL) +
+  theme_nm(legend_position = "right", plot_title = FALSE, plot_subtitle = FALSE) +
+  ggplot2::theme(
+    axis.text.y = ggplot2::element_text(
+      family = nm_style$font_family,
+      size = nm_style$small_text,
+      colour = "black"
+    ),
+    axis.ticks = ggplot2::element_blank()
+  )
+
+save_nm_both(
+  p_old_ctl_ins_consensus,
+  file.path(out_dir, "OldCtl_Insoluble_Consensus_Heatmap"),
+  "consensus",
+  height_mm = nm_heatmap_height(nrow(old_ctl_ins_consensus))
+)
+
+cat(
+  "Old-Control insoluble baseline with aggregation metrics: ",
+  nrow(old_ctl_ins_propensity), " proteins\n", sep = ""
+)
+```
+
+# Build paired soluble/insoluble treatment effects
+
+The primary effect is the direct change in per-animal volume-corrected log2(Insoluble/Soluble) for Exercise vs Control or Rapamycin vs Control. The complementary effect is the direct treatment-associated change in insoluble abundance. The **starting protein universe remains the pooled-sex Old-Control insoluble pool defined above**; treatment-group measurements do not determine eligibility. Effects are then estimated separately in females and males, requiring at least `min_detected` valid Control and `min_detected` valid treatment observations within the relevant sex.
+
+```{r treatment-fate-data}
+make_protein_sample_data <- function(dat, fraction_name) {
+  dat %>%
+    dplyr::filter(Age == "Old", Treatment %in% c("Control", "Exercise", "Rapamycin")) %>%
+    tidyr::separate_longer_delim(Protein.Group, delim = ";") %>%
+    dplyr::mutate(
+      Protein_ID = clean_id(Protein.Group),
+      Abundance = suppressWarnings(as.numeric(Abundance)),
+      Fraction = fraction_name
+    ) %>%
+    dplyr::filter(
+      Protein_ID != "",
+      !stringr::str_detect(Protein_ID, stringr::regex("^cRAP-", ignore_case = TRUE)),
+      Protein_ID %in% old_ctl_ins_propensity$Protein_ID
+    ) %>%
+    dplyr::group_by(Sample, Protein_ID, Sex, Treatment, Fraction) %>%
+    dplyr::summarise(
+      Abundance = if (all(is.na(Abundance))) NA_real_ else sum(Abundance, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+sol_sample <- make_protein_sample_data(sol_long, "Soluble")
+ins_sample <- make_protein_sample_data(ins_long, "Insoluble")
+
+ratio_sample <- dplyr::bind_rows(sol_sample, ins_sample) %>%
+  dplyr::filter(is.finite(Abundance), Abundance > 0) %>%
+  dplyr::select(Sample, Protein_ID, Sex, Treatment, Fraction, Abundance) %>%
+  tidyr::pivot_wider(names_from = Fraction, values_from = Abundance) %>%
+  dplyr::filter(is.finite(Soluble), is.finite(Insoluble), Soluble > 0, Insoluble > 0) %>%
+  dplyr::mutate(
+    Soluble_corrected = Soluble * sol_scale_factor,
+    Insoluble_corrected = Insoluble * ins_scale_factor,
+    log2_InsSol = log2(Insoluble_corrected / Soluble_corrected)
+  )
+
+make_ratio_effect <- function(trt_name) {
+  means <- ratio_sample %>%
+    dplyr::filter(Treatment %in% c("Control", trt_name)) %>%
+    dplyr::group_by(Protein_ID, Sex, Treatment) %>%
+    dplyr::summarise(Mean_log2_InsSol = mean(log2_InsSol, na.rm = TRUE), n = dplyr::n(), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = Treatment, values_from = c(Mean_log2_InsSol, n))
+
+  if (!(paste0("Mean_log2_InsSol_", trt_name) %in% names(means))) return(tibble::tibble())
+
+  ptab <- ratio_sample %>%
+    dplyr::filter(Treatment %in% c("Control", trt_name)) %>%
+    dplyr::group_by(Protein_ID, Sex) %>%
+    dplyr::group_modify(~ tibble::tibble(p_InsSol = safe_treatment_p(.x, log2_InsSol, trt_name))) %>%
+    dplyr::ungroup()
+
+  means %>%
+    dplyr::transmute(
+      Protein_ID,
+      Sex,
+      Treatment = trt_name,
+      Control = Mean_log2_InsSol_Control,
+      Treatment_Value = .data[[paste0("Mean_log2_InsSol_", trt_name)]],
+      n_Control = n_Control,
+      n_Treatment = .data[[paste0("n_", trt_name)]],
+      Delta_InsSol = Treatment_Value - Control
+    ) %>%
+    dplyr::filter(
+      is.finite(Control), is.finite(Treatment_Value),
+      n_Control >= min_detected, n_Treatment >= min_detected
+    ) %>%
+    dplyr::left_join(ptab, by = c("Protein_ID", "Sex"))
+}
+
+ratio_effect <- dplyr::bind_rows(make_ratio_effect("Exercise"), make_ratio_effect("Rapamycin")) %>%
+  dplyr::mutate(
+    Treatment = factor(Treatment, levels = c("Exercise", "Rapamycin")),
+    Sex = factor(Sex, levels = c("Female", "Male"))
+  )
+
+ins_positive <- ins_sample %>%
+  dplyr::filter(is.finite(Abundance), Abundance > 0) %>%
+  dplyr::mutate(log2_Abundance = log2(Abundance))
+
+make_ins_effect <- function(trt_name) {
+  means <- ins_positive %>%
+    dplyr::filter(Treatment %in% c("Control", trt_name)) %>%
+    dplyr::group_by(Protein_ID, Sex, Treatment) %>%
+    dplyr::summarise(Mean_Abundance = mean(Abundance, na.rm = TRUE), n = dplyr::n(), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = Treatment, values_from = c(Mean_Abundance, n))
+
+  if (!(paste0("Mean_Abundance_", trt_name) %in% names(means))) return(tibble::tibble())
+
+  ptab <- ins_positive %>%
+    dplyr::filter(Treatment %in% c("Control", trt_name)) %>%
+    dplyr::group_by(Protein_ID, Sex) %>%
+    dplyr::group_modify(~ tibble::tibble(p_Ins = safe_treatment_p(.x, log2_Abundance, trt_name))) %>%
+    dplyr::ungroup()
+
+  means %>%
+    dplyr::transmute(
+      Protein_ID,
+      Sex,
+      Treatment = trt_name,
+      Control = Mean_Abundance_Control,
+      Treatment_Value = .data[[paste0("Mean_Abundance_", trt_name)]],
+      n_Control = n_Control,
+      n_Treatment = .data[[paste0("n_", trt_name)]],
+      Delta_Ins = log2(Treatment_Value / Control)
+    ) %>%
+    dplyr::filter(
+      is.finite(Control), is.finite(Treatment_Value),
+      Control > 0, Treatment_Value > 0,
+      n_Control >= min_detected, n_Treatment >= min_detected
+    ) %>%
+    dplyr::left_join(ptab, by = c("Protein_ID", "Sex"))
+}
+
+ins_effect <- dplyr::bind_rows(make_ins_effect("Exercise"), make_ins_effect("Rapamycin")) %>%
+  dplyr::mutate(
+    Treatment = factor(Treatment, levels = c("Exercise", "Rapamycin")),
+    Sex = factor(Sex, levels = c("Female", "Male"))
+  )
+
+readr::write_csv(ratio_effect, file.path(out_dir, "Direct_InsSol_Effects.csv"))
+readr::write_csv(ins_effect, file.path(out_dir, "Direct_Insoluble_Effects.csv"))
+```
+
+## Fate of high-propensity Old-Control insoluble proteins
+
+This figure follows the consensus high-propensity proteins defined **within the Old-Control insoluble proteome** and asks whether Exercise or Rapamycin shifts them toward greater relative solubility. Negative treatment effects indicate a decrease in log2(Insoluble/Soluble), i.e. a shift toward the soluble fraction. `*` denotes raw p < 0.05. Missing cells indicate that a valid ratio effect could not be estimated for that protein/sex/comparison.
+
+```{r oldctl-insoluble-consensus-fate-heatmap, fig.keep="none"}
+ratio_effect_wide <- ratio_effect %>%
+  dplyr::mutate(Key = paste(as.character(Treatment), as.character(Sex), sep = "_")) %>%
+  dplyr::select(Protein_ID, Key, Delta_InsSol, p_InsSol) %>%
+  tidyr::pivot_wider(names_from = Key, values_from = c(Delta_InsSol, p_InsSol), names_glue = "{.value}_{Key}")
+
+ins_effect_wide <- ins_effect %>%
+  dplyr::mutate(Key = paste(as.character(Treatment), as.character(Sex), sep = "_")) %>%
+  dplyr::select(Protein_ID, Key, Delta_Ins, p_Ins) %>%
+  tidyr::pivot_wider(names_from = Key, values_from = c(Delta_Ins, p_Ins), names_glue = "{.value}_{Key}")
+
+old_ctl_ins_consensus_fate <- old_ctl_ins_consensus %>%
+  dplyr::left_join(ratio_effect_wide, by = "Protein_ID") %>%
+  dplyr::left_join(ins_effect_wide, by = "Protein_ID")
+
+readr::write_csv(old_ctl_ins_consensus_fate, file.path(out_dir, "OldCtl_Insoluble_Consensus_Fate.csv"))
+
+fate_order <- old_ctl_ins_consensus$Protein_Label
+
+p_prop_fate <- ggplot2::ggplot(
+  old_ctl_ins_consensus_long,
+  ggplot2::aes(x = Metric, y = Protein_Label, fill = Percentile)
+) +
+  ggplot2::geom_tile(colour = "white", linewidth = nm_style$axis_line) +
+  ggplot2::scale_fill_viridis_c(option = "D", direction = 1, limits = c(0, 1), name = "Percentile rank") +
+  ggplot2::labs(x = NULL, y = NULL) +
+  theme_nm(legend_position = "bottom", plot_title = FALSE, plot_subtitle = FALSE) +
+  ggplot2::theme(
+    axis.text.y = ggplot2::element_text(
+      family = nm_style$font_family,
+      size = nm_style$small_text,
+      colour = "black"
+    ),
+    axis.ticks = ggplot2::element_blank()
+  )
+
+safe_col <- function(data, name) {
+  if (name %in% names(data)) data[[name]] else rep(NA_real_, nrow(data))
+}
+
+fate_long <- dplyr::bind_rows(
+  tibble::tibble(
+    Protein_Label = old_ctl_ins_consensus_fate$Protein_Label,
+    Measure = "Ex F",
+    Effect = safe_col(old_ctl_ins_consensus_fate, "Delta_InsSol_Exercise_Female"),
+    p_raw = safe_col(old_ctl_ins_consensus_fate, "p_InsSol_Exercise_Female")
+  ),
+  tibble::tibble(
+    Protein_Label = old_ctl_ins_consensus_fate$Protein_Label,
+    Measure = "Ex M",
+    Effect = safe_col(old_ctl_ins_consensus_fate, "Delta_InsSol_Exercise_Male"),
+    p_raw = safe_col(old_ctl_ins_consensus_fate, "p_InsSol_Exercise_Male")
+  ),
+  tibble::tibble(
+    Protein_Label = old_ctl_ins_consensus_fate$Protein_Label,
+    Measure = "Rapa F",
+    Effect = safe_col(old_ctl_ins_consensus_fate, "Delta_InsSol_Rapamycin_Female"),
+    p_raw = safe_col(old_ctl_ins_consensus_fate, "p_InsSol_Rapamycin_Female")
+  ),
+  tibble::tibble(
+    Protein_Label = old_ctl_ins_consensus_fate$Protein_Label,
+    Measure = "Rapa M",
+    Effect = safe_col(old_ctl_ins_consensus_fate, "Delta_InsSol_Rapamycin_Male"),
+    p_raw = safe_col(old_ctl_ins_consensus_fate, "p_InsSol_Rapamycin_Male")
+  )
+) %>%
+  dplyr::mutate(
+    Measure = factor(Measure, levels = c("Ex F", "Ex M", "Rapa F", "Rapa M")),
+    Protein_Label = factor(Protein_Label, levels = rev(fate_order)),
+    Sig = dplyr::if_else(is.finite(p_raw) & p_raw < 0.05, "*", "")
+  )
+
+finite_fate_effects <- fate_long$Effect[is.finite(fate_long$Effect)]
+fate_lim <- if (length(finite_fate_effects) > 0L) {
+  max(abs(finite_fate_effects))
+} else {
+  1
+}
+if (!is.finite(fate_lim) || fate_lim == 0) fate_lim <- 1
+
+p_fate <- ggplot2::ggplot(fate_long, ggplot2::aes(x = Measure, y = Protein_Label, fill = Effect)) +
+  ggplot2::geom_tile(colour = "white", linewidth = nm_style$axis_line) +
+  ggplot2::geom_text(
+    ggplot2::aes(label = Sig),
+    family = nm_style$font_family,
+    size = nm_style$stat_text / 2.845276,
+    fontface = "bold"
+  ) +
+  ggplot2::scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "#F7F7F7",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-fate_lim, fate_lim),
+    oob = scales::squish,
+    na.value = "grey92",
+    name = "Treatment effect\nΔlog2(Ins/Sol)"
+  ) +
+  ggplot2::labs(x = NULL, y = NULL) +
+  theme_nm(legend_position = "bottom", plot_title = FALSE, plot_subtitle = FALSE) +
+  ggplot2::theme(axis.text.y = ggplot2::element_blank(), axis.ticks = ggplot2::element_blank())
+
+p_consensus_fate <- (p_prop_fate | p_fate) +
+  patchwork::plot_layout(widths = c(3.0, 4.0))
+
+save_nm_both(
+  p_consensus_fate,
+  file.path(out_dir, "OldCtl_Insoluble_Consensus_Fate_Heatmap"),
+  "fate_heat",
+  height_mm = nm_heatmap_height(nrow(old_ctl_ins_consensus_fate))
+)
+```
+
+# Primary analysis: does propensity predict Exercise- or Rapamycin-induced solubility remodeling?
+
+The continuous analysis uses **all proteins from the fixed pooled-sex Old-Control insoluble baseline universe** for which the corresponding sex-specific direct treatment effect on volume-corrected log2(Insoluble/Soluble) can be estimated. No propensity cutoff or top-protein filter is used to define the regression dataset. BH correction is applied across the three propensity metrics **within each Treatment × Sex family**, mirroring the Adult-vs-Old analysis while keeping Exercise and Rapamycin as distinct planned comparisons. Metric-specific top-10 proteins are added only after the statistics are calculated and are used for visualization only. To make the biological interpretation clearer, each panel labels the **union** of two descriptive sets: (i) the metric-specific top-10 high-propensity proteins and (ii) the top 5 proteins with the most negative treatment-associated partitioning shift within that Treatment × Sex comparison. These labeling rules do not alter the regression statistics.
+
+```{r propensity-vs-ratio-treatment, fig.keep="none"}
+ratio_propensity <- ratio_effect %>%
+  dplyr::inner_join(
+    old_ctl_ins_propensity %>%
+      dplyr::select(
+        Protein_ID, Gene, Protein_Label, Bin, Consensus_percentile,
+        Na4vSS_percentile, TANGO_percentile, WALTZ_percentile
+      ),
+    by = "Protein_ID"
+  ) %>%
+  dplyr::inner_join(metrics_long, by = "Protein_ID", relationship = "many-to-many") %>%
+  dplyr::filter(is.finite(Delta_InsSol), is.finite(Metric_Score), Bin %in% display_bins) %>%
+  dplyr::mutate(
+    log2FC = Delta_InsSol,
+    Treatment = factor(Treatment, levels = c("Exercise", "Rapamycin")),
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Metric = factor(Metric, levels = metric_levels)
+  )
+
+ratio_cor_stats <- ratio_propensity %>%
+  dplyr::group_by(Treatment, Sex, Metric) %>%
+  dplyr::group_modify(~ safe_cor_stats(.x)) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(Treatment, Sex) %>%
+  dplyr::mutate(q_BH = stats::p.adjust(p, method = "BH")) %>%
+  dplyr::ungroup()
+
+readr::write_csv(ratio_cor_stats, file.path(out_dir, "Propensity_vs_InsSol_stats.csv"))
+
+# Export the exact rows used in the primary correlation before any top-10
+# visualization lookup is joined. This makes future version-to-version audits
+# protein-for-protein reproducible.
+readr::write_csv(
+  ratio_propensity %>%
+    dplyr::select(Protein_ID, Gene, Protein_Label, Bin, Treatment, Sex, Metric, Delta_InsSol, Metric_Score) %>%
+    dplyr::distinct(),
+  file.path(out_dir, "Propensity_vs_InsSol_input.csv")
+)
+
+# Descriptive audit: top intervention-associated decreases in partitioning
+# used for labeling in the primary propensity-vs-Ins/Sol panels.
+ratio_top_shift_labels <- ratio_propensity %>%
+  dplyr::distinct(Treatment, Sex, Protein_ID, Gene, Protein_Label, Bin, Delta_InsSol) %>%
+  dplyr::group_by(Treatment, Sex) %>%
+  dplyr::slice_min(order_by = Delta_InsSol, n = top_n_shift_label, with_ties = FALSE) %>%
+  dplyr::ungroup()
+readr::write_csv(ratio_top_shift_labels, file.path(out_dir, "Propensity_vs_InsSol_top5_decrease_labels.csv"))
+
+make_treatment_corr_plot <- function(trt_name, data, stats, effect_col, x_label) {
+  effect_col <- rlang::ensym(effect_col)
+
+  # VISUALIZATION ONLY: metric-specific Old-Control INSOLUBLE top proteins.
+  # Statistics were already calculated above from the full estimable baseline
+  # pool. With top_n_plot = 10, a protein is highlighted only in the metric for
+  # which it belongs to that metric-specific top-10 list.
+  top_metric_lookup <- old_top_plot %>%
+    dplyr::transmute(Protein_ID, Metric_key = as.character(Metric), Top_metric = TRUE) %>%
+    dplyr::distinct()
+
+  # Additional descriptive labels: within each Treatment x Sex comparison,
+  # identify the proteins with the most negative intervention-associated shift
+  # on the x-axis. This lookup is metric-independent and is used only for
+  # point labeling, not for any statistical calculation.
+  top_shift_lookup <- data %>%
+    dplyr::filter(as.character(Treatment) == trt_name) %>%
+    dplyr::distinct(Sex, Protein_ID, Protein_Label, !!effect_col) %>%
+    dplyr::group_by(Sex) %>%
+    dplyr::slice_min(order_by = !!effect_col, n = top_n_shift_label, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::transmute(Sex, Protein_ID, Top_shift = TRUE)
+
+  st <- stats %>%
+    dplyr::filter(as.character(Treatment) == trt_name) %>%
+    dplyr::mutate(
+      Sex = factor(as.character(Sex), levels = c("Female", "Male")),
+      Metric = factor(as.character(Metric), levels = metric_levels),
+      Facet = paste0(
+        "<b>", Sex, " — ", Metric, "</b><br>",
+        "<span style='font-size:5.7pt;font-weight:normal;'>r=",
+        ifelse(is.na(r), "NA", sprintf("%.2f", r)),
+        ", p=", fmt_p3(p), ", BH q=", fmt_p3(q_BH), "</span>"
+      )
+    ) %>%
+    dplyr::arrange(Sex, Metric)
+
+  dd <- data %>%
+    dplyr::filter(as.character(Treatment) == trt_name) %>%
+    dplyr::left_join(st %>% dplyr::select(Sex, Metric, Facet), by = c("Sex", "Metric")) %>%
+    dplyr::mutate(
+      Facet = factor(Facet, levels = st$Facet),
+      Metric_key = as.character(Metric),
+      Bin = factor(as.character(Bin), levels = display_bins)
+    ) %>%
+    dplyr::left_join(top_metric_lookup, by = c("Protein_ID", "Metric_key")) %>%
+    dplyr::left_join(top_shift_lookup, by = c("Sex", "Protein_ID")) %>%
+    dplyr::mutate(
+      Top_metric = dplyr::coalesce(Top_metric, FALSE),
+      Top_shift = dplyr::coalesce(Top_shift, FALSE),
+      Label_me = Top_metric | Top_shift
+    )
+
+  # Label the union of (i) metric-specific top-10 high-propensity proteins and
+  # (ii) the strongest intervention-associated decreases. Proteins without a
+  # valid treatment effect for that panel cannot be displayed.
+  labels <- dd %>%
+    dplyr::filter(Label_me) %>%
+    dplyr::distinct(Sex, Metric, Protein_ID, .keep_all = TRUE)
+
+  ggplot2::ggplot(dd, ggplot2::aes(x = !!effect_col, y = Metric_Score)) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", linewidth = nm_style$axis_line, colour = "grey65") +
+    ggplot2::geom_smooth(
+      method = "lm",
+      formula = y ~ x,
+      se = TRUE,
+      colour = "black",
+      fill = "grey75",
+      alpha = 0.25,
+      linewidth = nm_style$data_line
+    ) +
+
+    # All proteins = filled circles coloured by cellular component.
+    ggplot2::geom_point(ggplot2::aes(colour = Bin), shape = 16, size = nm_style$point_small, alpha = 0.58) +
+
+    # Metric-specific top-10 proteins = coloured diamond points (no outline box).
+    ggplot2::geom_point(
+      data = dd %>% dplyr::filter(Top_metric),
+      ggplot2::aes(colour = Bin),
+      shape = 18,
+      size = nm_style$point_rank + 0.45,
+      stroke = 0,
+      inherit.aes = TRUE
+    ) +
+
+    # Label all requested proteins available in the panel: high-propensity hits
+    # and the strongest intervention-induced partitioning shifters.
+    ggrepel::geom_text_repel(
+      data = labels,
+      ggplot2::aes(label = Protein_Label),
+      family = nm_style$font_family,
+      size = nm_style$small_text / 2.845276,
+      colour = "black",
+      max.overlaps = Inf,
+      box.padding = 0.25,
+      point.padding = 0.15,
+      min.segment.length = 0,
+      segment.size = 0.18,
+      show.legend = FALSE
+    ) +
+    ggplot2::scale_colour_manual(
+      values = component_cols,
+      limits = names(component_cols),
+      breaks = names(component_cols),
+      drop = FALSE,
+      name = "Cellular component"
+    ) +
+    ggplot2::facet_wrap(~ Facet, ncol = 3, scales = "free_y") +
+    ggplot2::labs(title = paste0(trt_name, " vs Control"), x = x_label, y = "Intrinsic aggregation propensity") +
+    theme_nm(legend_position = "right") +
+    ggplot2::theme(
+      strip.text = ggtext::element_markdown(
+        family = nm_style$font_family,
+        size = nm_style$strip_text,
+        lineheight = 1.02
+      )
+    )
+}
+
+p_ratio_ex <- make_treatment_corr_plot(
+  "Exercise", ratio_propensity, ratio_cor_stats, Delta_InsSol,
+  "Exercise effect on log2(Insoluble/Soluble)"
+)
+p_ratio_rapa <- make_treatment_corr_plot(
+  "Rapamycin", ratio_propensity, ratio_cor_stats, Delta_InsSol,
+  "Rapamycin effect on log2(Insoluble/Soluble)"
+)
+
+main_dir <- file.path(out_dir, "Main")
+safe_dir_create(main_dir)
+
+save_nm_both(p_ratio_ex + ggplot2::labs(title = NULL), file.path(main_dir, "Ex_Propensity_vs_InsSol"), "corr_six")
+save_nm_both(
+  p_ratio_rapa + ggplot2::labs(title = NULL),
+  file.path(main_dir, "Rapa_Propensity_vs_InsSol"),
+  "corr_six"
+)
+
+p_ratio_both <- (
+  p_ratio_ex + p_ratio_rapa + patchwork::plot_layout(ncol = 1, guides = "collect")
+) & ggplot2::theme(legend.position = "right")
+
+save_nm_both(p_ratio_both, file.path(main_dir, "Ex_Rapa_Propensity_vs_InsSol"), "corr_both")
+```
+
+# Component-adjusted models
+
+These models test whether the continuous propensity relationship remains after accounting for cellular-component membership. Metric scores are standardized within each Treatment × Sex × Metric analysis, so the coefficient represents the treatment-associated change in log2(Insoluble/Soluble) per 1-SD increase in intrinsic propensity. An exploratory propensity × component interaction comparison is also exported when estimable.
+
+```{r component-adjusted-models}
+component_adjusted_stats <- ratio_propensity %>%
+  dplyr::group_by(Treatment, Sex, Metric) %>%
+  dplyr::group_modify(function(.x, .y) {
+    dd <- .x %>%
+      dplyr::filter(is.finite(Delta_InsSol), is.finite(Metric_Score), Bin %in% display_bins) %>%
+      dplyr::mutate(Bin = droplevels(factor(as.character(Bin), levels = display_bins)))
+
+    n_protein <- dplyr::n_distinct(dd$Protein_ID)
+    n_bin <- nlevels(dd$Bin)
+    s_metric <- stats::sd(dd$Metric_Score, na.rm = TRUE)
+
+    if (n_protein < 10L || n_bin < 2L || !is.finite(s_metric) || s_metric == 0) {
+      return(tibble::tibble(
+        n = n_protein, n_components = n_bin,
+        beta_propensity_SD = NA_real_, p_propensity = NA_real_,
+        p_propensity_x_component = NA_real_, status = "Not estimable"
+      ))
+    }
+
+    dd <- dd %>% dplyr::mutate(Metric_z = as.numeric(scale(Metric_Score)))
+    fit_add <- tryCatch(stats::lm(Delta_InsSol ~ Metric_z + Bin, data = dd), error = function(e) NULL)
+    fit_int <- tryCatch(stats::lm(Delta_InsSol ~ Metric_z * Bin, data = dd), error = function(e) NULL)
+
+    if (is.null(fit_add)) {
+      return(tibble::tibble(
+        n = n_protein, n_components = n_bin,
+        beta_propensity_SD = NA_real_, p_propensity = NA_real_,
+        p_propensity_x_component = NA_real_, status = "Fit failed"
+      ))
+    }
+
+    co <- summary(fit_add)$coefficients
+    beta <- if ("Metric_z" %in% rownames(co)) co["Metric_z", "Estimate"] else NA_real_
+    p_beta <- if ("Metric_z" %in% rownames(co)) co["Metric_z", "Pr(>|t|)"] else NA_real_
+
+    p_int <- NA_real_
+    if (!is.null(fit_int)) {
+      cmp <- tryCatch(stats::anova(fit_add, fit_int), error = function(e) NULL)
+      if (!is.null(cmp) && nrow(cmp) >= 2L) p_int <- cmp$`Pr(>F)`[2]
+    }
+
+    tibble::tibble(
+      n = n_protein,
+      n_components = n_bin,
+      beta_propensity_SD = beta,
+      p_propensity = p_beta,
+      p_propensity_x_component = p_int,
+      status = "OK"
+    )
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(Treatment, Sex) %>%
+  dplyr::mutate(
+    q_propensity_BH = stats::p.adjust(p_propensity, method = "BH"),
+    q_interaction_BH = stats::p.adjust(p_propensity_x_component, method = "BH")
+  ) %>%
+  dplyr::ungroup()
+
+readr::write_csv(component_adjusted_stats, file.path(out_dir, "Component_Adjusted_InsSol_Models.csv"))
+```
+
+# Reverse-angle analysis: propensity of the proteins shifted most strongly toward solubility
+
+Proteins are ranked separately within each Treatment × Sex comparison by treatment effect size. For the ratio endpoint, the top 10 most negative Δlog2(Insoluble/Soluble) values are shown. Selection is based on effect size only, not statistical significance. The same descriptive analysis is repeated for the strongest decreases in insoluble abundance.
+
+```{r reverse-angle-top-shifters, fig.keep="none"}
+shift_dir <- file.path(out_dir, "TopShift")
+safe_dir_create(shift_dir)
+
+prepare_top_shifters <- function(effect_data, effect_col, p_col, endpoint_label) {
+  effect_col <- rlang::ensym(effect_col)
+  p_col <- rlang::ensym(p_col)
+
+  ranked <- effect_data %>%
+    dplyr::filter(is.finite(!!effect_col)) %>%
+    dplyr::inner_join(
+      old_ctl_ins_propensity %>%
+        dplyr::select(Protein_ID, Gene, Protein_Label, Bin, Na4vSS, TANGO, `WALTZ %`, Consensus_percentile),
+      by = "Protein_ID"
+    ) %>%
+    dplyr::mutate(Effect = !!effect_col, Effect_p = !!p_col, Endpoint = endpoint_label) %>%
+    dplyr::group_by(Treatment, Sex) %>%
+    dplyr::arrange(Effect, .by_group = TRUE) %>%
+    dplyr::mutate(Rank_all = dplyr::row_number()) %>%
+    dplyr::ungroup()
+
+  readr::write_csv(ranked, file.path(shift_dir, paste0(endpoint_label, "_Full_Ranking.csv")))
+
+  ranked %>%
+    dplyr::filter(Effect < 0) %>%
+    dplyr::group_by(Treatment, Sex) %>%
+    dplyr::slice_min(Effect, n = top_n_shifter, with_ties = FALSE) %>%
+    dplyr::ungroup()
+}
+
+make_top_shifter_plot <- function(dd, trt_name, endpoint_text) {
+  d <- dd %>%
+    dplyr::filter(as.character(Treatment) == trt_name) %>%
+    dplyr::select(Protein_ID, Protein_Label, Bin, Sex, Treatment, Effect, Effect_p, Na4vSS, TANGO, `WALTZ %`) %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(metric_levels), names_to = "Metric", values_to = "Metric_Score") %>%
+    dplyr::mutate(Metric = factor(Metric, levels = metric_levels), Sex = factor(Sex, levels = c("Female", "Male")))
+
+  # Order labels independently within each sex using the treatment effect.
+  order_df <- d %>%
+    dplyr::distinct(Sex, Protein_Label, Effect) %>%
+    dplyr::arrange(Sex, Effect) %>%
+    dplyr::mutate(Label2 = paste(Sex, Protein_Label, sep = "__"))
+
+  d <- d %>%
+    dplyr::mutate(Label2 = paste(Sex, Protein_Label, sep = "__")) %>%
+    dplyr::mutate(Label2 = factor(Label2, levels = rev(order_df$Label2)))
+
+  ggplot2::ggplot(d, ggplot2::aes(x = Metric_Score, y = Label2, colour = Bin)) +
+    ggplot2::geom_point(size = nm_style$point_rank, alpha = 0.9) +
+    ggplot2::scale_y_discrete(labels = function(x) sub("^[^_]+__", "", x)) +
+    ggplot2::scale_colour_manual(
+      values = component_cols,
+      limits = names(component_cols),
+      breaks = names(component_cols),
+      drop = FALSE,
+      name = "Cellular component"
+    ) +
+    ggplot2::facet_grid(Sex ~ Metric, scales = "free", space = "free_x") +
+    ggplot2::labs(
+      title = paste0(trt_name, " vs Control — strongest shifts toward solubility"),
+      subtitle = endpoint_text,
+      x = "Intrinsic aggregation propensity",
+      y = NULL
+    ) +
+    theme_nm(legend_position = "right") +
+    ggplot2::theme(axis.text.y = ggplot2::element_text(size = nm_style$small_text))
+}
+
+top_ratio <- prepare_top_shifters(ratio_effect, Delta_InsSol, p_InsSol, "InsSol")
+readr::write_csv(top_ratio, file.path(shift_dir, "InsSol_Top10.csv"))
+
+for (trt in c("Exercise", "Rapamycin")) {
+  p <- make_top_shifter_plot(
+    top_ratio, trt,
+    "Top 10 most negative treatment effects on volume-corrected log2(Insoluble/Soluble)"
+  )
+  save_nm_both(
+    p + ggplot2::labs(title = NULL, subtitle = NULL),
+    file.path(shift_dir, paste0(ifelse(trt == "Exercise", "Ex", "Rapa"), "_Top_InsSol")),
+    "shift_both"
+  )
+}
+
+top_ins <- prepare_top_shifters(ins_effect, Delta_Ins, p_Ins, "Insoluble")
+readr::write_csv(top_ins, file.path(shift_dir, "Insoluble_Top10.csv"))
+
+for (trt in c("Exercise", "Rapamycin")) {
+  p <- make_top_shifter_plot(top_ins, trt, "Top 10 largest decreases in insoluble protein abundance")
+  save_nm_both(
+    p + ggplot2::labs(title = NULL, subtitle = NULL),
+    file.path(shift_dir, paste0(ifelse(trt == "Exercise", "Ex", "Rapa"), "_Top_Insoluble")),
+    "shift_both"
+  )
+}
+```
+
+# Complementary analysis: propensity vs treatment-associated insoluble-abundance change
+
+The complementary insoluble-abundance correlations use the same descriptive labeling rule as the primary ratio plots: metric-specific top-10 high-propensity proteins are highlighted with diamonds, and the top 5 proteins with the most negative insoluble-abundance response within each Treatment × Sex comparison are also labeled.
+
+```{r propensity-vs-insoluble-treatment, fig.keep="none"}
+ins_propensity <- ins_effect %>%
+  dplyr::inner_join(
+    old_ctl_ins_propensity %>%
+      dplyr::select(
+        Protein_ID, Gene, Protein_Label, Bin, Consensus_percentile,
+        Na4vSS_percentile, TANGO_percentile, WALTZ_percentile
+      ),
+    by = "Protein_ID"
+  ) %>%
+  dplyr::inner_join(metrics_long, by = "Protein_ID", relationship = "many-to-many") %>%
+  dplyr::filter(is.finite(Delta_Ins), is.finite(Metric_Score), Bin %in% display_bins) %>%
+  dplyr::mutate(
+    log2FC = Delta_Ins,
+    Treatment = factor(Treatment, levels = c("Exercise", "Rapamycin")),
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Metric = factor(Metric, levels = metric_levels)
+  )
+
+ins_cor_stats <- ins_propensity %>%
+  dplyr::group_by(Treatment, Sex, Metric) %>%
+  dplyr::group_modify(~ safe_cor_stats(.x)) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(Treatment, Sex) %>%
+  dplyr::mutate(q_BH = stats::p.adjust(p, method = "BH")) %>%
+  dplyr::ungroup()
+
+readr::write_csv(ins_cor_stats, file.path(out_dir, "Propensity_vs_Insoluble_stats.csv"))
+
+# Export the exact rows used in the complementary insoluble-abundance
+# correlations. Top-10 highlighting is not part of this dataset definition.
+readr::write_csv(
+  ins_propensity %>%
+    dplyr::select(Protein_ID, Gene, Protein_Label, Bin, Treatment, Sex, Metric, Delta_Ins, Metric_Score) %>%
+    dplyr::distinct(),
+  file.path(out_dir, "Propensity_vs_Insoluble_input.csv")
+)
+
+# Descriptive audit: top intervention-associated decreases in insoluble
+# abundance labeled in the complementary propensity-vs-insoluble panels.
+ins_top_shift_labels <- ins_propensity %>%
+  dplyr::distinct(Treatment, Sex, Protein_ID, Gene, Protein_Label, Bin, Delta_Ins) %>%
+  dplyr::group_by(Treatment, Sex) %>%
+  dplyr::slice_min(order_by = Delta_Ins, n = top_n_shift_label, with_ties = FALSE) %>%
+  dplyr::ungroup()
+readr::write_csv(ins_top_shift_labels, file.path(out_dir, "Propensity_vs_Insoluble_top5_decrease_labels.csv"))
+
+ext_dir <- file.path(out_dir, "Extended")
+safe_dir_create(ext_dir)
+
+p_ins_ex <- make_treatment_corr_plot(
+  "Exercise", ins_propensity, ins_cor_stats, Delta_Ins,
+  "Exercise effect on insoluble abundance, log2FC"
+)
+p_ins_rapa <- make_treatment_corr_plot(
+  "Rapamycin", ins_propensity, ins_cor_stats, Delta_Ins,
+  "Rapamycin effect on insoluble abundance, log2FC"
+)
+
+save_nm_both(p_ins_ex + ggplot2::labs(title = NULL), file.path(ext_dir, "Ex_Propensity_vs_Insoluble"), "corr_six")
+save_nm_both(
+  p_ins_rapa + ggplot2::labs(title = NULL),
+  file.path(ext_dir, "Rapa_Propensity_vs_Insoluble"),
+  "corr_six"
+)
+```
+
+# Cellular-component-specific treatment correlations
+
+The same direct treatment effects are evaluated within each cellular component. A fit is attempted when at least `min_component_n` proteins are available with nonconstant values. All attempted tests are saved. BH correction is applied across all component-specific tests within each treatment. Ratio-based correlations are the primary compartment analysis; insoluble-abundance correlations are generated as a complementary Extended Data analysis.
+
+```{r component-specific-correlations, fig.keep="none"}
+run_component_correlations <- function(data, effect_col, endpoint_tag) {
+  effect_col <- rlang::ensym(effect_col)
+
+  stats_tbl <- data %>%
+    dplyr::filter(Bin %in% display_bins, is.finite(!!effect_col), is.finite(Metric_Score)) %>%
+    dplyr::group_by(Treatment, Metric, Bin, Sex) %>%
+    dplyr::group_modify(function(.x, .y) {
+      z <- .x
+      n_protein <- dplyr::n_distinct(z$Protein_ID)
+      sx <- stats::sd(dplyr::pull(z, !!effect_col), na.rm = TRUE)
+      sy <- stats::sd(z$Metric_Score, na.rm = TRUE)
+
+      if (n_protein < min_component_n || !is.finite(sx) || !is.finite(sy) || sx == 0 || sy == 0) {
+        return(tibble::tibble(
+          n = n_protein, r = NA_real_, p = NA_real_, slope = NA_real_, status = "Not estimable"
+        ))
+      }
+
+      x <- dplyr::pull(z, !!effect_col)
+      ct <- stats::cor.test(x, z$Metric_Score, method = "pearson")
+      fit <- stats::lm(Metric_Score ~ x, data = z)
+
+      tibble::tibble(
+        n = n_protein,
+        r = unname(ct$estimate),
+        p = ct$p.value,
+        slope = unname(stats::coef(fit)[["x"]]),
+        status = "OK"
+      )
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::group_by(Treatment) %>%
+    dplyr::mutate(q_BH = stats::p.adjust(p, method = "BH")) %>%
+    dplyr::ungroup()
+
+  out_cc <- file.path(ext_dir, endpoint_tag)
+  safe_dir_create(out_cc)
+  readr::write_csv(stats_tbl, file.path(out_cc, paste0(endpoint_tag, "_stats.csv")))
+
+  make_cc_plot <- function(trt_name, metric, bins_here, single = FALSE, show_legend = TRUE) {
+    dd <- data %>%
+      dplyr::filter(
+        as.character(Treatment) == trt_name,
+        as.character(Metric) == metric,
+        as.character(Bin) %in% bins_here
+      )
+
+    ss <- stats_tbl %>%
+      dplyr::filter(
+        as.character(Treatment) == trt_name,
+        as.character(Metric) == metric,
+        as.character(Bin) %in% bins_here
+      )
+
+    strip_df <- ss %>%
+      dplyr::mutate(Bin = factor(as.character(Bin), levels = display_bins)) %>%
+      dplyr::arrange(Bin, Sex) %>%
+      dplyr::mutate(
+        stat = paste0(Sex, ": n=", n, ", r=", ifelse(is.na(r), "NA", sprintf("%.2f", r)), ", p=", fmt_p3(p))
+      ) %>%
+      dplyr::select(Bin, Sex, stat) %>%
+      tidyr::pivot_wider(names_from = Sex, values_from = stat) %>%
+      dplyr::mutate(
+        Strip = paste(
+          as.character(Bin),
+          dplyr::coalesce(Female, "Female: NA"),
+          dplyr::coalesce(Male, "Male: NA"),
+          sep = "\n"
+        )
+      )
+
+    dd <- dd %>%
+      dplyr::mutate(Bin = factor(as.character(Bin), levels = display_bins)) %>%
+      dplyr::left_join(strip_df %>% dplyr::select(Bin, Strip), by = "Bin") %>%
+      dplyr::mutate(Strip = factor(Strip, levels = unique(strip_df$Strip)))
+
+    ggplot2::ggplot(dd, ggplot2::aes(x = !!effect_col, y = Metric_Score)) +
+      ggplot2::geom_vline(xintercept = 0, colour = "grey65", linetype = "dashed", linewidth = nm_style$axis_line) +
+      ggplot2::geom_point(ggplot2::aes(colour = Sex, shape = Sex), size = nm_style$point_small, alpha = 0.70) +
+      ggplot2::geom_smooth(
+        ggplot2::aes(colour = Sex, fill = Sex, group = Sex),
+        method = "lm", formula = y ~ x, se = TRUE,
+        alpha = 0.12, linewidth = nm_style$data_line,
+        show.legend = FALSE
+      ) +
+      ggplot2::scale_colour_manual(values = sex_cols, breaks = c("Female", "Male"), name = "Sex") +
+      ggplot2::scale_fill_manual(values = sex_cols, guide = "none") +
+      ggplot2::scale_shape_manual(values = sex_shapes, breaks = c("Female", "Male"), name = "Sex") +
+      ggplot2::facet_wrap(~ Strip, ncol = if (single) 1 else 3, nrow = if (single) 1 else 2, scales = "free") +
+      ggplot2::labs(
+        x = if (endpoint_tag == "RatioCC") {
+          paste0(trt_name, " effect on log2(Ins/Sol)")
+        } else {
+          paste0(trt_name, " effect on insoluble abundance, log2FC")
+        },
+        y = unname(metric_axis_short[[metric]])
+      ) +
+      theme_nm(
+        legend_position = if (show_legend) "bottom" else "none",
+        plot_title = FALSE,
+        plot_subtitle = FALSE
+      ) +
+      ggplot2::theme(
+        strip.text = ggplot2::element_text(
+          family = nm_style$font_family,
+          size = nm_style$strip_text,
+          lineheight = 1.05,
+          face = "plain"
+        )
+      )
+  }
+
+  for (trt in c("Exercise", "Rapamycin")) {
+    for (metric in metric_levels) {
+      chosen <- stats_tbl %>%
+        dplyr::filter(
+          as.character(Treatment) == trt,
+          as.character(Metric) == metric,
+          status == "OK",
+          n >= min_component_plot_n
+        ) %>%
+        dplyr::group_by(Bin) %>%
+        dplyr::summarise(n_sexes = dplyr::n_distinct(Sex), .groups = "drop") %>%
+        dplyr::filter(n_sexes == 2L) %>%
+        dplyr::mutate(Bin = factor(as.character(Bin), levels = display_bins)) %>%
+        dplyr::arrange(Bin) %>%
+        dplyr::pull(Bin) %>%
+        as.character()
+
+      if (length(chosen) == 0L) next
+
+      trt_tag <- ifelse(trt == "Exercise", "Ex", "Rapa")
+      mtag <- metric_tag(metric)
+
+      # Short component tags keep Windows/Dropbox paths well below the path
+      # length limit. Individual component panels do not need their own legend;
+      # the grid export below provides the shared Sex legend.
+      component_file_tags <- c(
+        "Sarcomere/Myofibril" = "Sarc",
+        "Cytoskeleton"       = "Cytosk",
+        "Extracellular"      = "Extra",
+        "ECM"                = "ECM",
+        "Nucleus"            = "Nuc",
+        "Mitochondrion"      = "Mito",
+        "Plasma membrane"    = "PM",
+        "Cytosol"            = "Cytosol"
+      )
+
+      for (bin_name in chosen) {
+        btag <- unname(component_file_tags[[bin_name]])
+        if (is.null(btag) || is.na(btag)) {
+          btag <- gsub("[^A-Za-z0-9]+", "_", bin_name)
+        }
+
+        p_one <- make_cc_plot(trt, metric, bin_name, single = TRUE, show_legend = FALSE)
+
+        save_nm_both(
+          p_one,
+          file.path(out_cc, paste0(trt_tag, "_", mtag, "_", btag)),
+          "cc_single",
+          save_legend = FALSE
+        )
+      }
+
+      page_id <- ceiling(seq_along(chosen) / 6)
+      for (page in sort(unique(page_id))) {
+        page_bins <- chosen[page_id == page]
+        p_grid <- make_cc_plot(trt, metric, page_bins, single = FALSE, show_legend = TRUE)
+        save_nm_both(p_grid, file.path(out_cc, paste0(trt_tag, "_", mtag, "_grid", page)), "cc_grid")
+      }
+    }
+  }
+
+  invisible(stats_tbl)
+}
+
+ratio_cc_stats <- run_component_correlations(ratio_propensity, Delta_InsSol, "RatioCC")
+ins_cc_stats <- run_component_correlations(ins_propensity, Delta_Ins, "InsCC")
+```
+
+# Extended Data: global insoluble-proteome intrinsic propensity
+
+This Extended Data analysis is distinct from the fixed-baseline treatment-fate analysis above. It asks whether the **composition of proteins represented within each treatment/sex insoluble proteome** differs globally in intrinsic propensity after treatment. Because this question concerns treatment- and sex-specific proteome representation rather than entry into the Old-Control starting pool, its sex-specific detection filter is retained here. Exercise vs Control and Rapamycin vs Control are tested as two separate planned factorial comparisons; there is no overall three-treatment omnibus test.
+
+```{r global-insoluble-propensity, fig.keep="none"}
+ins_detection <- ins_long %>%
+  dplyr::filter(Age == "Old", Treatment %in% c("Control", "Exercise", "Rapamycin")) %>%
+  dplyr::group_by(Protein.Group, Gene1, Age, Sex, Treatment) %>%
+  dplyr::summarise(N_detected = sum(Detected, na.rm = TRUE), .groups = "drop")
+
+ins_eligible <- ins_detection %>%
+  dplyr::filter(N_detected >= min_detected) %>%
+  tidyr::separate_longer_delim(Protein.Group, delim = ";") %>%
+  dplyr::mutate(Protein_ID = clean_id(Protein.Group)) %>%
+  dplyr::filter(
+    Protein_ID != "",
+    !stringr::str_detect(Protein_ID, stringr::regex("^cRAP-", ignore_case = TRUE))
+  ) %>%
+  dplyr::distinct(Sex, Treatment, Protein_ID)
+
+ins_metric_data <- ins_eligible %>%
+  dplyr::inner_join(metrics_long, by = "Protein_ID", relationship = "many-to-many") %>%
+  dplyr::mutate(
+    Treatment = factor(Treatment, levels = c("Control", "Exercise", "Rapamycin")),
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Metric = factor(Metric, levels = metric_levels)
+  )
+
+ins_metric_stats <- run_planned_treatment_stats(ins_metric_data)
+readr::write_csv(ins_metric_stats, file.path(ext_dir, "Global_InsPropensity_PlannedStats.csv"))
+
+trt_x_map <- tibble::tibble(
+  Group = c(
+    "Female Control", "Female Exercise", "Female Rapamycin",
+    "Male Control", "Male Exercise", "Male Rapamycin"
+  ),
+  x_pos = c(1.00, 1.35, 1.70, 2.60, 2.95, 3.30)
+)
+
+make_global_propensity_plot <- function(metric, data, stats, weighted = FALSE) {
+  st <- stats %>% dplyr::filter(Metric == metric)
+  p_ex <- st %>% dplyr::filter(Treatment == "Exercise") %>% dplyr::pull(p_Treatment)
+  p_ra <- st %>% dplyr::filter(Treatment == "Rapamycin") %>% dplyr::pull(p_Treatment)
+
+  dd <- data %>%
+    dplyr::filter(Metric == metric) %>%
+    dplyr::mutate(Group = factor(paste(Sex, Treatment), levels = trt_x_map$Group)) %>%
+    dplyr::left_join(trt_x_map, by = "Group")
+
+  ylab <- if (weighted) paste0("Abundance-weighted ", metric_axis_short[[metric]]) else metric_axis_short[[metric]]
+
+  ggplot2::ggplot(dd, ggplot2::aes(x = x_pos, y = Metric_Score)) +
+    ggplot2::geom_violin(
+      ggplot2::aes(fill = Treatment, group = Group),
+      trim = FALSE, alpha = 0.50, scale = "width", linewidth = nm_style$axis_line
+    ) +
+    ggplot2::geom_boxplot(
+      ggplot2::aes(fill = Treatment, group = Group),
+      width = 0.13, outlier.shape = NA, alpha = 0.45,
+      linewidth = nm_style$axis_line
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(shape = Sex),
+      position = ggplot2::position_jitter(width = 0.035, height = 0),
+      size = nm_style$point_small, alpha = 0.20
+    ) +
+    ggplot2::scale_fill_manual(values = treatment_cols, drop = FALSE) +
+    ggplot2::scale_shape_manual(values = sex_shapes, drop = FALSE) +
+    ggplot2::scale_x_continuous(
+      breaks = trt_x_map$x_pos,
+      labels = c("Ctl", "Ex", "Rapa", "Ctl", "Ex", "Rapa"),
+      limits = c(0.65, 3.65),
+      expand = ggplot2::expansion(mult = 0)
+    ) +
+    ggplot2::labs(
+      title = metric_titles[[metric]],
+      subtitle = paste0("Ex vs Ctl p=", fmt_p3(p_ex), " | Rapa vs Ctl p=", fmt_p3(p_ra)),
+      x = NULL,
+      y = ylab,
+      fill = "Treatment",
+      shape = "Sex"
+    ) +
+    theme_nm(legend_position = "right") +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(face = "bold"))
+}
+
+global_plots <- lapply(metric_levels, function(metric) {
+  make_global_propensity_plot(metric, ins_metric_data, ins_metric_stats, weighted = FALSE)
+})
+names(global_plots) <- metric_levels
+
+for (metric in metric_levels) {
+  save_nm_both(
+    global_plots[[metric]],
+    file.path(ext_dir, paste0("Global_InsProp_", metric_tag(metric))),
+    "global_single"
+  )
+}
+
+p_global_three <- patchwork::wrap_plots(global_plots, nrow = 1, guides = "collect") &
+  ggplot2::theme(legend.position = "right")
+
+save_nm_both(p_global_three, file.path(ext_dir, "Global_InsProp_3metric"), "global_three")
+```
+
+# Extended Data: abundance-weighted insoluble-proteome propensity
+
+Each plotted observation is a biological sample. Protein-group abundance is divided equally among UniProt IDs represented by that group before calculating the abundance-weighted mean propensity. Exercise vs Control and Rapamycin vs Control remain separate planned comparisons.
+
+```{r abundance-weighted-propensity, fig.keep="none"}
+ins_detection_keys <- ins_detection %>%
+  dplyr::filter(N_detected >= min_detected) %>%
+  dplyr::select(Protein.Group, Age, Sex, Treatment)
+
+retained_weighted <- ins_long %>%
+  dplyr::filter(Age == "Old", Treatment %in% c("Control", "Exercise", "Rapamycin"), Detected) %>%
+  dplyr::inner_join(ins_detection_keys, by = c("Protein.Group", "Age", "Sex", "Treatment")) %>%
+  dplyr::mutate(Original_Group = Protein.Group) %>%
+  tidyr::separate_longer_delim(Protein.Group, delim = ";") %>%
+  dplyr::mutate(Protein_ID = clean_id(Protein.Group)) %>%
+  dplyr::filter(
+    Protein_ID != "",
+    !stringr::str_detect(Protein_ID, stringr::regex("^cRAP-", ignore_case = TRUE))
+  ) %>%
+  dplyr::group_by(Sample, Sex, Treatment, Original_Group) %>%
+  dplyr::mutate(ID_Abundance = Abundance / dplyr::n()) %>%
+  dplyr::ungroup()
+
+weighted_metric_data <- retained_weighted %>%
+  dplyr::inner_join(metrics_long, by = "Protein_ID", relationship = "many-to-many") %>%
+  dplyr::group_by(Sample, Sex, Treatment, Metric) %>%
+  dplyr::summarise(
+    Metric_Score = stats::weighted.mean(Metric_Score, ID_Abundance, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(is.finite(Metric_Score)) %>%
+  dplyr::mutate(
+    Treatment = factor(Treatment, levels = c("Control", "Exercise", "Rapamycin")),
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Metric = factor(Metric, levels = metric_levels)
+  )
+
+weighted_stats <- run_planned_treatment_stats(weighted_metric_data)
+readr::write_csv(weighted_stats, file.path(ext_dir, "AbundanceWeighted_PlannedStats.csv"))
+readr::write_csv(weighted_metric_data, file.path(ext_dir, "AbundanceWeighted_SampleScores.csv"))
+
+weighted_plots <- lapply(metric_levels, function(metric) {
+  make_global_propensity_plot(metric, weighted_metric_data, weighted_stats, weighted = TRUE)
+})
+names(weighted_plots) <- metric_levels
+
+for (metric in metric_levels) {
+  save_nm_both(
+    weighted_plots[[metric]],
+    file.path(ext_dir, paste0("Weighted_InsProp_", metric_tag(metric))),
+    "weighted_single"
+  )
+}
+
+p_weighted_three <- patchwork::wrap_plots(weighted_plots, nrow = 1, guides = "collect") &
+  ggplot2::theme(legend.position = "right")
+
+save_nm_both(p_weighted_three, file.path(ext_dir, "Weighted_InsProp_3metric"), "weighted_three")
+```
+
+# Detection-linked aggregation propensity: shared, exercise-specific and rapamycin-specific losses
+
+This analysis tests whether proteins showing **reduced detection in the insoluble fraction**
+with Old Exercise or Old Rapamycin have greater intrinsic sequence-based aggregation
+propensity (Na4vSS, TANGO, WALTZ). Case membership is taken **directly from the
+original sex-specific detection-analysis CSVs**. The three categories are:
+
+- **Shared loss:** decreased detection after both Exercise and Rapamycin.
+- **Exercise-specific loss:** decreased detection after Exercise only.
+- **Rapamycin-specific loss:** decreased detection after Rapamycin only.
+
+The reference group consists of Old-Control insoluble proteins detected in at
+least two samples in each of Control, Exercise and Rapamycin **within that sex**.
+The percentile reference universe is all proteins detected in at least two
+Old-Control insoluble samples **within the same sex**, not the high-propensity
+(top-10) set from the primary correlation analysis. Detection and propensity are
+assessed independently of one another.
+
+Two figure sets are produced for each category:
+
+1. **All detection-category proteins** as defined in the original CSVs.
+2. **Nominally detection-significant category proteins**. Exercise-specific loss
+   uses the original `p_Exercise < 0.05`; Rapamycin-specific loss uses
+   `p_Rapamycin < 0.05`. For **shared loss**, the primary significant-only
+   view uses `p_Exercise < 0.05 OR p_Rapamycin < 0.05`, because no shared-loss
+   protein in the provided CSVs meets the nominal 0.05 threshold for *both*
+   interventions. Separate `Significant_Both` and treatment-specific columns
+   are preserved in the audit file. **These are raw detection P values**, not
+   FDR-significant changes. The significance filter refers to detection, not
+   aggregation propensity.
+
+For each set, comparison to consistently detected proteins uses a one-sided
+Wilcoxon test, a one-sided Fisher test for top-quartile enrichment and a
+component-stratified permutation sensitivity analysis, per sex and metric;
+P values are BH-adjusted across the nine category × metric comparisons per sex
+and figure set. Small groups can be shown descriptively even when inferential
+tests are not estimable. All candidate IDs, detection P values, score coverage,
+and matrix-count mismatches are reported in CSV audits.
+
+**Figures:** The combined distribution plots compare stable and the three loss
+categories; separate distributions show stable versus each loss category.
+Selected proteins above the 75th score percentile are labeled in each sex ×
+metric facet. Protein-level plots show each scored candidate, with cellular
+component expressed in both the colored protein name and the colored outline
+and 35%-opacity interior of its marker; marker shape distinguishes the three
+intrinsic propensity metrics. Legends are exported separately.
+
+```{r ot-detection-defined-propensity, fig.keep='none'}
+# Self-contained detection-figure size safeguards for interactive RStudio use.
+# The Adult-vs-Old and Old-Treatments Rmds use similar helper object names.
+# Running the AO figure helper after OT can replace nm_svg_dims/nm_dims with
+# incompatible families, producing "Unknown size family: corr_both".
+# Restore only MISSING OT detection defaults, without overwriting custom sizes.
+if (!exists("nm_svg_dims", inherits = TRUE) || !is.list(nm_svg_dims) ||
+    !exists("nm_dims", inherits = TRUE) || !is.list(nm_dims) ||
+    !exists("save_nm_both", mode = "function", inherits = TRUE)) {
+  stop("OT export helpers are not ready. Run the OT Markdown chunks ",
+       "nm-figure-dimensions, nature-metabolism-svg-helpers, ",
+       "and nm-inline-panel-registry before this chunk.")
+}
+
+nm_ot_detect_family_defaults <- list(
+  corr_both = c(width = 142, height = 157),
+  shift_sex = c(width = 172, height = 50)
+)
+for (family in names(nm_ot_detect_family_defaults)) {
+  if (is.null(nm_svg_dims[[family]])) {
+    nm_svg_dims[[family]] <- nm_ot_detect_family_defaults[[family]]
+    message("Restored missing OT export size family: ", family)
+  }
+}
+if (!exists("nm_legend_dims", inherits = TRUE) || !is.list(nm_legend_dims)) {
+  nm_legend_dims <- list()
+}
+for (family in c("corr_both", "shift_sex")) {
+  if (is.null(nm_legend_dims[[family]])) {
+    nm_legend_dims[[family]] <- if (family == "corr_both") {
+      c(width = 52, height = 58)
+    } else {
+      c(width = 58, height = 42)
+    }
+  }
+}
+if (is.null(nm_legend_dims[["generic"]])) {
+  nm_legend_dims[["generic"]] <- c(width = 50, height = 36)
+}
+
+nm_ot_detect_panel_defaults <- list(
+  OT_Detect_Propensity = c(width = 178, height = 120),
+  OT_Detect_Propensity_Sig = c(width = 178, height = 120),
+  OT_Detect_Prop_Shared = c(width = 118, height = 94),
+  OT_Detect_Prop_Exercise = c(width = 118, height = 94),
+  OT_Detect_Prop_Rapa = c(width = 118, height = 94),
+  OT_Detect_Prop_Shared_Sig = c(width = 118, height = 94),
+  OT_Detect_Prop_Exercise_Sig = c(width = 118, height = 94),
+  OT_Detect_Prop_Rapa_Sig = c(width = 118, height = 94),
+  OT_Detect_Shared_Female = c(width = 92, height = 122),
+  OT_Detect_Shared_Male = c(width = 92, height = 72),
+  OT_Detect_Exercise_Female = c(width = 92, height = 67),
+  OT_Detect_Exercise_Male = c(width = 92, height = 74),
+  OT_Detect_Rapa_Female = c(width = 92, height = 62),
+  OT_Detect_Rapa_Male = c(width = 92, height = 52),
+  OT_Detect_Shared_Female_Sig = c(width = 92, height = 47),
+  OT_Detect_Shared_Male_Sig = c(width = 92, height = 38),
+  OT_Detect_Exercise_Female_Sig = c(width = 92, height = 38),
+  OT_Detect_Exercise_Male_Sig = c(width = 92, height = 38),
+  OT_Detect_Rapa_Female_Sig = c(width = 92, height = 38),
+  OT_Detect_Rapa_Male_Sig = c(width = 92, height = 46)
+)
+for (id in names(nm_ot_detect_panel_defaults)) {
+  if (is.null(nm_dims[[id]])) {
+    nm_dims[[id]] <- nm_ot_detect_panel_defaults[[id]]
+  }
+}
+
+# The detection CSVs are the authoritative source of category membership and
+# original detection P values. No propensity threshold is used for selection.
+nm_det_read <- function(candidates) {
+  found <- candidates[file.exists(candidates)]
+  if (!length(found)) stop(
+    "Detection input not found. Put the supplied detection CSV in the Rmd ",
+    "working directory. Searched: ", paste(candidates, collapse = ", ")
+  )
+  readr::read_csv(found[[1]], show_col_types = FALSE)
+}
+
+nm_det_score <- function(eligible, metric_names = metric_levels) {
+  # Rank against the full eligible insoluble baseline universe (including
+  # 'Other' proteins), before extracting selected/reference groups.
+  eligible %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(metric_names), names_to = "Metric", values_to = "Score") %>%
+    dplyr::filter(is.finite(Score)) %>%
+    dplyr::group_by(Sex, Metric) %>%
+    dplyr::mutate(Percentile = 100 * dplyr::percent_rank(Score)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(Metric = factor(Metric, levels = metric_names))
+}
+
+nm_det_test <- function(scored, pattern, sex, metric, reference = "Stable", n_perm = 1999L) {
+  dd <- scored %>%
+    dplyr::filter(Sex == sex, as.character(Metric) == metric, Pattern %in% c(pattern, reference)) %>%
+    dplyr::distinct(Protein_ID, .keep_all = TRUE)
+  x <- dd$Percentile[dd$Pattern == pattern]
+  y <- dd$Percentile[dd$Pattern == reference]
+  nc <- length(x); nr <- length(y)
+  med_delta <- if (nc && nr) stats::median(x) - stats::median(y) else NA_real_
+  auc <- if (nc && nr) mean(vapply(
+    x, function(z) mean(as.numeric(z > y) + 0.5 * as.numeric(z == y)), numeric(1)
+  )) else NA_real_
+  # High-tail enrichment directly tests the 'near the edge' prediction:
+  # are selected proteins overrepresented above the sex-specific 75th
+  # percentile of the full eligible Old insoluble proteome?
+  case_top25 <- sum(x >= 75)
+  stable_top25 <- sum(y >= 75)
+  fisher_top25 <- if (nc >= 2L && nr >= 2L) {
+    tryCatch(stats::fisher.test(
+      matrix(c(case_top25, nc - case_top25, stable_top25, nr - stable_top25), nrow = 2, byrow = TRUE),
+      alternative = "greater")$p.value, error = function(e) NA_real_)
+  } else NA_real_
+  p_w <- if (nc >= 2L && nr >= 2L) {
+    tryCatch(stats::wilcox.test(x, y, alternative = "greater", exact = FALSE, correct = FALSE)$p.value,
+             error = function(e) NA_real_)
+  } else NA_real_
+
+  # Sensitivity analysis: shuffle membership *within cellular components*.
+  # Only components containing at least one case and one reference can inform
+  # a within-component comparison. The permutation holds observed group counts
+  # fixed in every component and uses the one-sided high-propensity alternative.
+  overlapping <- dd %>%
+    dplyr::group_by(Bin) %>%
+    dplyr::filter(any(Pattern == pattern), any(Pattern == reference)) %>%
+    dplyr::ungroup()
+  n_case_overlap <- sum(overlapping$Pattern == pattern)
+  n_ref_overlap <- sum(overlapping$Pattern == reference)
+  observed <- if (n_case_overlap >= 2L && n_ref_overlap >= 2L) {
+    mean(overlapping$Percentile[overlapping$Pattern == pattern]) -
+      mean(overlapping$Percentile[overlapping$Pattern == reference])
+  } else NA_real_
+  p_strat <- NA_real_
+  if (is.finite(observed) && n_perm >= 99L) {
+    # Reproducible, independent of plot rendering or other analysis chunks.
+    set.seed(1807L + match(sex, c("Female", "Male")) * 101L + match(metric, metric_levels) * 13L + nchar(pattern))
+    by_bin <- split(seq_len(nrow(overlapping)), as.character(overlapping$Bin))
+    case_n <- vapply(by_bin, function(idx) sum(overlapping$Pattern[idx] == pattern), integer(1))
+    perm_effect <- replicate(n_perm, {
+      is_case <- rep(FALSE, nrow(overlapping))
+      for (b in names(by_bin)) {
+        idx <- by_bin[[b]]
+        is_case[sample(idx, size = case_n[[b]], replace = FALSE)] <- TRUE
+      }
+      mean(overlapping$Percentile[is_case]) -
+        mean(overlapping$Percentile[!is_case])
+    })
+    p_strat <- (1 + sum(perm_effect >= observed - 1e-12)) / (n_perm + 1)
+  }
+  tibble::tibble(
+    Sex = sex, Pattern = pattern, Metric = metric,
+    n_selected = nc, n_stable = nr,
+    median_percentile_selected = if (nc) stats::median(x) else NA_real_,
+    median_percentile_stable = if (nr) stats::median(y) else NA_real_,
+    median_difference_pp = med_delta,
+    AUC_probability_selected_higher = auc,
+    n_selected_top_quartile = case_top25,
+    n_stable_top_quartile = stable_top25,
+    p_Fisher_top_quartile_one_sided = fisher_top25,
+    p_Wilcoxon_one_sided = p_w,
+    n_case_within_bin = n_case_overlap,
+    n_stable_within_bin = n_ref_overlap,
+    delta_mean_pp_within_overlap_bins = observed,
+    p_permutation_within_bin_one_sided = p_strat
+  )
+}
+
+nm_det_test_all <- function(scored, patterns) {
+  test_grid <- tidyr::crossing(Sex = c("Female", "Male"), Pattern = patterns, Metric = metric_levels)
+  purrr::pmap_dfr(test_grid, function(Sex, Pattern, Metric) {
+    nm_det_test(scored, as.character(Pattern), as.character(Sex), as.character(Metric))
+  }) %>%
+    dplyr::group_by(Sex) %>%
+    dplyr::mutate(
+      # AO: 3 tests/sex. OT: 9 tests/sex, across 3 categories x 3 metrics.
+      FDR_Wilcoxon_BH = stats::p.adjust(p_Wilcoxon_one_sided, "BH"),
+      FDR_top_quartile_BH = stats::p.adjust(p_Fisher_top_quartile_one_sided, "BH"),
+      FDR_within_bin_BH = stats::p.adjust(p_permutation_within_bin_one_sided, "BH")
+    ) %>%
+    dplyr::ungroup()
+}
+
+# Component palette shares the same GO assignment/viridis generation as
+# the primary OT and AO propensity figures.
+nm_ot_detect_component_cols <- c(component_cols[!is.na(component_cols)], "Other/Unassigned" = "#7A7A7A")
+
+nm_ot_detect_shapes <- c(
+  "Na4vSS" = 21,   # circle
+  "TANGO" = 24,    # triangle
+  "WALTZ %" = 22  # square
+)
+
+nm_ot_detect_short <- c(
+  "Stable" = "Stable",
+  "Shared loss" = "Shared",
+  "Exercise-specific" = "Exercise",
+  "Rapamycin-specific" = "Rapamycin"
+)
+
+nm_fmt_p <- function(x) {
+  dplyr::case_when(is.na(x) ~ "NA", x < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", x))
+}
+
+nm_ot_detect_stat_strip <- function(test_df, patterns) {
+
+  panels <- c(
+    "Female — Na4vSS", "Female — TANGO", "Female — WALTZ %",
+    "Male — Na4vSS", "Male — TANGO", "Male — WALTZ %"
+  )
+
+  labels <- stats::setNames(paste0("<b>", panels, "</b>"), panels)
+
+  if (is.null(test_df)) return(labels)
+
+  fmt <- function(x) {
+    gsub("<", "&lt;", nm_fmt_p(x), fixed = TRUE)
+  }
+
+  # Fixed category order and abbreviated labels
+  pattern_order <- c("Shared loss", "Exercise-specific", "Rapamycin-specific")
+
+  short <- c("Shared loss" = "Shared", "Exercise-specific" = "Ex", "Rapamycin-specific" = "Rapa")
+
+  tab <- test_df %>%
+    dplyr::filter(as.character(Pattern) %in% patterns) %>%
+    dplyr::arrange(match(as.character(Pattern), pattern_order))
+
+  for (sex in c("Female", "Male")) {
+    for (metric in c("Na4vSS", "TANGO", "WALTZ %")) {
+
+      key <- paste(sex, metric, sep = " — ")
+
+      dat <- tab %>%
+        dplyr::filter(Sex == sex, as.character(Metric) == metric)
+
+      if (!nrow(dat)) next
+
+      lines <- character()
+
+      for (j in seq_len(nrow(dat))) {
+
+        z <- dat[j, ]
+        prefix <- unname(short[as.character(z$Pattern)])
+
+        lines <- c(
+          lines,
+          paste0(
+            "<b>", prefix, ":</b> ",
+            "Wilcoxon p = ", fmt(z$p_Wilcoxon_one_sided),
+            ", q = ", fmt(z$FDR_Wilcoxon_BH),
+            " | Fisher p = ",
+            fmt(z$p_Fisher_top_quartile_one_sided),
+            ", q = ", fmt(z$FDR_top_quartile_BH)
+          )
+        )
+      }
+
+      # One compact line per category
+      stat_size <- "5.0pt"
+
+      labels[[key]] <- paste0(
+        "<span style='font-size:7pt;'><b>",
+        key,
+        "</b></span>",
+        paste0("<br><span style='font-size:", stat_size, ";'>", lines, "</span>", collapse = "")
+      )
+    }
+  }
+
+  labels
+}
+
+nm_ot_detect_distribution <- function(scored, patterns, chart_title,
+                                      component_cols, tests_df = NULL,
+                                      show_detection_sig = FALSE) {
+  lev <- c("Stable", patterns)
+  dd <- scored %>%
+    dplyr::filter(Pattern %in% lev) %>%
+    dplyr::mutate(
+      Pattern = factor(Pattern, levels = lev),
+      Sex = factor(Sex, levels = c("Female", "Male")),
+      Bin = factor(Bin, levels = names(component_cols)),
+      Label = dplyr::if_else(is.na(Gene) | Gene == "", Protein_ID, Gene),
+      SigStatus = dplyr::if_else(Sig_Selected %in% TRUE, "Nominal p ≤ 0.05", "NS"),
+      Panel = factor(paste0(Sex, " — ", Metric),
+                     levels = c("Female — Na4vSS", "Female — TANGO", "Female — WALTZ %",
+                                "Male — Na4vSS", "Male — TANGO", "Male — WALTZ %"))
+    )
+  stable_df <- dd %>% dplyr::filter(Pattern == "Stable")
+  selected_df <- dd %>% dplyr::filter(Pattern != "Stable")
+  sig_df <- selected_df %>% dplyr::filter(SigStatus == "Nominal p ≤ 0.05")
+  ns_df <- selected_df %>% dplyr::filter(SigStatus == "NS")
+  label_df <- selected_df %>% dplyr::filter(Percentile > 75)
+  strip_labels <- nm_ot_detect_stat_strip(tests_df, patterns)
+
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_boxplot(
+      data = stable_df,
+      ggplot2::aes(x = Pattern, y = Percentile),
+      width = 0.55, alpha = 0.22, outlier.shape = NA,
+      linewidth = 0.25, color = "#979797", fill = "#D0D0D0"
+    ) +
+    ggplot2::geom_boxplot(
+      data = selected_df,
+      ggplot2::aes(x = Pattern, y = Percentile),
+      width = 0.55, alpha = 0.12, outlier.shape = NA,
+      linewidth = 0.25, color = "#696969", fill = "#A5A5A5"
+    )
+
+  if (show_detection_sig) {
+    p <- p +
+      ggplot2::geom_point(
+        data = ns_df,
+        ggplot2::aes(x = Pattern, y = Percentile, color = Bin, shape = SigStatus),
+        position = ggplot2::position_jitter(width = 0.10, height = 0, seed = 2407),
+        size = 1.28, alpha = 0.90, stroke = 0.35
+      ) +
+      ggplot2::geom_point(
+        data = sig_df,
+        ggplot2::aes(x = Pattern, y = Percentile, color = Bin, shape = SigStatus),
+        position = ggplot2::position_jitter(width = 0.10, height = 0, seed = 2407),
+        size = 1.28, alpha = 0.90, stroke = 0.35
+      )
+  } else {
+    p <- p +
+      ggplot2::geom_point(
+        data = selected_df,
+        ggplot2::aes(x = Pattern, y = Percentile, color = Bin),
+        position = ggplot2::position_jitter(width = 0.10, height = 0, seed = 2407),
+        size = 1.12, alpha = 0.90
+      )
+  }
+
+  p <- p +
+    ggrepel::geom_text_repel(
+      data = label_df,
+      ggplot2::aes(x = Pattern, y = Percentile, label = Label, color = Bin),
+      size = 2.0,
+      direction = "both",
+      box.padding = 0.18,
+      point.padding = 0.10,
+      min.segment.length = 0,
+      segment.size = 0.16,
+      segment.alpha = 0.8,
+      force = 2.0,
+      force_pull = 0.15,
+      max.time = 2,
+      seed = 2407,
+      max.overlaps = Inf,
+      show.legend = FALSE
+    ) +
+    ggplot2::facet_wrap(~ Panel, ncol = 3, drop = FALSE, labeller = ggplot2::as_labeller(strip_labels)) +
+    ggplot2::geom_hline(yintercept = 75, linetype = "dashed", linewidth = 0.18, color = "grey65") +
+    ggplot2::scale_color_manual(values = component_cols,
+                                drop = FALSE, na.value = "#7A7A7A",
+                                name = "Cellular component") +
+    ggplot2::scale_x_discrete(labels = nm_ot_detect_short, drop = FALSE) +
+    ggplot2::scale_y_continuous(breaks = c(0, 25, 50, 75, 100),
+                                limits = c(0, 100),
+                                expand = ggplot2::expansion(mult = c(0.005, 0.025))) +
+    ggplot2::labs(
+      title = chart_title,
+      subtitle = if (show_detection_sig) {
+        ">75th percentile selected proteins are labeled; open points = NS, filled points = nominal detection P ≤ 0.05"
+      } else {
+        "Selected proteins above the 75th percentile labeled; colors = cellular component"
+      },
+      x = NULL, y = "Intrinsic aggregation score percentile"
+    ) +
+    theme_nm(legend_position = "right") +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 25, hjust = 1),
+      panel.grid.major.x = ggplot2::element_blank(),
+      strip.text = ggtext::element_markdown(
+        size = 7, hjust = 0.5, lineheight = 1.12,
+        family = nm_style$font_family,
+        margin = ggplot2::margin(t = 0.9, b = 0.9, unit = "mm")
+      )
+    )
+
+  if (show_detection_sig) {
+    p <- p + ggplot2::scale_shape_manual(values = c("NS" = 1, "Nominal p ≤ 0.05" = 16), name = "Detection test")
+  }
+
+  p
+}
+
+nm_ot_detect_protein_plot <- function(scored, selected_pattern, selected_sex, metric_shapes, component_cols) {
+  dd <- scored %>%
+    dplyr::filter(Pattern == selected_pattern, Sex == selected_sex) %>%
+    dplyr::mutate(
+      Label = dplyr::if_else(is.na(Gene) | Gene == "", Protein_ID, Gene),
+      Bin = factor(Bin, levels = names(component_cols)),
+      BinColor = dplyr::coalesce(unname(component_cols[as.character(Bin)]), "#7A7A7A")
+    )
+  if (!nrow(dd)) {
+    # An explicit empty figure is preferable to silent omission for a
+    # significant-only sex/category with zero scored detection candidates.
+    return(
+      ggplot2::ggplot() +
+        ggplot2::annotate(
+          "text", x = 0.5, y = 0.5,
+          label = "No selected proteins\nwith available propensity scores",
+          size = 2.4, color = "#555555"
+        ) +
+        ggplot2::xlim(0, 1) + ggplot2::ylim(0, 1) +
+        ggplot2::labs(title = paste(selected_pattern, "—", selected_sex)) +
+        ggplot2::theme_void(base_size = 7) +
+        ggplot2::theme(plot.title = ggplot2::element_text(size = 8, face = "bold"))
+    )
+  }
+  order_genes <- dd %>%
+    dplyr::group_by(Protein_ID, Label, Bin, BinColor) %>%
+    dplyr::summarise(Average = mean(Percentile), .groups = "drop") %>%
+    dplyr::arrange(Average, Label) %>%
+    dplyr::mutate(
+      UniqueLabel = make.unique(as.character(Label)),
+      LabelMarkdown = paste0("<span style='color:", BinColor, ";'>", UniqueLabel, "</span>")
+    )
+  dd <- dd %>%
+    dplyr::left_join(order_genes %>% dplyr::select(Protein_ID, UniqueLabel, Bin), by = c("Protein_ID", "Bin")) %>%
+    dplyr::mutate(UniqueLabel = factor(UniqueLabel, levels = order_genes$UniqueLabel))
+  label_map <- stats::setNames(order_genes$LabelMarkdown, order_genes$UniqueLabel)
+
+  ggplot2::ggplot(dd, ggplot2::aes(x = Percentile, y = UniqueLabel)) +
+    ggplot2::geom_point(
+      ggplot2::aes(shape = Metric, color = Bin, fill = Bin),
+      position = ggplot2::position_jitter(width = 0, height = 0.12, seed = 108),
+      size = 2.0, stroke = 0.35
+    ) +
+    ggplot2::scale_shape_manual(values = metric_shapes, drop = FALSE, name = "Aggregation metric") +
+    ggplot2::scale_color_manual(
+      values = component_cols, name = "Cellular component",
+      drop = FALSE, na.value = "#7A7A7A"
+    ) +
+    ggplot2::scale_fill_manual(
+      values = scales::alpha(component_cols, 0.35), guide = "none",
+      drop = FALSE, na.value = scales::alpha("#7A7A7A", 0.35)
+    ) +
+    ggplot2::scale_y_discrete(labels = label_map) +
+    ggplot2::scale_x_continuous(limits = c(0, 100), breaks = c(0, 25, 50, 75, 100)) +
+    ggplot2::labs(
+      x = "Aggregation score percentile", y = NULL,
+      title = paste(selected_pattern, "—", selected_sex),
+      subtitle = "Protein names/colors = component; marker shapes = propensity metric"
+    ) +
+    theme_nm(legend_position = "right") +
+    ggplot2::theme(
+      panel.grid.major.y = ggplot2::element_line(color = "grey92", linewidth = 0.15),
+      axis.text.y = ggtext::element_markdown(
+        family = nm_style$font_family, size = nm_style$axis_text,
+        colour = "black"
+      )
+    )
+}
+# INPUT: Original detection-analysis CSVs (must be in Rmd working folder).
+# IMPORTANT: raw P < 0.05 identifies nominally significant detection changes;
+# no file contains FDR-significant selected proteins at FDR < 0.05.
+ot_input_specs <- list(
+  "Shared loss" = "Detect_SharedLoss_bySex.csv",
+  "Exercise-specific" = "Detect_ExSpecific_bySex.csv",
+  "Rapamycin-specific" = "Detect_RapaSpecific_bySex.csv"
+)
+
+ot_detection_selected <- purrr::imap_dfr(ot_input_specs, function(input, pattern) {
+  csv <- nm_det_read(input)
+  # Prevent reinterpreting an original detection category from today's raw
+  # proteomics matrix or from the presence of a propensity score.
+  required_cols <- c("Protein.Group", "Gene1", "Bin", "Sex",
+                     "detected_n_Control", "detected_n_Exercise",
+                     "detected_n_Rapamycin", "p_Exercise", "p_Rapamycin",
+                     "FDR_Exercise", "FDR_Rapamycin")
+  absent <- setdiff(required_cols, names(csv))
+  if (length(absent)) stop("Columns missing in ", input, ": ", paste(absent, collapse = ", "))
+  csv %>%
+    dplyr::transmute(
+      Sex = as.character(Sex), Protein_ID = clean_id(Protein.Group),
+      Pattern = pattern,
+      CSV_Gene = as.character(Gene1), CSV_Bin = as.character(Bin),
+      CSV_Control_N = as.integer(detected_n_Control),
+      CSV_Exercise_N = as.integer(detected_n_Exercise),
+      CSV_Rapamycin_N = as.integer(detected_n_Rapamycin),
+      CSV_p_Exercise = as.numeric(p_Exercise),
+      CSV_p_Rapamycin = as.numeric(p_Rapamycin),
+      CSV_FDR_Exercise = as.numeric(FDR_Exercise),
+      CSV_FDR_Rapamycin = as.numeric(FDR_Rapamycin),
+      Sig_Exercise = is.finite(CSV_p_Exercise) & CSV_p_Exercise < 0.05,
+      Sig_Rapamycin = is.finite(CSV_p_Rapamycin) & CSV_p_Rapamycin < 0.05,
+      Sig_Both = Sig_Exercise & Sig_Rapamycin,
+      Sig_Selected = dplyr::case_when(
+        Pattern == "Shared loss" ~ (Sig_Exercise | Sig_Rapamycin),
+        Pattern == "Exercise-specific" ~ Sig_Exercise,
+        Pattern == "Rapamycin-specific" ~ Sig_Rapamycin,
+        TRUE ~ FALSE
+      )
+    )
+}) %>%
+  dplyr::distinct(Sex, Protein_ID, Pattern, .keep_all = TRUE)
+
+if (any(duplicated(ot_detection_selected[c("Sex", "Protein_ID")]))) {
+  stop("A protein occurs in more than one loss category within a sex. ",
+       "Check the original detection CSVs before testing.")
+}
+
+# Recalculate sex-specific raw detection counts for QC and stable references,
+# but DO NOT use these to redefine category membership from the original CSVs.
+ot_det_counts <- ins_long %>%
+  dplyr::filter(Age == "Old", Sex %in% c("Female", "Male")) %>%
+  dplyr::mutate(Protein_ID = clean_id(Protein.Group)) %>%
+  dplyr::group_by(Sex, Protein_ID, Treatment) %>%
+  dplyr::summarise(N = max(0L, max(
+    vapply(split(Detected, Protein.Group), function(z) sum(z, na.rm = TRUE), integer(1)), na.rm = TRUE
+  )), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Treatment, values_from = N, names_prefix = "N_", values_fill = 0L)
+for (nm in c("N_Control", "N_Exercise", "N_Rapamycin")) {
+  if (!nm %in% names(ot_det_counts)) ot_det_counts[[nm]] <- 0L
+}
+
+ot_annotations <- ins_long %>%
+  dplyr::mutate(Protein_ID = clean_id(Protein.Group)) %>%
+  dplyr::distinct(Protein_ID, Gene1, Bin) %>%
+  dplyr::distinct(Protein_ID, .keep_all = TRUE) %>%
+  dplyr::rename(Gene = Gene1)
+
+ot_det_base <- ot_det_counts %>%
+  dplyr::filter(N_Control >= min_detected) %>%
+  dplyr::left_join(ot_annotations, by = "Protein_ID") %>%
+  dplyr::left_join(ot_detection_selected, by = c("Sex", "Protein_ID")) %>%
+  dplyr::mutate(
+    Gene = dplyr::coalesce(CSV_Gene, Gene, Protein_ID),
+    Bin = dplyr::coalesce(CSV_Bin, as.character(Bin), "Other/Unassigned"),
+    Stable = N_Exercise >= min_detected & N_Rapamycin >= min_detected,
+    Selected_All = !is.na(Pattern),
+    Selected_Sig = Selected_All & Sig_Selected %in% TRUE,
+    Pattern = dplyr::case_when(Selected_All ~ Pattern, Stable ~ "Stable", TRUE ~ "Other")
+  ) %>%
+  dplyr::left_join(metrics_wide, by = "Protein_ID") %>%
+  dplyr::distinct(Sex, Protein_ID, .keep_all = TRUE)
+
+# Input audit includes EVERY original protein/sex/category, even if a protein
+# cannot be scored or cannot be reconstructed in the current raw matrix.
+ot_det_audit <- ot_detection_selected %>%
+  dplyr::left_join(ot_det_counts, by = c("Sex", "Protein_ID")) %>%
+  dplyr::left_join(metrics_wide, by = "Protein_ID") %>%
+  dplyr::mutate(
+    Has_Control_Min2 = !is.na(N_Control) & N_Control >= min_detected,
+    Reproduces_Detection_Counts =
+      !is.na(N_Control) & N_Control == CSV_Control_N &
+      !is.na(N_Exercise) & N_Exercise == CSV_Exercise_N &
+      !is.na(N_Rapamycin) & N_Rapamycin == CSV_Rapamycin_N,
+    Has_Na4vSS = is.finite(Na4vSS),
+    Has_TANGO = is.finite(TANGO),
+    Has_WALTZ = is.finite(`WALTZ %`),
+    Has_All_3_Scores = Has_Na4vSS & Has_TANGO & Has_WALTZ,
+    Score_Coverage = paste0(
+      ifelse(Has_Na4vSS, "Na4vSS ", ""),
+      ifelse(Has_TANGO, "TANGO ", ""),
+      ifelse(Has_WALTZ, "WALTZ", "")
+    ),
+    In_Analysis_Universe = Has_Control_Min2
+  )
+if (any(!ot_det_audit$Has_Control_Min2)) {
+  warning("Selected detection-CSV entries not found with >=2 Old-Control ",
+          "insoluble detections in current raw data. See OT_Detect_Input_QC.csv.")
+}
+if (any(!ot_det_audit$Reproduces_Detection_Counts)) {
+  warning("Some detection counts differ from the original CSVs. ",
+          "See OT_Detect_Input_QC.csv (original category assignments retained).")
+}
+
+ot_det_dir <- file.path(out_dir, "DetectionProp")
+dir.create(ot_det_dir, recursive = TRUE, showWarnings = FALSE)
+readr::write_csv(ot_det_audit, file.path(ot_det_dir, "OT_Detect_Input_QC.csv"))
+readr::write_csv(ot_detection_selected, file.path(ot_det_dir, "OT_Detect_OriginalCandidates.csv"))
+readr::write_csv(ot_det_base %>% dplyr::filter(Selected_All),
+                 file.path(ot_det_dir, "OT_Detect_Selected_ProteinScores.csv"))
+
+# Calculate percentile ONCE on the full sex-specific Old-Control insoluble
+# universe, before filtering the significant-only subset.
+ot_det_scored_base <- nm_det_score(ot_det_base)
+
+nm_ot_det_subset <- function(scored, significant_only = FALSE) {
+  selected <- if (significant_only) scored$Selected_Sig else scored$Selected_All
+  scored %>%
+    dplyr::mutate(
+      Pattern = dplyr::case_when(
+        selected ~ as.character(Pattern),
+        Selected_All ~ "Other",  # nonsignificant loss never joins stable reference
+        Stable ~ "Stable",
+        TRUE ~ "Other"
+      )
+    )
+}
+
+ot_det_scored_all <- nm_ot_det_subset(ot_det_scored_base, FALSE)
+ot_det_scored_sig <- nm_ot_det_subset(ot_det_scored_base, TRUE)
+
+# Because subset() is row-wise, unsignificant loss proteins revert to Other,
+# NOT Stable. This prevents contaminating the comparison/reference group.
+ot_det_patterns <- names(ot_input_specs)
+
+nm_ot_det_export_subset <- function(scored, tag) {
+  readr::write_csv(
+    scored %>% dplyr::filter(Pattern %in% c("Stable", ot_det_patterns)),
+    file.path(ot_det_dir, paste0("OT_Detect_MetricPercentiles_", tag, ".csv"))
+  )
+  tests <- nm_det_test_all(scored, ot_det_patterns) %>%
+    dplyr::mutate(Subset = tag)
+  readr::write_csv(tests, file.path(ot_det_dir, paste0("OT_Detect_Tests_", tag, ".csv")))
+  tests
+}
+
+ot_det_tests_all <- nm_ot_det_export_subset(ot_det_scored_all, "All")
+ot_det_tests_sig <- nm_ot_det_export_subset(ot_det_scored_sig, "Sig")
+print(ot_det_tests_all)
+print(ot_det_tests_sig)
+
+# Coverage table shows selection numbers before/after accession matching,
+# control-detection gate and finite metric-score availability.
+ot_det_coverage <- tidyr::crossing(
+  Sex = c("Female", "Male"),
+  Pattern = ot_det_patterns,
+  Subset = c("All", "Sig"),
+  Metric = metric_levels
+) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    n_csv_candidates = sum(
+      ot_det_audit$Sex == Sex & ot_det_audit$Pattern == Pattern &
+        (Subset == "All" | ot_det_audit$Sig_Selected %in% TRUE)
+    ),
+    n_matched_old_control = sum(
+      ot_det_audit$Sex == Sex & ot_det_audit$Pattern == Pattern &
+        (Subset == "All" | ot_det_audit$Sig_Selected %in% TRUE) &
+        ot_det_audit$Has_Control_Min2
+    ),
+    n_finite_score = sum(
+      (if (Subset == "All") {
+        ot_det_scored_all
+      } else {
+        ot_det_scored_sig
+      })$Sex == Sex &
+        (if (Subset == "All") {
+          ot_det_scored_all
+        } else {
+          ot_det_scored_sig
+        })$Pattern == Pattern &
+        as.character((if (Subset == "All") {
+          ot_det_scored_all
+        } else {
+          ot_det_scored_sig
+        })$Metric) == Metric
+    )
+  ) %>%
+  dplyr::ungroup()
+readr::write_csv(ot_det_coverage, file.path(ot_det_dir, "OT_Detect_ScoreCoverage.csv"))
+
+# Combined plots retain all three categories. Individual-category plots make
+# selected >75th-percentile labels easier to place and read in small panels.
+for (subset_tag in c("All", "Sig")) {
+  dsub <- if (subset_tag == "All") ot_det_scored_all else ot_det_scored_sig
+  suffix <- if (subset_tag == "All") "" else "_Sig"
+  p_comb <- nm_ot_detect_distribution(
+    dsub, ot_det_patterns,
+    paste0("Insoluble detection loss and aggregation propensity",
+           if (subset_tag == "Sig") " (nominally significant detection)" else ""),
+    nm_ot_detect_component_cols,
+    tests_df = if (subset_tag == "All") ot_det_tests_all else ot_det_tests_sig,
+    show_detection_sig = (subset_tag == "All")
+  )
+  save_nm_both(
+    p_comb,
+    file.path(ot_det_dir, paste0("OT_Detect_Propensity", suffix)),
+    "corr_both", save_legend = TRUE
+  )
+
+  for (pattern in ot_det_patterns) {
+    short <- switch(
+      pattern,
+      "Shared loss" = "Shared", "Exercise-specific" = "Exercise",
+      "Rapamycin-specific" = "Rapa"
+    )
+    p_comp <- nm_ot_detect_distribution(
+      dsub, pattern,
+      paste0(pattern, ": aggregation propensity",
+             if (subset_tag == "Sig") " (nominal detection P < 0.05)" else ""),
+      nm_ot_detect_component_cols,
+      tests_df = if (subset_tag == "All") ot_det_tests_all else ot_det_tests_sig,
+      show_detection_sig = (subset_tag == "All")
+    )
+    save_nm_both(
+      p_comp,
+      file.path(ot_det_dir, paste0("OT_Detect_Prop_", short, suffix)),
+      "corr_both", save_legend = TRUE
+    )
+
+    for (sx in c("Female", "Male")) {
+      dd <- dsub %>%
+        dplyr::filter(Pattern == pattern, Sex == sx)
+      p_prot <- nm_ot_detect_protein_plot(dsub, pattern, sx, nm_ot_detect_shapes, nm_ot_detect_component_cols)
+      id <- paste0("OT_Detect_", short, "_", sx, suffix)
+      save_nm_both(p_prot, file.path(ot_det_dir, id), "shift_sex", save_legend = nrow(dd) > 0)
+    }
+  }
+}
+```
+
+**Interpretation:** Increased intrinsic aggregation propensity among proteins
+whose insoluble detection decreases after Exercise and/or Rapamycin would be
+consistent with interventions affecting proteins close to their solubility
+threshold. However, a reduction in mass-spectrometric detection does not
+establish protein solubilization or aggregate clearance: decreased abundance,
+turnover, extraction efficiency and detection limits remain alternative
+explanations. Component-stratified permutations are sensitivity tests, not
+full control for baseline protein abundance. In particular, nominally
+significant detection subsets with fewer than two scored proteins have
+**no inferential Wilcoxon/Fisher P value** (reported as `NA`), even though their
+individual scores are still plotted.
+
+# Output summary
+
+```{r output-summary}
+cat(
+  "\nUpdated old-treatment aggregation-propensity analysis complete (v17 pooled-sex baseline).\n",
+  "Output directory: ", normalizePath(out_dir, mustWork = TRUE), "\n\n",
+  "Primary comparisons:\n",
+  "  Exercise vs Control\n",
+  "  Rapamycin vs Control\n",
+  "No three-treatment omnibus test is used as a prerequisite for these comparisons.\n\n",
+  "Baseline universe: Old-Control insoluble proteome; >=2 detections TOTAL across sexes.\n",
+  "Sex does not determine baseline entry; sex-specific treatment effects require >=2 valid Control and treatment observations within sex.\n",
+  "Primary endpoint: volume-corrected treatment effect on log2(Insoluble/Soluble).\n",
+  "Secondary endpoint: treatment effect on insoluble abundance.\n",
+  "All manuscript figures are exported as 600-dpi PNG and editable SVG files; ggplot legends are exported separately when present.\n",
+  sep = ""
+)
+```
+
+## Export manifest / panel lookup
+
+Once the analysis has produced the figures, inspect `list_panels()` to find each
+figure ID, the plotting chunk, and its current physical dimensions. To re-export
+only a figure, change its named dimension entry in the Figure export settings and run
+`reexport("Panel_ID")`. The following chunk writes a short output manifest.
+
+```{r nm-export-manifest}
+figure_export_manifest()
+```
+

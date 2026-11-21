@@ -1,0 +1,292 @@
+---
+title: "AGGRESCAN"
+author: "Michael Taylor"
+date: "2026-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(tibble)
+
+HST <- -0.02
+
+a3v <- c(
+  A=-0.036,R=-1.240,N=-1.302,D=-1.836,C=0.604,Q=-1.231,E=-1.412,
+  G=-0.535,H=-1.033,I=1.822,L=1.380,K=-0.931,M=0.910,F=1.754,
+  P=-0.334,S=-0.294,T=-0.159,W=1.037,Y=1.159,V=1.594
+)
+
+clean_id <- function(x) {
+  x <- stringr::str_trim(as.character(x))
+  x <- stringr::str_remove(x, "^>")
+  x <- dplyr::if_else(
+    stringr::str_detect(x, "\\|"),
+    stringr::str_split_fixed(x, "\\|", 3)[, 2],
+    x
+  )
+  x <- stringr::str_remove(x, ";.*$")
+  stringr::str_remove(x, "-\\d+$")
+}
+
+clean_seq <- function(x) {
+  stringr::str_replace_all(
+    toupper(x),
+    "[^ACDEFGHIKLMNPQRSTVWY]",
+    ""
+  )
+}
+
+window_size <- function(n) {
+  dplyr::case_when(
+    n <= 75  ~ 5L,
+    n <= 175 ~ 7L,
+    n <= 300 ~ 9L,
+    TRUE     ~ 11L
+  )
+}
+
+profile <- function(seq) {
+
+  aa <- strsplit(clean_seq(seq), "")[[1]]
+  vals <- unname(a3v[aa])
+  n <- length(vals)
+  w <- window_size(n)
+
+  ext <- c(
+    mean(a3v[c("D", "E")]),
+    vals,
+    mean(a3v[c("K", "R")])
+  )
+
+  starts <- seq_len(length(ext) - w + 1)
+  centers <- starts + floor(w / 2) - 1
+
+  raw <- purrr::map_dbl(
+    starts,
+    \(i) mean(ext[i:(i + w - 1)])
+  )
+
+  out <- rep(NA_real_, n)
+
+  keep <- centers >= 1 & centers <= n
+  out[centers[keep]] <- raw[keep]
+
+  first <- min(which(!is.na(out)))
+  last <- max(which(!is.na(out)))
+
+  if (first > 1) {
+    out[1:(first - 1)] <- out[first]
+  }
+
+  if (last < n) {
+    out[(last + 1):n] <- out[last]
+  }
+
+  tibble::tibble(
+    AA = aa,
+    a3v = vals,
+    a4v = out
+  )
+}
+
+hotspots <- function(p) {
+
+  mask <- is.finite(p$a4v) &
+    p$a4v > HST &
+    p$AA != "P"
+
+  r <- rle(mask)
+
+  ends <- cumsum(r$lengths)
+  starts <- ends - r$lengths + 1
+  runs <- which(r$values & r$lengths >= 5)
+
+  purrr::map_dfr(
+    runs,
+    \(i) {
+      idx <- starts[i]:ends[i]
+
+      tibble::tibble(
+        HS_Start = min(idx),
+        HS_End = max(idx),
+        HSA = sum(p$a4v[idx] - HST)
+      )
+    }
+  )
+}
+
+aggrescan <- function(seq) {
+
+  p <- profile(seq)
+  hs <- hotspots(p)
+
+  n <- nrow(p)
+  a4vSS <- sum(p$a4v)
+
+  tibble::tibble(
+    Sequence_Length = n,
+    AGGRESCAN_Window = window_size(n),
+    a3vSA = mean(p$a3v),
+    nHS = nrow(hs),
+    NnHS = nrow(hs) / n * 100,
+    AAT = sum(
+      dplyr::if_else(
+        p$AA != "P",
+        pmax(p$a4v - HST, 0),
+        0
+      )
+    ),
+    THSA = sum(hs$HSA),
+    a4vSS = a4vSS,
+    Na4vSS = a4vSS / n * 100,
+    Hotspots = if (nrow(hs) > 0) {
+      paste0(
+        hs$HS_Start,
+        "-",
+        hs$HS_End,
+        collapse = "; "
+      )
+    } else {
+      NA_character_
+    }
+  )
+}
+
+# ============================================================
+# Parse master FASTA
+# ============================================================
+
+fasta_entries <- stringr::str_split(
+  master_fasta,
+  "(?m)(?=^>)"
+)[[1]]
+
+fasta_entries <- fasta_entries[
+  stringr::str_starts(
+    stringr::str_trim(fasta_entries),
+    ">"
+  )
+]
+
+uniprot_sequences <- tibble::tibble(
+  FASTA = fasta_entries
+) %>%
+  dplyr::mutate(
+    Header = purrr::map_chr(
+      FASTA,
+      \(x) stringr::str_split(x, "\n")[[1]][1]
+    ),
+    Protein_ID = clean_id(Header),
+    Sequence = purrr::map_chr(
+      FASTA,
+      \(x) {
+        lines <- stringr::str_split(x, "\n")[[1]]
+
+        lines[!stringr::str_starts(lines, ">")] %>%
+          paste0(collapse = "") %>%
+          clean_seq()
+      }
+    )
+  ) %>%
+  dplyr::filter(
+    Protein_ID != "",
+    Sequence != ""
+  ) %>%
+  dplyr::distinct(
+    Protein_ID,
+    .keep_all = TRUE
+  ) %>%
+  dplyr::select(
+    Protein_ID,
+    Sequence
+  )
+
+# ============================================================
+# Run AGGRESCAN on every retrieved protein
+# ============================================================
+
+aggrescan_metrics <- uniprot_sequences %>%
+  dplyr::mutate(
+    metrics = purrr::map(
+      Sequence,
+      aggrescan
+    )
+  ) %>%
+  tidyr::unnest(metrics) %>%
+  dplyr::select(-Sequence)
+
+# ============================================================
+# Map proteins back to all qualifying groups
+# ============================================================
+
+protein_groups <- detection_counts %>%
+  dplyr::filter(
+    N_detected >= min_detected
+  ) %>%
+  dplyr::select(
+    Group,
+    Protein.Group
+  ) %>%
+  dplyr::distinct() %>%
+  tidyr::separate_longer_delim(
+    Protein.Group,
+    delim = ";"
+  ) %>%
+  dplyr::transmute(
+    Group,
+    Protein_ID = stringr::str_trim(Protein.Group)
+  ) %>%
+  dplyr::filter(
+    Protein_ID != "",
+    !stringr::str_detect(
+      Protein_ID,
+      stringr::regex(
+        "^cRAP-",
+        ignore_case = TRUE
+      )
+    )
+  ) %>%
+  dplyr::group_by(
+    Protein_ID
+  ) %>%
+  dplyr::summarise(
+    Groups = paste(
+      sort(unique(Group)),
+      collapse = "; "
+    ),
+    .groups = "drop"
+  )
+
+# ============================================================
+# Final master AGGRESCAN table
+# ============================================================
+
+all_aggrescan <- protein_groups %>%
+  dplyr::left_join(
+    aggrescan_metrics,
+    by = "Protein_ID"
+  )
+
+missing_aggrescan <- all_aggrescan %>%
+  dplyr::filter(
+    is.na(a4vSS)
+  )
+
+cat(
+  "Proteins:", nrow(all_aggrescan),
+  "\nFASTA sequences:", nrow(uniprot_sequences),
+  "\nScored:", sum(!is.na(all_aggrescan$a4vSS)),
+  "\nMissing:", nrow(missing_aggrescan),
+  "\n"
+)
+
+missing_aggrescan
+```
