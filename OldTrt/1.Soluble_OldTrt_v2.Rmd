@@ -1,0 +1,1873 @@
+---
+title: "Soluble proteome — Old treatments"
+subtitle: "Exercise and rapamycin × Sex analysis (3 × 2 limma model) of the soluble fraction"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    self_contained: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  error = FALSE,
+  fig.align = "center",
+  dev = "ragg_png"
+)
+```
+
+# Overview {-}
+
+**Question.** How do voluntary exercise and mTOR inhibition (rapamycin) change the soluble (Triton X-100–soluble) skeletal-muscle proteome of old mice, and does the response differ between females and males?
+
+**Design.** Old Control, Old + Exercise and Old + Rapamycin mice of both sexes (Treatment × Sex, 3 × 2). Sample sizes are printed in *Load, filter, and transform data*.
+
+**Statistical approach (in brief).**
+
+| Step | What is done |
+|---|---|
+| Filter | Protein detected in ≥ 50% of samples **within each treatment group** (Female and Male pooled); intensities ≤ 0 are treated as missing |
+| Transform | log2 intensity; **no imputation** |
+| Model | limma 3 × 2 cell-means model on the six Treatment × Sex groups; `eBayes(trend = TRUE)` |
+| Contrasts | Treatment contrasts average Female and Male cell means equally: **Exercise vs Control**, **Rapamycin vs Control**, **Rapamycin vs Exercise**. Also **Sex** (Male − Female, averaged over treatment), **Exercise × Sex** and **Rapamycin × Sex** interactions, and the four sex-specific treatment effects (Exercise or Rapamycin − Control within Female and within Male) |
+| Multiple testing | Benjamini–Hochberg across all retained proteins, separately for each contrast |
+| Significance | Raw *P* ≤ 0.05 and FDR ≤ 0.05 are reported separately; **no log2FC threshold** (the dashed ±0.5 lines on the volcano plots are visual references only) |
+| PCA | NIPALS on the same filtered log2 matrix; missing values handled without imputation |
+
+**What is shown.** PCA and scree plot; volcano plots; heatmaps of significant proteins; GO Biological Process enrichment; a UPR / chaperone / folding module; Treatment × Sex interaction plots; and, at the end, Female-versus-Male treatment-effect panels (log2FC in females against males, with GO Cellular Component colouring).
+
+**Outputs** (written under `Sol_OldTrt/`; figures as 600-dpi PNG + editable SVG with separate legends): limma tables in `Tbl/`, and figures in `PCA/`, `Vol/`, `HM/`, `GO/`, `UPR/`, `Int/`, and `NM_SexFx/` (Female-vs-Male panels). `Figure_Export_Manifest.csv` lists every exported panel.
+
+> **To run:** keep the two input CSV files (see *Settings*) and the `R/` folder next to this file, then knit. Code is folded by default; use the **Code** buttons to expand it.
+
+# Setup
+
+## Packages
+
+All packages must be installed beforehand (the script stops and lists any that are missing). Package load order is kept identical to the original analysis because it determines which functions mask which.
+
+```{r packages}
+pkgs <- c("tidyverse", "limma", "ComplexHeatmap", "circlize", "ggrepel", "patchwork",
+          "clusterProfiler", "org.Mm.eg.db", "nipals", "ragg", "svglite", "cowplot",
+          "viridisLite", "GO.db", "AnnotationDbi")
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Install missing packages first: ", paste(missing_pkgs, collapse = ", "), call. = FALSE)
+}
+invisible(lapply(pkgs[1:10], library, character.only = TRUE))
+select <- dplyr::select   # AnnotationDbi masks dplyr::select
+```
+
+## Settings
+
+```{r settings}
+fraction_name <- "Soluble"
+data_dir      <- "."     # folder holding the two input files
+data_file     <- file.path(data_dir, "Soluble_Old_One-way.csv")
+meta_file     <- file.path(data_dir, "Aggregates_SampleList_Mesquita.csv")
+helper_dir    <- "R"     # folder holding nm_export_engine_OT.R
+out_dir       <- "Sol_OldTrt"
+
+min_detect_frac <- 0.50
+raw_p_cutoff    <- 0.05
+fdr_cutoff      <- 0.05
+volcano_lfc_ref <- 0.50
+z_clip          <- 2.5
+
+# GO settings
+run_go_analysis <- TRUE
+go_min_genes_per_direction <- 3
+go_top_n <- 5
+
+# UPR heatmap: set FALSE if not needed for this fraction
+make_upr_module_heatmap <- TRUE
+
+# Interaction plots: set TRUE for FDR-only, FALSE for raw-p OR FDR
+interaction_fdr_only <- FALSE
+interaction_lfc_cutoff <- 0
+
+# Optional: exclude samples by ID if needed
+exclude_samples <- character(0)
+# exclude_samples <- c("3630R")
+```
+
+## Figure export settings (presentation only)
+
+Panel sizes (mm), font sizes (pt) and line/point sizes used for the exported PNG/SVG files. Editing them changes only how figures are drawn and saved, never the data or statistics. Use the exact panel names in `nm_panel_dims` as arguments to `reexport()`, e.g. `reexport("Volcano_Exercise_vs_Control")`; `list_panels()` shows which panels exist once a figure chunk has run. Family names (`family_*` in `nm_dims`) are size defaults derived from these entries, not figure IDs. Heatmaps with automatic height are sized from their protein-row count. Changing a geom setting hard-coded in a plotting chunk requires re-running that chunk, but not refitting limma.
+
+```{r NATURE_FIGURE_HELPER_EDIT_HERE, echo=FALSE}
+# ── Nature Metabolism manuscript design system ───────────────────────────────
+# EDIT THIS BLOCK to change typography, line/point sizes, or the physical size
+# of any output. All dimensions are FINAL publication dimensions in millimetres.
+# Every standard figure is exported as both 600-dpi PNG and editable SVG.
+
+nm_style <- list(
+  font_family = "sans",
+
+  # Typography at final physical size (pt)
+  panel_label  = 8.0,
+  axis_title   = 7.0,
+  axis_text    = 6.6,
+  legend_title = 6.6,
+  legend_text  = 6.2,
+  stat_text    = 6.2,
+  small_text   = 5.8,
+  plot_title   = 8.0,
+  strip_text   = 6.8,
+
+  # ggplot2 linewidth values are mm
+  # 0.18-0.22 mm is ~0.5-0.6 pt; 0.28 mm is ~0.8 pt.
+  axis_line    = 0.18,
+  data_line    = 0.24,
+  thin_line    = 0.18,
+
+  # Point sizes used/capped by the export styling layer
+  point_small  = 0.80,
+  point_medium = 1.00,
+  point_large  = 1.35,
+  point_max    = 1.55
+)
+
+# Use generic sans inside ggplot/grid, but map SVG sans text explicitly to Arial.
+# This avoids both the PostScript Arial warning and svglite's literal "sans" lookup warning.
+svg_font_family <- "Arial"
+
+nm_export <- list(
+  dpi = 600,
+  background = "white"
+)
+
+# PRIMARY FIGURE CONTROLS — exact output names, copy directly into reexport().
+# EXACT FIGURE IDs — copy the name on the LEFT into reexport("name")
+# These are individual exported filenames (without .png/.svg).
+# Not every output exists in every dataset: create its plotting chunk first.
+# Dynamically named single-protein plots (MeanSEM_..._<Gene>) appear
+# via list_panels("MeanSEM_") after their plotting chunk runs.
+nm_panel_dims <- list(
+  PCA = c(width = 60, height = 52),
+  Scree = c(width = 60, height = 48),
+  Volcano_Exercise_vs_Control = c(width = 45, height = 45),
+  Volcano_Rapamycin_vs_Control = c(width = 45, height = 45),
+  Volcano_Sex_Male_vs_Female = c(width = 45, height = 45),
+  Volcano_ExerciseSex_Interaction = c(width = 45, height = 45),
+  Volcano_RapamycinSex_Interaction = c(width = 45, height = 45),
+  Volcano_Combined = c(width = 183, height = 112),
+  Heatmap_Exercise_vs_Control_rawP_FDR = c(width = 183, height = NA_real_),
+  Heatmap_Rapamycin_vs_Control_rawP_FDR = c(width = 183, height = NA_real_),
+  Heatmap_Sex_Male_vs_Female_rawP_FDR = c(width = 183, height = NA_real_),
+  GO_BP_Lollipop_Ex_vs_Ctl_FDR = c(width = 120, height = 102),
+  GO_BP_Lollipop_Ex_vs_Ctl_rawP = c(width = 120, height = 102),
+  GO_BP_Lollipop_Rapa_vs_Ctl_FDR = c(width = 120, height = 102),
+  GO_BP_Lollipop_Rapa_vs_Ctl_rawP = c(width = 120, height = 102),
+  MeanSEM_ExSex_Int_All = c(width = 140, height = 90),
+  MeanSEM_RapaSex_Int_All = c(width = 140, height = 140),
+  Heatmap_UPR_module_oldTreatments_rawP_and_FDR = c(width = 170, height = 80),
+  Ex_Sol_SexFx = c(width = 58, height = 54),
+  Rapa_Sol_SexFx = c(width = 58, height = 54),
+  Sol_SexFx_pair = c(width = 122, height = 58)
+)
+
+# Legends are exported separately from the plotting panels. This preserves the
+# intended plotting-region dimensions in Inkscape instead of allowing a wide or
+# tall legend to compress the data panel. Each standard ggplot export therefore
+# creates:
+#   <name>.png / <name>.svg         = plot with NO embedded legend
+#   <name>_legend.png / .svg        = editable standalone legend, when present
+# Heatmaps keep their native ComplexHeatmap legends because those legends are
+# part of the heatmap layout rather than ggplot guides.
+nm_export$separate_legends <- TRUE
+nm_export$legend_suffix <- "_legend"
+
+# Legend footprints are intentionally independent of panel footprints. Adjust
+# these values only if a legend needs more/less room; the plot itself will not
+# change size.
+nm_legend_dims <- list(
+  family_pca              = c(width = 38, height = 24),
+  family_scree            = c(width = 38, height = 20),
+  family_volcano          = c(width = 58, height = 40),
+  family_volcano_grid     = c(width = 55, height = 24),
+  family_go               = c(width = 62, height = 64),
+  family_interaction_all  = c(width = 48, height = 28),
+  family_interaction_one  = c(width = 50, height = 35),
+  family_sex_single       = c(width = 58, height = 58),
+  family_sex_pair         = c(width = 58, height = 58),
+  family_reversal_single  = c(width = 72, height = 34),
+  family_reversal_pair    = c(width = 72, height = 34),
+  family_ratio_volcano    = c(width = 52, height = 22),
+  family_ratio_pair       = c(width = 52, height = 22),
+  family_solubility       = c(width = 52, height = 34),
+  generic_single        = c(width = 55, height = 50)
+)
+
+# Height of protein heatmaps is proportional to the number of plotted rows.
+# Auto height applies only when the panel-specific height is NA.
+nm_layout <- list(
+  heatmap_mm_per_protein = 2.5,
+  heatmap_base_height_mm = 36,
+  upr_mm_per_protein = 3.2,
+  upr_base_height_mm = 32,
+  go_mm_per_term = 3.8,
+  minimum_heatmap_height_mm = 75
+)
+```
+
+## Helper functions
+
+```{r helpers}
+# INTERNAL FALLBACKS ONLY — not a second figure-dimension settings section.
+# Figure-size edits belong exclusively in nm_panel_dims near the top of this Rmd.
+# Legacy save calls and dynamically named plots still use a size-family key,
+# so derive family defaults from the corresponding exact-ID entries.
+# When an ID is absent in this dataset, use the indicated sensible fallback.
+nm_family_default <- function(panel_id, width_mm, height_mm) {
+  dd <- nm_panel_dims[[panel_id]]
+  if (is.null(dd)) c(width = width_mm, height = height_mm) else dd
+}
+nm_dims <- list(
+  family_pca = nm_family_default("PCA", 60, 52),
+  family_scree = nm_family_default("Scree", 60, 48),
+  family_volcano = nm_family_default("Volcano_Exercise_vs_Control", 58, 54),
+  family_volcano_grid = nm_family_default("Volcano_Combined", 183, 112),
+  family_heatmap_sig = nm_family_default("Heatmap_Exercise_vs_Control_rawP_FDR", 183, NA_real_),
+  family_heatmap_upr = nm_family_default("Heatmap_UPR_module_oldTreatments_rawP_and_FDR", 155, NA_real_),
+  family_go = nm_family_default("GO_BP_Lollipop_Ex_vs_Ctl_FDR", 120, 102),
+  family_interaction_all = nm_family_default("MeanSEM_ExSex_Int_All", 183, 145),
+  family_interaction_one = c(width = 58, height = 53),
+  family_sex_single = nm_family_default("Ex_Sol_SexFx", 58, 54),
+  family_sex_pair = nm_family_default("Sol_SexFx_pair", 122, 58),
+  family_reversal_single = nm_family_default("Exercise_Ratio_Reversal_FemaleMale_FDR", 85, 54),
+  family_reversal_pair = nm_family_default("Ratio_Reversal_Pooled_ExRapa_FDR", 176, 65),
+  family_ratio_volcano = c(width = 58, height = 54),
+  family_ratio_pair = c(width = 176, height = 65),
+  family_solubility = nm_family_default("Solubility_OldTreatments", 176, 62),
+  generic_single = c(width = 60, height = 55)
+)
+
+safe_dir_create <- function(path) {
+  if (!dir.exists(path)) {
+    dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  }
+}
+
+safe_filename <- function(x) {
+  x %>%
+    as.character() %>%
+    str_replace_all("[^A-Za-z0-9_\\-]+", "_") %>%
+    str_replace_all("_+", "_") %>%
+    str_replace_all("^_|_$", "")
+}
+
+format_p <- function(p) {
+  dplyr::case_when(is.na(p) ~ "", p < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p))
+}
+
+row_zscore <- function(x) {
+  m <- mean(x, na.rm = TRUE)
+  s <- stats::sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(0, length(x)))
+  (x - m) / s
+}
+
+first_gene_symbol <- function(x) {
+  x <- as.character(x)
+  x <- ifelse(is.na(x), "", x)
+  x <- str_replace_all(x, "\\|", ";")
+  x <- str_split_fixed(x, ";|,|\\s+", 2)[, 1]
+  str_trim(x)
+}
+```
+
+```{r nm-export-engine, echo=FALSE}
+engine_file <- file.path(helper_dir, "nm_export_engine_OT.R")
+if (!file.exists(engine_file)) {
+  stop("Cannot find the figure-export file '", engine_file, "' (working directory: ", getwd(),
+       "). Copy the 'R' folder from the zip next to this Rmd and the input CSVs, or set helper_dir.",
+       call. = FALSE)
+}
+source(engine_file, local = knitr::knit_global())
+```
+
+# Output folders
+
+```{r output-folders}
+safe_dir_create(out_dir)
+
+table_dir       <- file.path(out_dir, "Tbl")
+pca_dir         <- file.path(out_dir, "PCA")
+volcano_dir     <- file.path(out_dir, "Vol")
+heatmap_dir     <- file.path(out_dir, "HM")
+go_dir          <- file.path(out_dir, "GO")
+upr_dir         <- file.path(out_dir, "UPR")
+interaction_dir <- file.path(out_dir, "Int")
+
+purrr::walk(c(table_dir, pca_dir, volcano_dir, heatmap_dir, go_dir, upr_dir, interaction_dir), safe_dir_create)
+```
+
+# Load, filter, and transform data
+
+```{r load-filter-data}
+if (!file.exists(data_file)) stop("Could not find data file: ", data_file)
+if (!file.exists(meta_file)) stop("Could not find metadata file: ", meta_file)
+
+df   <- read.csv(data_file, check.names = FALSE, stringsAsFactors = FALSE)
+meta <- read.csv(meta_file, check.names = FALSE, stringsAsFactors = FALSE)
+
+required_df_cols <- c("Protein.Group", "Genes")
+missing_df <- setdiff(required_df_cols, colnames(df))
+if (length(missing_df) > 0) stop("Missing data columns: ", paste(missing_df, collapse = ", "))
+
+required_meta_cols <- c("ID", "Age", "Treatment", "Sex")
+missing_meta <- setdiff(required_meta_cols, colnames(meta))
+if (length(missing_meta) > 0) stop("Missing metadata columns: ", paste(missing_meta, collapse = ", "))
+
+meta_old <- meta %>%
+  mutate(
+    ID = as.character(ID),
+    Age = str_to_title(str_trim(as.character(Age))),
+    Treatment = str_to_title(str_trim(as.character(Treatment))),
+    Sex = str_to_title(str_trim(as.character(Sex)))
+  ) %>%
+  filter(
+    Age == "Old",
+    Treatment %in% c("Control", "Exercise", "Rapamycin"),
+    ID %in% colnames(df),
+    !ID %in% exclude_samples
+  ) %>%
+  mutate(
+    Treatment = factor(Treatment, levels = c("Control", "Exercise", "Rapamycin")),
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Group = factor(
+      paste(Treatment, Sex, sep = "_"),
+      levels = c(
+        "Control_Female", "Control_Male",
+        "Exercise_Female", "Exercise_Male",
+        "Rapamycin_Female", "Rapamycin_Male"
+      )
+    )
+  ) %>%
+  arrange(Treatment, Sex, ID)
+
+cat("\nSample counts per treatment × sex:\n")
+print(table(meta_old$Treatment, meta_old$Sex))
+
+if (nrow(meta_old) == 0) stop("No old-treatment samples found after metadata filtering.")
+if (any(table(meta_old$Group) == 0)) {
+  warning("At least one Treatment × Sex group has zero samples. Model may fail.")
+}
+
+all_cols <- meta_old$ID
+treatment_ids <- split(meta_old$ID, meta_old$Treatment)
+
+# Protein annotation table
+protein_tbl <- df %>%
+  mutate(
+    Protein.Group = as.character(Protein.Group),
+    Genes = as.character(Genes),
+    Gene_clean = first_gene_symbol(Genes),
+    Gene_clean = ifelse(is.na(Gene_clean) | Gene_clean == "", Protein.Group, Gene_clean),
+    row_id_base = ifelse(is.na(Genes) | Genes == "", Protein.Group, Genes),
+    row_id = make.unique(row_id_base)
+  ) %>%
+  select(row_id, Protein.Group, Genes, Gene_clean, everything())
+
+mat <- protein_tbl %>%
+  select(row_id, all_of(all_cols)) %>%
+  column_to_rownames("row_id") %>%
+  as.matrix()
+
+mode(mat) <- "numeric"
+mat[mat <= 0] <- NA
+
+cat(sprintf("\nProteins before filter: %d\n", nrow(mat)))
+
+keep_idx <- rep(TRUE, nrow(mat))
+for (trt in names(treatment_ids)) {
+  ids <- treatment_ids[[trt]]
+  keep_idx <- keep_idx & rowMeans(!is.na(mat[, ids, drop = FALSE])) >= min_detect_frac
+}
+
+mat_filt <- mat[keep_idx, , drop = FALSE]
+protein_tbl_filt <- protein_tbl %>% filter(row_id %in% rownames(mat_filt))
+
+cat(sprintf(
+  "Proteins after %.0f%% completeness filter within each treatment: %d\n",
+  min_detect_frac * 100,
+  nrow(mat_filt)
+))
+
+write.csv(
+  protein_tbl_filt %>% select(row_id, Protein.Group, Genes, Gene_clean),
+  file.path(table_dir, "Proteins_retained_after_filter.csv"),
+  row.names = FALSE
+)
+
+mat_log <- log2(mat_filt)
+```
+
+# PCA and scree plot
+
+```{r pca-scree, fig.keep="none"}
+# PCA uses the same filtered, log2-transformed matrix as the differential
+# abundance analysis. NIPALS handles missing values without imputation.
+X <- t(mat_log)
+
+n_pc <- min(nrow(X), ncol(X), 10)
+
+pca_res <- nipals::nipals(X, ncomp = n_pc, center = TRUE, scale = TRUE)
+
+# nipals reports marginal R2 for each component. Use this directly when
+# available rather than renormalizing only the extracted PCs to 100%.
+if (!is.null(pca_res$R2)) {
+  var_ind <- as.numeric(pca_res$R2)[seq_len(n_pc)] * 100
+} else {
+  warning("nipals R2 was unavailable; falling back to eigenvalue normalization.")
+  var_ind <- (pca_res$eig[seq_len(n_pc)] / sum(pca_res$eig[seq_len(n_pc)])) * 100
+}
+
+cum_var <- cumsum(var_ind)
+
+scores_df <- as.data.frame(pca_res$scores[, 1:2, drop = FALSE]) %>%
+  rownames_to_column("Sample") %>%
+  left_join(meta_old %>% select(ID, Treatment, Sex), by = c("Sample" = "ID"))
+
+loadings_df <- as.data.frame(pca_res$loadings[, seq_len(n_pc), drop = FALSE]) %>%
+  rownames_to_column("Protein")
+
+variance_df <- tibble(PC = paste0("PC", seq_len(n_pc)), Variance_pct = var_ind, Cumulative_pct = cum_var)
+
+write.csv(scores_df, file.path(pca_dir, "PCA_scores.csv"), row.names = FALSE)
+
+write.csv(loadings_df, file.path(pca_dir, "PCA_loadings.csv"), row.names = FALSE)
+
+write.csv(variance_df, file.path(pca_dir, "PCA_variance.csv"), row.names = FALSE)
+
+treatment_cols_pca <- c("Control"   = "#59C761", "Exercise"  = "#F2D925", "Rapamycin" = "#64106E")
+
+sex_shapes_pca <- c("Female" = 16, "Male" = 17)
+
+p_pca <- ggplot(scores_df, aes(x = PC1, y = PC2, colour = Treatment, fill = Treatment)) +
+  stat_ellipse(aes(group = Treatment), type = "norm", level = 0.95, geom = "polygon", alpha = 0.12, colour = NA) +
+  geom_point(aes(shape = Sex), size = 4, alpha = 0.95, stroke = 0.6) +
+  scale_colour_manual(values = treatment_cols_pca) +
+  scale_fill_manual(values = treatment_cols_pca) +
+  scale_shape_manual(values = sex_shapes_pca) +
+  guides(fill = "none") +
+  labs(
+    title = "PCA — Soluble Fraction",
+    x = sprintf("PC1 (%.1f%%)", var_ind[1]),
+    y = sprintf("PC2 (%.1f%%)", var_ind[2]),
+    colour = "Treatment",
+    shape = "Sex",
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(colour = "grey40", size = 11),
+    plot.caption = element_text(colour = "grey50", size = 8.5, hjust = 0.5),
+    legend.position = "right",
+    legend.title = element_text(face = "bold")
+  )
+
+scree_df <- tibble(
+  PC = factor(paste0("PC", seq_len(n_pc)), levels = paste0("PC", seq_len(n_pc))),
+  Individual = var_ind,
+  Cumulative = cum_var
+)
+
+p_scree <- ggplot(scree_df, aes(x = PC)) +
+  geom_col(aes(y = Individual, fill = Individual), width = 0.65, colour = "white", linewidth = 0.3) +
+  geom_line(aes(y = Cumulative, group = 1), colour = treatment_cols_pca[["Control"]], linewidth = 1.1) +
+  geom_point(
+    aes(y = Cumulative),
+    colour = treatment_cols_pca[["Control"]],
+    size = 2.8,
+    shape = 21,
+    fill = "white",
+    stroke = 1.2
+  ) +
+  geom_hline(yintercept = 80, linetype = "dashed", colour = "grey50", linewidth = 0.6) +
+  scale_fill_viridis_c(option = "D", direction = -1, guide = "none") +
+  scale_y_continuous(limits = c(0, max(100, max(scree_df$Cumulative, na.rm = TRUE)) * 1.02), expand = c(0, 0)) +
+  labs(
+    title = "Scree Plot",
+    subtitle = "Bars = individual variance | Line = cumulative variance",
+    x = "Principal Component",
+    y = "Variance Explained (%)"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(colour = "grey40", size = 11),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.y = element_line(colour = "grey93", linewidth = 0.3)
+  )
+
+pca_png <- save_plot_png(p_pca, file.path(pca_dir, "PCA"), width = 7, height = 6, dpi = 300)
+
+scree_png <- save_plot_png(p_scree, file.path(pca_dir, "Scree"), width = 7, height = 5, dpi = 300)
+```
+
+```{r show-pca-scree, echo=FALSE, out.width="48%"}
+knitr::include_graphics(c(pca_png, scree_png))
+```
+
+# Treatment × Sex limma model
+
+```{r limma-model}
+group_vec <- factor(meta_old$Group, levels = levels(meta_old$Group))
+design <- model.matrix(~ 0 + group_vec)
+colnames(design) <- levels(group_vec)
+
+fit <- lmFit(mat_log[, meta_old$ID, drop = FALSE], design)
+
+cont_mat <- makeContrasts(
+  Ex_vs_Ctl =
+    ((Exercise_Female + Exercise_Male) / 2) -
+    ((Control_Female + Control_Male) / 2),
+
+  Rapa_vs_Ctl =
+    ((Rapamycin_Female + Rapamycin_Male) / 2) -
+    ((Control_Female + Control_Male) / 2),
+
+  Rapa_vs_Ex =
+    ((Rapamycin_Female + Rapamycin_Male) / 2) -
+    ((Exercise_Female + Exercise_Male) / 2),
+
+  Sex =
+    ((Control_Male + Exercise_Male + Rapamycin_Male) / 3) -
+    ((Control_Female + Exercise_Female + Rapamycin_Female) / 3),
+
+  Ex_SexInt =
+    (Exercise_Male - Control_Male) -
+    (Exercise_Female - Control_Female),
+
+  Rapa_SexInt =
+    (Rapamycin_Male - Control_Male) -
+    (Rapamycin_Female - Control_Female),
+
+  Ex_vs_Ctl_Female = Exercise_Female - Control_Female,
+  Ex_vs_Ctl_Male   = Exercise_Male   - Control_Male,
+
+  Rapa_vs_Ctl_Female = Rapamycin_Female - Control_Female,
+  Rapa_vs_Ctl_Male   = Rapamycin_Male   - Control_Male,
+
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, cont_mat)
+fit2 <- eBayes(fit2, trend = TRUE)
+
+contrast_meta <- tribble(
+  ~coef_name, ~label, ~file_tag, ~x_label,
+  "Ex_vs_Ctl", "Exercise vs Control", "Exercise_vs_Control", "log2FC (Old+Exercise / Old Control)",
+  "Rapa_vs_Ctl", "Rapamycin vs Control", "Rapamycin_vs_Control", "log2FC (Old+Rapamycin / Old Control)",
+  "Rapa_vs_Ex", "Rapamycin vs Exercise", "Rapamycin_vs_Exercise", "log2FC (Old+Rapamycin / Old+Exercise)",
+  "Sex", "Sex: Male vs Female", "Sex_Male_vs_Female", "log2FC (Male / Female)",
+  "Ex_SexInt", "Exercise × Sex interaction", "ExerciseSex_Interaction", "Interaction log2FC",
+  "Rapa_SexInt", "Rapamycin × Sex interaction", "RapamycinSex_Interaction", "Interaction log2FC",
+  "Ex_vs_Ctl_Female", "Exercise vs Control — Female", "Exercise_vs_Control_Female", "log2FC (Exercise / Control) in females",
+  "Ex_vs_Ctl_Male", "Exercise vs Control — Male", "Exercise_vs_Control_Male", "log2FC (Exercise / Control) in males",
+  "Rapa_vs_Ctl_Female", "Rapamycin vs Control — Female", "Rapamycin_vs_Control_Female", "log2FC (Rapamycin / Control) in females",
+  "Rapa_vs_Ctl_Male", "Rapamycin vs Control — Male", "Rapamycin_vs_Control_Male", "log2FC (Rapamycin / Control) in males"
+)
+
+make_result_table <- function(coef_name, label, x_label) {
+  topTable(fit2, coef = coef_name, number = Inf, sort.by = "none") %>%
+    rownames_to_column("Protein") %>%
+    left_join(protein_tbl_filt %>% select(Protein = row_id, Protein.Group, Genes, Gene_clean), by = "Protein") %>%
+    mutate(
+      Contrast = label,
+      X_label = x_label,
+      SigFDR = !is.na(adj.P.Val) & adj.P.Val <= fdr_cutoff,
+      SigRawOnly = !is.na(P.Value) & P.Value <= raw_p_cutoff & !SigFDR,
+      SigAny = SigFDR | SigRawOnly,
+      Direction = case_when(SigAny & logFC > 0 ~ "Up", SigAny & logFC < 0 ~ "Down", TRUE ~ "NS"),
+      SigClass = case_when(SigFDR ~ "FDR <= 0.05", SigRawOnly ~ "Raw p <= 0.05 only", TRUE ~ "NS")
+    )
+}
+
+results_list <- pmap(
+  contrast_meta,
+  function(coef_name, label, file_tag, x_label) make_result_table(coef_name, label, x_label)
+)
+names(results_list) <- contrast_meta$coef_name
+
+for (i in seq_len(nrow(contrast_meta))) {
+  write.csv(
+    results_list[[contrast_meta$coef_name[i]]],
+    file.path(table_dir, paste0("DE_", contrast_meta$file_tag[i], ".csv")),
+    row.names = FALSE
+  )
+}
+
+res_ex_ctl      <- results_list$Ex_vs_Ctl
+res_rapa_ctl    <- results_list$Rapa_vs_Ctl
+res_rapa_ex     <- results_list$Rapa_vs_Ex
+res_sex         <- results_list$Sex
+res_ex_int      <- results_list$Ex_SexInt
+res_rapa_int    <- results_list$Rapa_SexInt
+res_ex_female   <- results_list$Ex_vs_Ctl_Female
+res_ex_male     <- results_list$Ex_vs_Ctl_Male
+res_rapa_female <- results_list$Rapa_vs_Ctl_Female
+res_rapa_male   <- results_list$Rapa_vs_Ctl_Male
+
+# Omnibus Treatment and Treatment×Sex F-tests, with raw and FDR columns
+max_abs_treatment <- full_join(
+  res_ex_ctl %>% select(Protein, logFC_ex = logFC),
+  res_rapa_ctl %>% select(Protein, logFC_rapa = logFC),
+  by = "Protein"
+) %>%
+  mutate(max_abs_logFC = pmax(abs(logFC_ex), abs(logFC_rapa), na.rm = TRUE))
+
+max_abs_interaction <- full_join(
+  res_ex_int %>% select(Protein, logFC_ex_int = logFC),
+  res_rapa_int %>% select(Protein, logFC_rapa_int = logFC),
+  by = "Protein"
+) %>%
+  mutate(max_abs_interaction = pmax(abs(logFC_ex_int), abs(logFC_rapa_int), na.rm = TRUE))
+
+make_omnibus_table <- function(coef_names, label, max_abs_tbl, max_col) {
+  topTable(fit2, coef = coef_names, number = Inf, sort.by = "F") %>%
+    rownames_to_column("Protein") %>%
+    left_join(protein_tbl_filt %>% select(Protein = row_id, Protein.Group, Genes, Gene_clean), by = "Protein") %>%
+    left_join(max_abs_tbl, by = "Protein") %>%
+    mutate(
+      Contrast = label,
+      SigFDR = !is.na(adj.P.Val) & adj.P.Val <= fdr_cutoff,
+      SigRawOnly = !is.na(P.Value) & P.Value <= raw_p_cutoff & !SigFDR,
+      SigAny = SigFDR | SigRawOnly,
+      SigClass = case_when(SigFDR ~ "FDR <= 0.05", SigRawOnly ~ "Raw p <= 0.05 only", TRUE ~ "NS")
+    )
+}
+
+res_treatment_main <- make_omnibus_table(
+  c("Ex_vs_Ctl", "Rapa_vs_Ctl"),
+  "Treatment omnibus",
+  max_abs_treatment,
+  "max_abs_logFC"
+)
+
+res_interaction_main <- make_omnibus_table(
+  c("Ex_SexInt", "Rapa_SexInt"),
+  "Treatment × Sex omnibus",
+  max_abs_interaction,
+  "max_abs_interaction"
+)
+
+write.csv(res_treatment_main, file.path(table_dir, "DE_Treatment_omnibus.csv"), row.names = FALSE)
+write.csv(res_interaction_main, file.path(table_dir, "DE_TreatmentSex_omnibus.csv"), row.names = FALSE)
+
+summary_tbl <- tibble(
+  Contrast = c("Exercise vs Control", "Rapamycin vs Control", "Sex", "Exercise × Sex", "Rapamycin × Sex", "Treatment omnibus", "Treatment×Sex omnibus"),
+  Raw_or_FDR_up = c(
+    sum(res_ex_ctl$SigAny & res_ex_ctl$logFC > 0, na.rm = TRUE),
+    sum(res_rapa_ctl$SigAny & res_rapa_ctl$logFC > 0, na.rm = TRUE),
+    sum(res_sex$SigAny & res_sex$logFC > 0, na.rm = TRUE),
+    sum(res_ex_int$SigAny & res_ex_int$logFC > 0, na.rm = TRUE),
+    sum(res_rapa_int$SigAny & res_rapa_int$logFC > 0, na.rm = TRUE),
+    NA_integer_, NA_integer_
+  ),
+  Raw_or_FDR_down = c(
+    sum(res_ex_ctl$SigAny & res_ex_ctl$logFC < 0, na.rm = TRUE),
+    sum(res_rapa_ctl$SigAny & res_rapa_ctl$logFC < 0, na.rm = TRUE),
+    sum(res_sex$SigAny & res_sex$logFC < 0, na.rm = TRUE),
+    sum(res_ex_int$SigAny & res_ex_int$logFC < 0, na.rm = TRUE),
+    sum(res_rapa_int$SigAny & res_rapa_int$logFC < 0, na.rm = TRUE),
+    NA_integer_, NA_integer_
+  ),
+  FDR_total = c(
+    sum(res_ex_ctl$SigFDR, na.rm = TRUE),
+    sum(res_rapa_ctl$SigFDR, na.rm = TRUE),
+    sum(res_sex$SigFDR, na.rm = TRUE),
+    sum(res_ex_int$SigFDR, na.rm = TRUE),
+    sum(res_rapa_int$SigFDR, na.rm = TRUE),
+    sum(res_treatment_main$SigFDR, na.rm = TRUE),
+    sum(res_interaction_main$SigFDR, na.rm = TRUE)
+  ),
+  Raw_only_total = c(
+    sum(res_ex_ctl$SigRawOnly, na.rm = TRUE),
+    sum(res_rapa_ctl$SigRawOnly, na.rm = TRUE),
+    sum(res_sex$SigRawOnly, na.rm = TRUE),
+    sum(res_ex_int$SigRawOnly, na.rm = TRUE),
+    sum(res_rapa_int$SigRawOnly, na.rm = TRUE),
+    sum(res_treatment_main$SigRawOnly, na.rm = TRUE),
+    sum(res_interaction_main$SigRawOnly, na.rm = TRUE)
+  )
+)
+
+write.csv(summary_tbl, file.path(table_dir, "DE_summary_counts_rawP_FDR.csv"), row.names = FALSE)
+print(summary_tbl)
+```
+
+# Plot colors
+
+```{r colours}
+col_control <- "#59C761"
+col_ex      <- "#F2D925"
+col_rapa    <- "#64106E"
+col_female  <- "#CC78BC"
+col_male    <- "#029E73"
+
+col_up      <- "#D62728"
+col_down    <- "#1F77B4"
+col_ns      <- "grey75"
+
+trt_cols <- c("Control" = col_control, "Exercise" = col_ex, "Rapamycin" = col_rapa)
+sex_cols <- c("Female" = col_female, "Male" = col_male)
+```
+
+# Volcano plots
+
+Open colored circles denote proteins meeting only the nominal raw-p threshold; solid colored circles denote proteins passing FDR. Red and blue indicate positive and negative contrast effects, respectively. The ±0.5 vertical lines are visual reference lines only.
+
+```{r volcano-plots, fig.keep="none"}
+make_volcano <- function(res, file_tag, title = unique(res$Contrast), subtitle = NULL) {
+  res_plot <- res %>%
+    mutate(
+      neg_log10_p = -log10(P.Value),
+      neg_log10_p = ifelse(is.finite(neg_log10_p), neg_log10_p, NA_real_),
+      DirectionLegend = case_when(SigAny & logFC > 0 ~ "Up", SigAny & logFC < 0 ~ "Down", TRUE ~ "NS"),
+      DirectionLegend = factor(DirectionLegend, levels = c("Up", "Down", "NS")),
+      SigShape = case_when(SigFDR ~ "FDR", SigRawOnly ~ "Raw p-value", TRUE ~ "NS"),
+      SigShape = factor(SigShape, levels = c("FDR", "Raw p-value", "NS"))
+    )
+
+  label_tbl <- bind_rows(
+    res_plot %>% filter(SigAny, logFC > 0) %>% slice_min(P.Value, n = 5, with_ties = FALSE),
+    res_plot %>% filter(SigAny, logFC < 0) %>% slice_min(P.Value, n = 5, with_ties = FALSE)
+  ) %>% distinct(Protein, .keep_all = TRUE)
+
+  n_up <- sum(res_plot$SigAny & res_plot$logFC > 0, na.rm = TRUE)
+  n_down <- sum(res_plot$SigAny & res_plot$logFC < 0, na.rm = TRUE)
+  n_ns <- sum(!res_plot$SigAny, na.rm = TRUE)
+
+  direction_colors <- c("Up" = col_up, "Down" = col_down, "NS" = col_ns)
+  direction_labels <- c(
+    "Up" = paste0("Up (", n_up, ")"),
+    "Down" = paste0("Down (", n_down, ")"),
+    "NS" = paste0("NS (", n_ns, ")")
+  )
+  shape_values <- c("FDR" = 16, "Raw p-value" = 1, "NS" = 16)
+
+  p <- ggplot(res_plot, aes(x = logFC, y = neg_log10_p)) +
+    geom_point(
+      aes(color = DirectionLegend, shape = SigShape),
+      size = 2.3,
+      stroke = 0.9,
+      alpha = 0.90,
+      na.rm = TRUE
+    ) +
+    geom_hline(yintercept = -log10(raw_p_cutoff), linetype = "dashed", colour = "grey55", linewidth = 0.45) +
+    geom_vline(xintercept = c(-volcano_lfc_ref, volcano_lfc_ref),
+               linetype = "dashed", colour = "grey65", linewidth = 0.45) +
+    geom_text_repel(
+      data = label_tbl,
+      aes(label = Protein),
+      size = 3,
+      max.overlaps = 20,
+      box.padding = 0.35,
+      point.padding = 0.25,
+      segment.size = 0.25,
+      segment.alpha = 0.55,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(values = direction_colors, labels = direction_labels, drop = FALSE, name = NULL) +
+    scale_shape_manual(
+      values = shape_values,
+      limits = c("FDR", "Raw p-value", "NS"),
+      breaks = c("FDR", "Raw p-value"),
+      labels = c(paste0("FDR ≤ ", fdr_cutoff), paste0("Raw p-value ≤ ", raw_p_cutoff)),
+      drop = FALSE,
+      name = NULL
+    ) +
+    guides(
+      color = guide_legend(order = 1, override.aes = list(shape = 16, size = 3, alpha = 1)),
+      shape = guide_legend(order = 2, override.aes = list(shape = c(16, 1), color = "black", size = 3, stroke = 1, alpha = 1))
+    ) +
+    labs(title = paste0(fraction_name, " — ", title), x = unique(res$X_label), y = "-log10(raw p-value)",) +
+    theme_classic(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(colour = "grey35", size = 10),
+      plot.caption = element_text(colour = "grey45", size = 8, hjust = 0.5),
+      legend.position = "right",
+      legend.text = element_text(size = 9),
+      legend.key.width = grid::unit(0.45, "cm")
+    )
+
+  save_plot_png(p, file.path(volcano_dir, paste0("Volcano_", file_tag)), width = 7.8, height = 6.2, dpi = 300)
+
+  p
+}
+
+p_v_ex_ctl <- make_volcano(res_ex_ctl, "Exercise_vs_Control")
+p_v_rapa_ctl <- make_volcano(res_rapa_ctl, "Rapamycin_vs_Control")
+p_v_sex <- make_volcano(res_sex, "Sex_Male_vs_Female")
+p_v_ex_int <- make_volcano(res_ex_int, "ExerciseSex_Interaction")
+p_v_rapa_int <- make_volcano(res_rapa_int, "RapamycinSex_Interaction")
+
+combined_v <- (p_v_ex_ctl | p_v_rapa_ctl | p_v_sex) /
+  (p_v_ex_int | p_v_rapa_int | plot_spacer()) +
+  plot_annotation(
+    title = paste0("Differential Abundance — ", fraction_name, " Fraction"),
+    subtitle = "3×2 limma model: Treatment × Sex | open = raw-p only | solid = FDR",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+      plot.subtitle = element_text(colour = "grey35", size = 10, hjust = 0.5)
+    )
+  )
+
+save_plot_png(combined_v, file.path(volcano_dir, "Volcano_Combined"), width = 20, height = 11, dpi = 300)
+```
+
+```{r show-volcanoes, echo=FALSE, out.width="48%"}
+volcano_files <- c(
+  file.path(volcano_dir, "Volcano_Exercise_vs_Control.png"),
+  file.path(volcano_dir, "Volcano_Rapamycin_vs_Control.png"),
+  file.path(volcano_dir, "Volcano_Sex_Male_vs_Female.png"),
+  file.path(volcano_dir, "Volcano_ExerciseSex_Interaction.png"),
+  file.path(volcano_dir, "Volcano_RapamycinSex_Interaction.png"),
+  file.path(volcano_dir, "Volcano_Combined.png")
+)
+knitr::include_graphics(volcano_files[file.exists(volcano_files)])
+```
+
+# Significant-protein heatmaps
+
+Heatmaps show proteins significant by raw p ≤ 0.05 or FDR ≤ 0.05 for the two treatment-vs-control contrasts and the overall Sex contrast. The Exercise vs Control heatmap includes only Control and Exercise samples; the Rapamycin vs Control heatmap includes only Control and Rapamycin samples. Both sexes are retained within each displayed treatment. The overall Sex heatmap and the targeted UPR/chaperone/folding module heatmap include all three treatment groups. Abundances are standardized within each protein using row-wise Z scores calculated across the samples displayed in that heatmap. Thus, colors represent relative abundance across the displayed samples for a given protein and do not compare absolute abundance between different proteins. Protein selection and the displayed raw-p/FDR values use the existing 3 × 2 limma model results.
+
+Interaction heatmaps are intentionally omitted; significant Treatment × Sex interactions are displayed later using mean ± SEM plots.
+
+```{r heatmaps, fig.keep="none"}
+heatmap_col_fun <- circlize::colorRamp2(c(-z_clip, 0, z_clip), c(col_down, "white", col_up))
+
+meta_ord <- meta_old %>% arrange(Treatment, Sex, ID)
+col_order <- meta_ord$ID
+
+top_ann <- HeatmapAnnotation(
+  Treatment = meta_ord$Treatment,
+  Sex = meta_ord$Sex,
+  col = list(Treatment = trt_cols, Sex = sex_cols),
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = nm_style$legend_title, fontface = "bold"),
+  gap = unit(1, "mm")
+)
+
+make_pval_heatmap <- function(info_tbl, row_names, raw_col = "P.Value", fdr_col = "adj.P.Val") {
+  pval_text <- cbind(Raw = format_p(info_tbl[[raw_col]]), FDR = format_p(info_tbl[[fdr_col]]))
+
+  pval_mat <- matrix(0, nrow = nrow(info_tbl), ncol = 2, dimnames = list(row_names, c("Raw", "FDR")))
+
+  Heatmap(
+    pval_mat,
+    name = "p-value",
+    col = circlize::colorRamp2(c(0, 1), c("white", "white")),
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    show_heatmap_legend = FALSE,
+    show_row_names = FALSE,
+    show_column_names = TRUE,
+    column_names_side = "top",
+    column_names_gp = gpar(fontsize = nm_style$axis_text, fontface = "bold"),
+    column_title = "p-value",
+    column_title_gp = gpar(fontsize = nm_style$axis_text, fontface = "bold"),
+    width = unit(18, "mm"),
+    rect_gp = gpar(col = "white"),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      this_p <- if (j == 1) info_tbl[[raw_col]][i] else info_tbl[[fdr_col]][i]
+      this_cutoff <- if (j == 1) raw_p_cutoff else fdr_cutoff
+      grid.text(
+        pval_text[i, j], x = x, y = y,
+        gp = gpar(
+          fontsize = nm_style$legend_text,
+          fontface = ifelse(!is.na(this_p) & this_p <= this_cutoff, "bold", "plain")
+        )
+      )
+    }
+  )
+}
+
+make_sig_heatmap <- function(res, file_tag, title, row_split_by = "Direction", treatments = NULL) {
+  sig_tbl <- res %>%
+    filter(SigAny, Protein %in% rownames(mat_log)) %>%
+    arrange(Direction, P.Value)
+
+  write.csv(sig_tbl, file.path(heatmap_dir, paste0("Heatmap_input_", file_tag, ".csv")), row.names = FALSE)
+
+  if (nrow(sig_tbl) < 2) {
+    message("Skipping heatmap for ", title, ": fewer than 2 significant proteins.")
+    return(NULL)
+  }
+
+  # Subset only this heatmap; shared metadata stay available to all-group plots.
+  hm_meta <- meta_ord
+  if (!is.null(treatments)) {
+    hm_meta <- hm_meta[hm_meta$Treatment %in% treatments, , drop = FALSE]
+  }
+  hm_meta <- droplevels(hm_meta)
+
+  top_ann_hm <- HeatmapAnnotation(
+    Treatment = hm_meta$Treatment,
+    Sex = hm_meta$Sex,
+    col = list(
+      Treatment = trt_cols[unique(as.character(hm_meta$Treatment))],
+      Sex = sex_cols[unique(as.character(hm_meta$Sex))]
+    ),
+    annotation_name_side = "left",
+    annotation_name_gp = grid::gpar(fontsize = nm_style$legend_title, fontface = "bold"),
+    gap = grid::unit(1, "mm")
+  )
+
+  # Compute row Z scores using only the samples displayed in this heatmap.
+  hm_mat <- mat_log[sig_tbl$Protein, hm_meta$ID, drop = FALSE]
+  hm_z <- t(apply(hm_mat, 1, row_zscore))
+  hm_z[!is.finite(hm_z)] <- 0
+  hm_z[hm_z > z_clip] <- z_clip
+  hm_z[hm_z < -z_clip] <- -z_clip
+
+  row_labels <- make.unique(sig_tbl$Protein)
+
+  if (row_split_by == "Direction") {
+    row_split <- factor(sig_tbl$Direction, levels = c("Up", "Down", "NS"))
+  } else {
+    row_split <- factor(sig_tbl$SigClass, levels = c("FDR <= 0.05", "Raw p <= 0.05 only", "NS"))
+  }
+
+  ht_main <- Heatmap(
+    hm_z,
+    name = "Z-score",
+    col = heatmap_col_fun,
+    na_col = "grey85",
+    top_annotation = top_ann_hm,
+    column_split = hm_meta$Treatment,
+    column_gap = unit(3, "mm"),
+    row_split = row_split,
+    row_gap = unit(3, "mm"),
+    row_title_side = "left",
+    row_title_gp = gpar(fontsize = nm_style$axis_text, fontface = "bold"),
+    cluster_rows = TRUE,
+    cluster_row_slices = FALSE,
+    cluster_columns = FALSE,
+    cluster_column_slices = FALSE,
+    show_column_names = FALSE,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    row_labels = row_labels,
+    row_names_gp = gpar(fontsize = nm_style$legend_text, fontface = "bold"),
+    column_title = title,
+    column_title_gp = gpar(fontsize = nm_style$plot_title, fontface = "bold"),
+    border = FALSE,
+    heatmap_legend_param = list(
+      title = "Z-score",
+      title_position = "topcenter",
+      at = c(-z_clip, 0, z_clip),
+      labels = c(paste0("-", z_clip), "0", as.character(z_clip))
+    )
+  )
+
+  ht_p <- make_pval_heatmap(sig_tbl, rownames(hm_z))
+  ht <- ht_main + ht_p
+
+  hm_h <- max(5.5, nrow(sig_tbl) * 0.26 + 3.2)
+  save_heatmap_png(
+    ht,
+    file.path(heatmap_dir, paste0("Heatmap_", file_tag, "_rawP_FDR")),
+    width = 13.8,
+    height = hm_h,
+    dpi = 300
+  )
+
+  ht
+}
+
+ht_ex_ctl <- make_sig_heatmap(
+  res_ex_ctl,
+  "Exercise_vs_Control",
+  paste0(fraction_name, " — Exercise vs Control significant proteins"),
+  treatments = c("Control", "Exercise")
+)
+
+ht_rapa_ctl <- make_sig_heatmap(
+  res_rapa_ctl,
+  "Rapamycin_vs_Control",
+  paste0(fraction_name, " — Rapamycin vs Control significant proteins"),
+  treatments = c("Control", "Rapamycin")
+)
+
+ht_sex <- make_sig_heatmap(
+  res_sex,
+  "Sex_Male_vs_Female",
+  paste0(fraction_name, " — Sex-effect significant proteins")
+)
+```
+
+```{r show-heatmaps, echo=FALSE, out.width="80%"}
+heatmap_files <- c(
+  file.path(heatmap_dir, "Heatmap_Exercise_vs_Control_rawP_FDR.png"),
+  file.path(heatmap_dir, "Heatmap_Rapamycin_vs_Control_rawP_FDR.png"),
+  file.path(heatmap_dir, "Heatmap_Sex_Male_vs_Female_rawP_FDR.png")
+)
+knitr::include_graphics(heatmap_files[file.exists(heatmap_files)])
+```
+
+# GO Biological Process enrichment
+
+For Exercise vs Control and Rapamycin vs Control, GO Biological Process enrichment is performed separately for proteins increased and decreased by treatment. Two input definitions are retained: **FDR-significant proteins** and **raw-p-significant proteins**. Only the separate FDR-defined and raw-p-defined enrichment analyses are retained.
+
+Gene symbols are mapped to Entrez IDs using `org.Mm.eg.db`. The background universe is the set of genes represented by proteins that passed the soluble-fraction completeness filter. Enrichment is performed with `clusterProfiler::enrichGO()` using the Biological Process ontology, a hypergeometric over-representation test, and Benjamini-Hochberg adjustment. Terms are required to meet the configured enrichment p/q thresholds, and the top five terms per direction are ranked by GO-adjusted p-value. Fold enrichment is calculated as the observed GeneRatio divided by the background BgRatio.
+
+```{r go-bp, fig.keep="none"}
+map_symbols_to_entrez <- function(symbols) {
+  symbols <- symbols[!is.na(symbols) & symbols != ""] %>% unique()
+  if (length(symbols) == 0) return(character(0))
+
+  suppressMessages({
+    mapped <- tryCatch(
+      bitr(symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Mm.eg.db, drop = TRUE),
+      error = function(e) NULL
+    )
+  })
+
+  if (is.null(mapped) || nrow(mapped) == 0) return(character(0))
+  unique(mapped$ENTREZID)
+}
+
+parse_ratio <- function(x) {
+  num <- as.numeric(str_replace(x, "/.*$", ""))
+  den <- as.numeric(str_replace(x, "^.*/", ""))
+  num / den
+}
+
+run_go_bp_one_direction <- function(symbols, universe_symbols, direction_label) {
+  if (length(unique(symbols)) < go_min_genes_per_direction) {
+    message("Skipping GO for ", direction_label, ": fewer than ", go_min_genes_per_direction, " genes.")
+    return(NULL)
+  }
+
+  eg <- map_symbols_to_entrez(symbols)
+  universe_eg <- map_symbols_to_entrez(universe_symbols)
+
+  if (length(eg) < go_min_genes_per_direction) {
+    message("Skipping GO for ", direction_label, ": fewer than ", go_min_genes_per_direction, " mapped Entrez IDs.")
+    return(NULL)
+  }
+
+  ego <- tryCatch(
+    enrichGO(
+      gene = eg,
+      universe = universe_eg,
+      OrgDb = org.Mm.eg.db,
+      ont = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff = 0.05,
+      qvalueCutoff = 0.25,
+      readable = TRUE
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(ego) || nrow(as.data.frame(ego)) == 0) {
+    message("No enriched GO BP terms for ", direction_label)
+    return(NULL)
+  }
+
+  as.data.frame(ego) %>%
+    mutate(
+      Direction = direction_label,
+      GeneRatio_num = parse_ratio(GeneRatio),
+      BgRatio_num = parse_ratio(BgRatio),
+      FoldEnrich = GeneRatio_num / BgRatio_num,
+      neg_log10_fdr = -log10(p.adjust)
+    )
+}
+
+make_go_lollipop_contrast <- function(res_tbl, sig_filter, analysis_label, file_tag, contrast_title) {
+
+  if (!run_go_analysis) return(NULL)
+
+  # Capture the filtering expression supplied in the function call
+  sig_filter_quo <- rlang::enquo(sig_filter)
+
+  go_input <- res_tbl %>%
+    dplyr::filter(!!sig_filter_quo) %>%
+    dplyr::filter(!is.na(Gene_clean), Gene_clean != "", !is.na(logFC), logFC != 0) %>%
+    dplyr::mutate(Direction = ifelse(logFC > 0, "Up", "Down"))
+
+  genes_up <- go_input %>% filter(Direction == "Up") %>% pull(Gene_clean) %>% unique()
+  genes_down <- go_input %>% filter(Direction == "Down") %>% pull(Gene_clean) %>% unique()
+  universe_genes <- protein_tbl_filt$Gene_clean %>% unique()
+
+  cat(sprintf("\nGO input [%s, %s]: %d Up, %d Down\n",
+              contrast_title, analysis_label, length(genes_up), length(genes_down)))
+
+  write.csv(
+    go_input %>% select(Protein, Protein.Group, Genes, Gene_clean, logFC, P.Value, adj.P.Val, Direction),
+    file.path(go_dir, paste0("GO_INPUT_", file_tag, "_protein_to_gene_list.csv")),
+    row.names = FALSE
+  )
+
+  go_up <- run_go_bp_one_direction(genes_up, universe_genes, paste0("Up with ", contrast_title))
+  go_down <- run_go_bp_one_direction(genes_down, universe_genes, paste0("Down with ", contrast_title))
+  go_all <- bind_rows(go_up, go_down)
+
+  if (is.null(go_all) || nrow(go_all) == 0) {
+    message("No GO terms to plot for ", contrast_title, " — ", analysis_label)
+    return(NULL)
+  }
+
+  write.csv(go_all, file.path(go_dir, paste0("GO_BP_AllTerms_", file_tag, ".csv")), row.names = FALSE)
+
+  go_plot <- go_all %>%
+    group_by(Direction) %>%
+    slice_min(p.adjust, n = go_top_n, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(
+      Description_wrapped = str_wrap(Description, width = 45),
+      Direction = factor(Direction, levels = unique(Direction))
+    ) %>%
+    arrange(Direction, FoldEnrich) %>%
+    mutate(Description_wrapped = factor(Description_wrapped, levels = unique(Description_wrapped)))
+
+  p <- ggplot(go_plot, aes(y = Description_wrapped, x = FoldEnrich, size = Count, colour = neg_log10_fdr)) +
+    geom_segment(aes(x = 1, xend = FoldEnrich, y = Description_wrapped, yend = Description_wrapped),
+                 linewidth = 0.6, colour = "grey60") +
+    geom_point(alpha = 0.95) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50", linewidth = 0.5) +
+    facet_wrap(~ Direction, scales = "free_y", ncol = 1) +
+    scale_colour_gradient(low = "#FDAE61", high = "#D62728", name = expression(-log[10](GO~FDR))) +
+    scale_size_continuous(name = "Protein count", range = c(4, 9)) +
+    scale_x_continuous(expand = expansion(mult = c(0.04, 0.15))) +
+    labs(
+      title = paste0("GO Biological Processes — ", fraction_name, ", ", contrast_title, ", ", analysis_label),
+      subtitle = paste0("Top ", go_top_n, " terms per direction"),
+      x = "Fold enrichment",
+      y = NULL,
+      caption = "Input proteins split by treatment logFC direction. Dashed line: fold enrichment = 1."
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(colour = "grey40", size = 10),
+      plot.caption = element_text(colour = "grey50", size = 8, hjust = 0.5),
+      strip.text = element_text(face = "bold"),
+      axis.text.y = element_text(size = 9),
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      panel.grid.major.x = element_line(colour = "grey93", linewidth = 0.3),
+      legend.position = "right"
+    )
+
+  h <- max(5, nrow(go_plot) * 0.42 + 2.2)
+  save_plot_png(p, file.path(go_dir, paste0("GO_BP_Lollipop_", file_tag)), width = 9.5, height = h, dpi = 300)
+  p
+}
+
+# Exercise vs Control GO
+p_go_ex_fdr <- make_go_lollipop_contrast(
+  res_ex_ctl,
+  sig_filter = adj.P.Val <= fdr_cutoff,
+  analysis_label = "FDR-significant proteins only",
+  file_tag = "Ex_vs_Ctl_FDR",
+  contrast_title = "Exercise vs Control"
+)
+
+p_go_ex_raw <- make_go_lollipop_contrast(
+  res_ex_ctl,
+  sig_filter = P.Value <= raw_p_cutoff,
+  analysis_label = "raw-p-significant proteins",
+  file_tag = "Ex_vs_Ctl_rawP",
+  contrast_title = "Exercise vs Control"
+)
+
+# Rapamycin vs Control GO
+p_go_rapa_fdr <- make_go_lollipop_contrast(
+  res_rapa_ctl,
+  sig_filter = adj.P.Val <= fdr_cutoff,
+  analysis_label = "FDR-significant proteins only",
+  file_tag = "Rapa_vs_Ctl_FDR",
+  contrast_title = "Rapamycin vs Control"
+)
+
+p_go_rapa_raw <- make_go_lollipop_contrast(
+  res_rapa_ctl,
+  sig_filter = P.Value <= raw_p_cutoff,
+  analysis_label = "raw-p-significant proteins",
+  file_tag = "Rapa_vs_Ctl_rawP",
+  contrast_title = "Rapamycin vs Control"
+)
+```
+
+```{r show-go, echo=FALSE, out.width="80%"}
+go_files <- c(
+  file.path(go_dir, "GO_BP_Lollipop_Ex_vs_Ctl_FDR.png"),
+  file.path(go_dir, "GO_BP_Lollipop_Ex_vs_Ctl_rawP.png"),
+  file.path(go_dir, "GO_BP_Lollipop_Rapa_vs_Ctl_FDR.png"),
+  file.path(go_dir, "GO_BP_Lollipop_Rapa_vs_Ctl_rawP.png")
+)
+knitr::include_graphics(go_files[file.exists(go_files)])
+```
+
+# UPR/chaperone/folding module
+
+The curated module heatmap summarizes ER-related folding, HSP70/HSP90 machinery, small HSPs, and mitochondrial folding proteins that survive the proteome-wide filter. Right-side columns report Exercise vs Control and Rapamycin vs Control raw and FDR-adjusted p-values.
+
+```{r upr-module, fig.keep="none"}
+if (make_upr_module_heatmap) {
+
+  upr_module_key <- bind_rows(
+    tibble(
+      Module = "ER-related folding",
+      Gene_Query = c("Hspa5", "Hsp90b1", "Calr", "Canx", "P4hb", "Pdia3", "Pdia4", "Pdia6", "Erp44", "Ero1l", "Prdx4"),
+      Gene_Label = c("Hspa5", "Hsp90b1", "Calr", "Canx", "P4hb", "Pdia3", "Pdia4", "Pdia6", "Erp44", "Ero1l", "Prdx4")
+    ),
+    tibble(
+      Module = "HSP70/HSP90 machinery",
+      Gene_Query = c("Hspa8", "Hspa1a", "Hspa1l", "Hsp90aa1", "Hsp90ab1", "St13", "Stip1"),
+      Gene_Label = c("Hspa8", "Hspa1a", "Hspa1l", "Hsp90aa1", "Hsp90ab1", "St13", "Stip1")
+    ),
+    tibble(
+      Module = "Small HSP",
+      Gene_Query = c("Hspb1", "Hspb2", "Hspb6", "Cryab"),
+      Gene_Label = c("Hspb1", "Hspb2", "Hspb6", "Cryab")
+    ),
+    tibble(
+      Module = "Mitochondrial folding",
+      Gene_Query = c("Hspa9", "Hspd1", "Hspe1", "Trap1", "Lonp1"),
+      Gene_Label = c("Hspa9", "Hspd1", "Hspe1", "Trap1", "Lonp1")
+    )
+  ) %>%
+    mutate(
+      Module = factor(Module, levels = c("ER-related folding", "HSP70/HSP90 machinery", "Small HSP", "Mitochondrial folding")),
+      Gene_key = str_to_lower(Gene_Query)
+    ) %>%
+    group_by(Module) %>%
+    mutate(Gene_order = row_number()) %>%
+    ungroup() %>%
+    mutate(Module_order = as.integer(Module))
+
+  upr_info <- protein_tbl_filt %>%
+    mutate(Gene_key = str_to_lower(Gene_clean)) %>%
+    inner_join(upr_module_key, by = "Gene_key") %>%
+    left_join(res_ex_ctl %>% select(Protein, Ex_logFC = logFC, Ex_P.Value = P.Value, Ex_adj.P.Val = adj.P.Val), by = c("row_id" = "Protein")) %>%
+    left_join(res_rapa_ctl %>% select(Protein, Rapa_logFC = logFC, Rapa_P.Value = P.Value, Rapa_adj.P.Val = adj.P.Val), by = c("row_id" = "Protein")) %>%
+    arrange(Module_order, Gene_order, row_id)
+
+  missing_upr_genes <- upr_module_key %>%
+    anti_join(
+      protein_tbl_filt %>% mutate(Gene_key = str_to_lower(Gene_clean)) %>% distinct(Gene_key),
+      by = "Gene_key"
+    ) %>%
+    arrange(Module_order, Gene_order)
+
+  write.csv(missing_upr_genes, file.path(upr_dir, "UPR_module_genes_missing_or_filtered_out.csv"), row.names = FALSE)
+  write.csv(upr_info, file.path(upr_dir, "UPR_module_treatment_limma_rawP_and_FDR_table.csv"), row.names = FALSE)
+
+  if (nrow(upr_info) >= 2) {
+    hm_upr_mat <- mat_log[upr_info$row_id, col_order, drop = FALSE]
+    hm_upr_z <- t(apply(hm_upr_mat, 1, row_zscore))
+    hm_upr_z[!is.finite(hm_upr_z)] <- 0
+    hm_upr_z[hm_upr_z > z_clip] <- z_clip
+    hm_upr_z[hm_upr_z < -z_clip] <- -z_clip
+
+    upr_row_split <- factor(as.character(upr_info$Module), levels = levels(upr_module_key$Module))
+    upr_row_labels <- make.unique(upr_info$Gene_Label)
+
+    upr_pval_text <- cbind(
+      "Ex Raw" = format_p(upr_info$Ex_P.Value),
+      "Ex FDR" = format_p(upr_info$Ex_adj.P.Val),
+      "Rapa Raw" = format_p(upr_info$Rapa_P.Value),
+      "Rapa FDR" = format_p(upr_info$Rapa_adj.P.Val)
+    )
+
+    upr_pval_mat <- matrix(
+      0,
+      nrow = nrow(upr_pval_text),
+      ncol = ncol(upr_pval_text),
+      dimnames = list(rownames(hm_upr_z), colnames(upr_pval_text))
+    )
+
+    ht_upr_pvals <- Heatmap(
+      upr_pval_mat,
+      name = "p-value",
+      col = circlize::colorRamp2(c(0, 1), c("white", "white")),
+      cluster_rows = FALSE,
+      cluster_columns = FALSE,
+      show_heatmap_legend = FALSE,
+      show_row_names = FALSE,
+      show_column_names = TRUE,
+      column_names_side = "top",
+      column_names_gp = gpar(fontsize = nm_style$legend_text, fontface = "bold"),
+      column_title = "p-value",
+      column_title_gp = gpar(fontsize = nm_style$axis_text, fontface = "bold"),
+      width = unit(34, "mm"),
+      rect_gp = gpar(col = "white"),
+      cell_fun = function(j, i, x, y, width, height, fill) {
+        this_p <- switch(j,
+                         upr_info$Ex_P.Value[i],
+                         upr_info$Ex_adj.P.Val[i],
+                         upr_info$Rapa_P.Value[i],
+                         upr_info$Rapa_adj.P.Val[i])
+        this_cutoff <- if (j %in% c(1, 3)) raw_p_cutoff else fdr_cutoff
+        grid.text(
+          upr_pval_text[i, j], x = x, y = y,
+          gp = gpar(fontsize = nm_style$small_text, fontface = ifelse(!is.na(this_p) & this_p <= this_cutoff, "bold", "plain"))
+        )
+      }
+    )
+
+    ht_upr <- Heatmap(
+      hm_upr_z,
+      name = "Z-score",
+      col = heatmap_col_fun,
+      na_col = "grey85",
+      top_annotation = top_ann,
+      column_split = meta_ord$Treatment,
+      column_gap = unit(3, "mm"),
+      row_split = upr_row_split,
+      row_gap = unit(4, "mm"),
+      row_title_side = "left",
+      row_title_rot = 90,
+      row_title_gp = gpar(fontsize = nm_style$legend_title, fontface = "bold"),
+      cluster_rows = FALSE,
+      cluster_row_slices = FALSE,
+      cluster_columns = FALSE,
+      cluster_column_slices = FALSE,
+      show_column_names = FALSE,
+      show_row_names = TRUE,
+      row_names_side = "left",
+      row_labels = upr_row_labels,
+      row_names_gp = gpar(fontsize = nm_style$legend_text, fontface = "bold"),
+      column_title = paste0(fraction_name, " — UPR/chaperone/folding prteins"),
+      column_title_gp = gpar(fontsize = nm_style$plot_title, fontface = "bold"),
+      border = FALSE,
+      heatmap_legend_param = list(
+        title = "Z-score",
+        title_position = "topcenter",
+        at = c(-z_clip, 0, z_clip),
+        labels = c(paste0("-", z_clip), "0", as.character(z_clip))
+      )
+    )
+
+    ht_upr_combined <- ht_upr + ht_upr_pvals
+    upr_h <- max(7.5, nrow(upr_info) * 0.32 + 3.6)
+    save_heatmap_png(
+      ht_upr_combined,
+      file.path(upr_dir, "Heatmap_UPR_module_oldTreatments_rawP_and_FDR"),
+      width = 15.2,
+      height = upr_h,
+      dpi = 300
+    )
+  } else {
+    message("Skipping UPR module heatmap: fewer than 2 UPR proteins found after filtering.")
+  }
+}
+```
+
+```{r show-upr, echo=FALSE, out.width="90%"}
+upr_file <- file.path(upr_dir, "Heatmap_UPR_module_oldTreatments_rawP_and_FDR.png")
+if (file.exists(upr_file)) knitr::include_graphics(upr_file)
+```
+
+# Treatment × Sex interaction plots
+
+For proteins with a significant Exercise × Sex or Rapamycin × Sex interaction under the selected raw-p/FDR criterion, treatment means ± SEM are plotted separately by sex. These plots replace interaction heatmaps for interpretation of the interaction direction.
+
+```{r interaction-plots, fig.keep="none"}
+make_interaction_mean_sem <- function(res_int, treatment_name, file_tag, interaction_label) {
+  int_dir <- file.path(interaction_dir, file_tag)
+  safe_dir_create(int_dir)
+
+  sig_int <- res_int %>%
+    filter(
+      Protein %in% rownames(mat_log),
+      abs(logFC) >= interaction_lfc_cutoff,
+      if (interaction_fdr_only) SigFDR else SigAny
+    ) %>%
+    arrange(adj.P.Val, P.Value)
+
+  write.csv(sig_int, file.path(int_dir, paste0(file_tag, "_sig_int_proteins.csv")), row.names = FALSE)
+
+  if (nrow(sig_int) == 0) {
+    message("No significant ", interaction_label, " proteins found using selected criteria.")
+    return(NULL)
+  }
+
+  keep_treatments <- c("Control", treatment_name)
+
+  plot_long <- mat_log[sig_int$Protein, meta_old$ID, drop = FALSE] %>%
+    as.data.frame() %>%
+    rownames_to_column("Protein") %>%
+    pivot_longer(cols = -Protein, names_to = "ID", values_to = "log2_abundance") %>%
+    left_join(meta_old %>% select(ID, Treatment, Sex, Group), by = "ID") %>%
+    filter(Treatment %in% keep_treatments) %>%
+    left_join(sig_int %>% select(Protein, logFC, P.Value, adj.P.Val, SigClass), by = "Protein") %>%
+    mutate(
+      Treatment = factor(Treatment, levels = keep_treatments),
+      Sex = factor(Sex, levels = c("Female", "Male")),
+      Protein_label = paste0(Protein, "\nInt p=", format_p(P.Value), "; FDR=", format_p(adj.P.Val))
+    )
+
+  label_levels <- sig_int %>%
+    mutate(Protein_label = paste0(Protein, "\nInt p=", format_p(P.Value), "; FDR=", format_p(adj.P.Val))) %>%
+    pull(Protein_label)
+
+  plot_long <- plot_long %>% mutate(Protein_label = factor(Protein_label, levels = label_levels))
+
+  summary_df <- plot_long %>%
+    group_by(Protein, Protein_label, Treatment, Sex, logFC, P.Value, adj.P.Val, SigClass) %>%
+    summarise(
+      n = sum(!is.na(log2_abundance)),
+      mean_log2 = mean(log2_abundance, na.rm = TRUE),
+      sd_log2 = sd(log2_abundance, na.rm = TRUE),
+      sem_log2 = sd_log2 / sqrt(n),
+      .groups = "drop"
+    ) %>%
+    mutate(sem_log2 = ifelse(is.na(sem_log2), 0, sem_log2))
+
+  write.csv(summary_df, file.path(int_dir, paste0(file_tag, "_mean_SEM_summary.csv")), row.names = FALSE)
+
+  n_prot <- length(unique(summary_df$Protein))
+  ncol_int <- ifelse(n_prot <= 2, n_prot, 4)
+  nrow_int <- ceiling(n_prot / ncol_int)
+  plot_w <- max(8, ncol_int * 4.0)
+  plot_h <- max(5.5, nrow_int * 3.4)
+
+  p_all <- ggplot(summary_df, aes(x = Treatment, y = mean_log2, color = Sex, group = Sex)) +
+    geom_line(linewidth = 1.1, na.rm = TRUE) +
+    geom_point(size = 3.2, na.rm = TRUE) +
+    geom_errorbar(aes(ymin = mean_log2 - sem_log2, ymax = mean_log2 + sem_log2),
+                  width = 0.12, linewidth = 0.8, na.rm = TRUE) +
+    scale_color_manual(values = sex_cols, drop = FALSE) +
+    facet_wrap(~ Protein_label, scales = "free_y", ncol = ncol_int) +
+    scale_x_discrete(labels = c("Control" = "Old Ctl", "Exercise" = "Old+Ex", "Rapamycin" = "Old+Rapa")) +
+    labs(
+      title = paste0("Significant ", interaction_label, " Proteins — ", fraction_name, " Fraction"),
+      x = NULL,
+      y = "Mean log2 abundance",
+      color = "Sex"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0, size = 18),
+      plot.subtitle = element_text(colour = "grey35", hjust = 0, size = 12),
+      strip.background = element_rect(fill = "white", color = "black"),
+      strip.text = element_text(face = "bold", size = 11),
+      axis.text.x = element_text(size = 10),
+      axis.title.y = element_text(face = "bold"),
+      legend.position = "right"
+    )
+
+  save_plot_png(
+    p_all,
+    file.path(int_dir, paste0("MeanSEM_", file_tag, "_All")),
+    width = plot_w,
+    height = plot_h,
+    dpi = 300
+  )
+
+  for (prot in unique(sig_int$Protein)) {
+    dat_p <- summary_df %>%
+  filter(Protein == prot)
+
+lab_p <- paste0("Int p=", format_p(unique(dat_p$P.Value)[1]), "; FDR=", format_p(unique(dat_p$adj.P.Val)[1]))
+
+    p_one <- ggplot(dat_p, aes(x = Treatment, y = mean_log2, color = Sex, group = Sex)) +
+      geom_line(linewidth = 1.2, na.rm = TRUE) +
+      geom_point(size = 3.6, na.rm = TRUE) +
+      geom_errorbar(aes(ymin = mean_log2 - sem_log2, ymax = mean_log2 + sem_log2),
+                    width = 0.12, linewidth = 0.85, na.rm = TRUE) +
+      scale_color_manual(values = sex_cols, drop = FALSE) +
+      scale_x_discrete(labels = c("Control" = "Old Ctl", "Exercise" = "Old+Ex", "Rapamycin" = "Old+Rapa")) +
+      labs(
+        title = paste0(fraction_name, " — ", prot),
+        subtitle = lab_p,
+        x = NULL,
+        y = "Mean log2 abundance",
+        color = "Sex"
+      ) +
+      theme_classic(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(colour = "grey35", hjust = 0.5, size = 11),
+        axis.title.y = element_text(face = "bold"),
+        legend.position = "right"
+      )
+
+    save_plot_png(
+      p_one,
+      file.path(int_dir, paste0("MeanSEM_", file_tag, "_", safe_filename(prot))),
+      width = 6.2,
+      height = 5.3,
+      dpi = 300
+    )
+  }
+
+  p_all
+}
+
+p_ex_interaction <- make_interaction_mean_sem(
+  res_ex_int,
+  treatment_name = "Exercise",
+  file_tag = "ExSex_Int",
+  interaction_label = "Ex Sex Int"
+)
+
+p_rapa_interaction <- make_interaction_mean_sem(
+  res_rapa_int,
+  treatment_name = "Rapamycin",
+  file_tag = "RapaSex_Int",
+  interaction_label = "Rapa Sex Int"
+)
+
+message("\n✓ Complete. Outputs saved to: ", normalizePath(out_dir, mustWork = FALSE))
+```
+
+## Exercise × Sex
+
+```{r show-ex-interactions, echo=FALSE, out.width="100%"}
+ex_all <- file.path(interaction_dir, "ExSex_Int", "MeanSEM_ExSex_Int_All.png")
+if (file.exists(ex_all)) knitr::include_graphics(ex_all)
+```
+
+## Rapamycin × Sex
+
+```{r show-rapa-interactions, echo=FALSE, out.width="100%"}
+rapa_all <- file.path(interaction_dir, "RapaSex_Int", "MeanSEM_RapaSex_Int_All.png")
+if (file.exists(rapa_all)) knitr::include_graphics(rapa_all)
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
+
+# Female vs Male treatment effects (manuscript panels)
+
+This section creates compact manuscript panels that compare the treatment effect in
+Female versus Male old mice. The analysis itself is unchanged; this is a new
+visualization/export layer using the same Nature Metabolism and Inkscape-safe SVG
+helpers used for the revised aggregation-propensity analyses.
+
+Symbol convention:
+
+- open circle = NS
+- filled circle = overall treatment raw p <= 0.05
+- filled diamond = Treatment x Sex raw p <= 0.05 (takes precedence if both are <= 0.05)
+
+```{r fig5-nm-packages}
+
+library(svglite)
+library(viridisLite)
+library(GO.db)
+library(AnnotationDbi)
+```
+
+```{r fig5-nm-component-helpers}
+# ── Cellular-component assignment, matching revised Figure 4 ─────────────────
+fig5_bin_roots <- list(
+  "Sarcomere/Myofibril" = c("GO:0030017", "GO:0030016", "GO:0043292"),
+  "Cytoskeleton"        = "GO:0005856",
+  "Extracellular"       = "GO:0005576",
+  "ECM"                 = "GO:0031012",
+  "Nucleus"             = "GO:0005634",
+  "Mitochondrion"       = "GO:0005739",
+  "Plasma membrane"     = "GO:0005886",
+  "Cytosol"             = "GO:0005829"
+)
+
+fig5_bin_order <- names(fig5_bin_roots)
+fig5_go_cc_offspring <- AnnotationDbi::as.list(GO.db::GOCCOFFSPRING)
+
+fig5_get_offspring <- function(go_id) {
+  unique(c(go_id, fig5_go_cc_offspring[[go_id]]))
+}
+
+fig5_bin_terms <- lapply(
+  fig5_bin_roots,
+  function(ids) unique(unlist(lapply(ids, fig5_get_offspring), use.names = FALSE))
+)
+
+fig5_assign_bin <- function(go_vec) {
+  go_vec <- unique(go_vec[!is.na(go_vec)])
+  if (length(go_vec) == 0) return("Other/Unassigned")
+  for (b in fig5_bin_order) {
+    if (any(go_vec %in% fig5_bin_terms[[b]])) return(b)
+  }
+  "Other/Unassigned"
+}
+
+fig5_build_gene_bin <- function(annotation_tbl, gene_col = "Gene_clean") {
+  genes <- tibble::tibble(SYMBOL = as.character(annotation_tbl[[gene_col]])) %>%
+    dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
+    dplyr::distinct()
+
+  gene2entrez <- suppressMessages(
+    AnnotationDbi::select(
+      org.Mm.eg.db::org.Mm.eg.db,
+      keys = genes$SYMBOL,
+      keytype = "SYMBOL",
+      columns = c("SYMBOL", "ENTREZID")
+    )
+  ) %>%
+    dplyr::distinct(SYMBOL, ENTREZID) %>%
+    dplyr::filter(!is.na(ENTREZID))
+
+  entrez2go <- suppressMessages(
+    AnnotationDbi::select(
+      org.Mm.eg.db::org.Mm.eg.db,
+      keys = sort(unique(gene2entrez$ENTREZID)),
+      keytype = "ENTREZID",
+      columns = c("ENTREZID", "GO", "ONTOLOGY")
+    )
+  ) %>%
+    dplyr::filter(ONTOLOGY == "CC", !is.na(GO)) %>%
+    dplyr::distinct(ENTREZID, GO)
+
+  gene2entrez %>%
+    dplyr::left_join(entrez2go, by = "ENTREZID") %>%
+    dplyr::group_by(SYMBOL) %>%
+    dplyr::summarise(GO_CC = list(unique(GO)), .groups = "drop") %>%
+    dplyr::mutate(Bin = vapply(GO_CC, fig5_assign_bin, character(1)))
+}
+
+# Reproduce the Figure 4 component-color logic: viridis colors assigned to the
+# alphabetically sorted component set, then displayed in biological order.
+fig5_palette_names <- sort(fig5_bin_order)
+fig5_component_pal <- c(
+  stats::setNames(viridisLite::viridis(length(fig5_palette_names), option = "D", end = 0.95), fig5_palette_names),
+  "Other/Unassigned" = "grey60"
+)
+```
+
+```{r fig5-nm-sex-effect-helpers}
+fig5_max_labels <- 10
+
+fig5_make_sex_effect_table <- function(
+  overall_res,
+  female_res,
+  male_res,
+  interaction_res,
+  treatment_name,
+  gene_bin_tbl
+) {
+
+  overall <- overall_res %>%
+    dplyr::transmute(Protein, Overall_logFC = logFC, Overall_P = P.Value, Overall_FDR = adj.P.Val)
+
+  female <- female_res %>%
+    dplyr::transmute(
+      Protein,
+      Protein.Group,
+      Gene_clean,
+      Female_logFC = logFC,
+      Female_P = P.Value,
+      Female_FDR = adj.P.Val
+    )
+
+  male <- male_res %>%
+    dplyr::transmute(Protein, Male_logFC = logFC, Male_P = P.Value, Male_FDR = adj.P.Val)
+
+  interaction <- interaction_res %>%
+    dplyr::transmute(Protein, Interaction_logFC = logFC, Interaction_P = P.Value, Interaction_FDR = adj.P.Val)
+
+  female %>%
+    dplyr::inner_join(male, by = "Protein") %>%
+    dplyr::inner_join(overall, by = "Protein") %>%
+    dplyr::inner_join(interaction, by = "Protein") %>%
+    dplyr::left_join(gene_bin_tbl %>% dplyr::select(SYMBOL, Bin), by = c("Gene_clean" = "SYMBOL")) %>%
+    dplyr::mutate(
+      Treatment = treatment_name,
+      Bin = dplyr::if_else(is.na(Bin), "Other/Unassigned", Bin),
+      OverallSig = !is.na(Overall_P) & Overall_P <= raw_p_cutoff,
+      InteractionSig = !is.na(Interaction_P) & Interaction_P <= raw_p_cutoff,
+      # User-requested precedence: any nominal Treatment x Sex interaction is
+      # shown as a diamond; otherwise pooled treatment p<=0.05 is a filled circle.
+      SigClass = dplyr::case_when(
+        InteractionSig ~ "Treatment x Sex p <= 0.05",
+        OverallSig ~ "Overall treatment p <= 0.05",
+        TRUE ~ "NS"
+      ),
+      Distance_from_identity = abs(Male_logFC - Female_logFC),
+      Mean_abs_effect = (abs(Female_logFC) + abs(Male_logFC)) / 2
+    )
+}
+
+fig5_make_sex_effect_plot <- function(dat, title_text, x_label, y_label, show_legend = TRUE) {
+
+  plot_df <- dat %>%
+    dplyr::filter(is.finite(Female_logFC), is.finite(Male_logFC)) %>%
+    dplyr::mutate(
+      Bin = factor(Bin, levels = c(fig5_bin_order, "Other/Unassigned")),
+      SigClass = factor(SigClass, levels = c("Treatment x Sex p <= 0.05", "Overall treatment p <= 0.05", "NS"))
+    )
+
+  # Label interaction proteins first, then the strongest pooled treatment hits.
+  label_df <- plot_df %>%
+    dplyr::filter(SigClass != "NS") %>%
+    dplyr::mutate(
+      label_priority = dplyr::if_else(InteractionSig, 1L, 2L),
+      label_p = dplyr::if_else(InteractionSig, Interaction_P, Overall_P)
+    ) %>%
+    dplyr::arrange(label_priority, label_p, dplyr::desc(Distance_from_identity), dplyr::desc(Mean_abs_effect)) %>%
+    dplyr::slice_head(n = fig5_max_labels)
+
+  lim_val <- max(abs(c(plot_df$Female_logFC, plot_df$Male_logFC)), na.rm = TRUE)
+  if (!is.finite(lim_val) || lim_val == 0) lim_val <- 1
+  lim_val <- lim_val * 1.08
+
+  p <- ggplot2::ggplot(plot_df, ggplot2::aes(x = Female_logFC, y = Male_logFC)) +
+    ggplot2::geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = "dotted",
+      colour = "grey35",
+      linewidth = nm_style$data_line
+    ) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = nm_style$axis_line) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", colour = "grey72", linewidth = nm_style$axis_line) +
+    ggplot2::geom_point(
+      ggplot2::aes(colour = Bin, shape = SigClass),
+      size = nm_style$point_medium,
+      stroke = 0.40,
+      alpha = 0.92
+    ) +
+    ggrepel::geom_text_repel(
+      data = label_df,
+      ggplot2::aes(label = Gene_clean, colour = Bin),
+      size = nm_style$small_text / 2.845276,
+      max.overlaps = Inf,
+      box.padding = 0.22,
+      point.padding = 0.12,
+      min.segment.length = 0,
+      segment.size = 0.18,
+      show.legend = FALSE
+    ) +
+    ggplot2::scale_colour_manual(
+      values = fig5_component_pal,
+      breaks = c(fig5_bin_order, "Other/Unassigned"),
+      drop = TRUE,
+      name = "Cellular component"
+    ) +
+    ggplot2::scale_shape_manual(
+      values = c("Treatment x Sex p <= 0.05" = 18, "Overall treatment p <= 0.05" = 16, "NS" = 1),
+      breaks = c("Treatment x Sex p <= 0.05", "Overall treatment p <= 0.05", "NS"),
+      name = "Significance"
+    ) +
+    ggplot2::guides(
+      shape = ggplot2::guide_legend(
+        order = 1,
+        override.aes = list(colour = "black", alpha = 1, size = 1.8, stroke = 0.45)
+      ),
+      colour = ggplot2::guide_legend(order = 2, override.aes = list(shape = 16, alpha = 1, size = 1.8))
+    ) +
+    ggplot2::coord_equal(xlim = c(-lim_val, lim_val), ylim = c(-lim_val, lim_val), clip = "off") +
+    ggplot2::labs(title = title_text, x = x_label, y = y_label) +
+    theme_nm(legend_position = if (show_legend) "right" else "none", plot_title = TRUE, plot_subtitle = FALSE)
+
+  p
+}
+```
+
+```{r fig5-nm-run-sol, fig.keep="none"}
+fig5_nm_dir <- file.path(out_dir, "NM_SexFx")
+dir.create(fig5_nm_dir, recursive = TRUE, showWarnings = FALSE)
+
+gene_bin_fig5 <- fig5_build_gene_bin(protein_tbl_filt, gene_col = "Gene_clean")
+
+ex_sexfx_nm <- fig5_make_sex_effect_table(
+  overall_res = res_ex_ctl,
+  female_res = res_ex_female,
+  male_res = res_ex_male,
+  interaction_res = res_ex_int,
+  treatment_name = "Exercise",
+  gene_bin_tbl = gene_bin_fig5
+)
+
+rapa_sexfx_nm <- fig5_make_sex_effect_table(
+  overall_res = res_rapa_ctl,
+  female_res = res_rapa_female,
+  male_res = res_rapa_male,
+  interaction_res = res_rapa_int,
+  treatment_name = "Rapamycin",
+  gene_bin_tbl = gene_bin_fig5
+)
+
+write.csv(ex_sexfx_nm, file.path(fig5_nm_dir, "Ex_SexFx.csv"), row.names = FALSE)
+write.csv(rapa_sexfx_nm, file.path(fig5_nm_dir, "Rapa_SexFx.csv"), row.names = FALSE)
+
+p_ex_sexfx_nm <- fig5_make_sex_effect_plot(
+  ex_sexfx_nm,
+  title_text = "Exercise: soluble abundance",
+  x_label = "Female effect (log2FC)",
+  y_label = "Male effect (log2FC)",
+  show_legend = FALSE
+)
+
+p_rapa_sexfx_nm <- fig5_make_sex_effect_plot(
+  rapa_sexfx_nm,
+  title_text = "Rapamycin: soluble abundance",
+  x_label = "Female effect (log2FC)",
+  y_label = "Male effect (log2FC)",
+  show_legend = FALSE
+)
+
+# Standalone panels: no legend, matching the compact footprint of current Fig. 5
+# volcano panels. The combined pair below carries the shared legend.
+save_nm_svg(p_ex_sexfx_nm, file.path(fig5_nm_dir, "Ex_Sol_SexFx.svg"), size_key = "family_sex_single")
+save_nm_png(p_ex_sexfx_nm, file.path(fig5_nm_dir, "Ex_Sol_SexFx.png"), size_key = "family_sex_single")
+
+save_nm_svg(p_rapa_sexfx_nm, file.path(fig5_nm_dir, "Rapa_Sol_SexFx.svg"), size_key = "family_sex_single")
+save_nm_png(p_rapa_sexfx_nm, file.path(fig5_nm_dir, "Rapa_Sol_SexFx.png"), size_key = "family_sex_single")
+
+# Rebuild only for the pair so the legends can be collected once.
+p_ex_sexfx_legend_nm <- fig5_make_sex_effect_plot(
+  ex_sexfx_nm,
+  title_text = "Exercise: soluble abundance",
+  x_label = "Female effect (log2FC)",
+  y_label = "Male effect (log2FC)",
+  show_legend = TRUE
+)
+
+p_rapa_sexfx_legend_nm <- fig5_make_sex_effect_plot(
+  rapa_sexfx_nm,
+  title_text = "Rapamycin: soluble abundance",
+  x_label = "Female effect (log2FC)",
+  y_label = "Male effect (log2FC)",
+  show_legend = TRUE
+)
+
+p_pair_sexfx_nm <- (
+  p_ex_sexfx_legend_nm + p_rapa_sexfx_legend_nm +
+    patchwork::plot_layout(ncol = 2, guides = "collect")
+) &
+  ggplot2::theme(legend.position = "right")
+
+# Store one shared legend separately so the two treatment panels retain their
+# full plotting area when imported into Inkscape.
+attr(p_pair_sexfx_nm, "nm_legend_grob") <- nm_extract_legend(p_ex_sexfx_legend_nm)
+attr(p_pair_sexfx_nm, "nm_legend_width_mm") <- 58
+attr(p_pair_sexfx_nm, "nm_legend_height_mm") <- 58
+
+save_nm_svg(p_pair_sexfx_nm, file.path(fig5_nm_dir, "Sol_SexFx_pair.svg"), size_key = "family_sex_pair")
+save_nm_png(p_pair_sexfx_nm, file.path(fig5_nm_dir, "Sol_SexFx_pair.png"), size_key = "family_sex_pair")
+```
+
+## Sex-specific treatment effects
+
+```{r fig5-nm-show-sol, echo=FALSE, out.width="100%"}
+knitr::include_graphics(file.path(fig5_nm_dir, "Sol_SexFx_pair.png"))
+```
+
+# Export manifest
+
+```{r write-export-manifest, include=FALSE}
+invisible(figure_export_manifest(write_csv = TRUE))
+```
